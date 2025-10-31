@@ -1,11 +1,11 @@
 ## Put your model args here
 module:
-  _target_: yourprojectname.model.lightning_module.LightningModule
+  _target_: chemflow.model.lightning_module.LightningModule
   # args and kwargs 
 
   # The 'model' key below is an argument to your LightningModule
   model:
-    _target_: yourprojectname.model.gnn.EGNNwithHeads
+    _target_: chemflow.model.gnn.EGNNwithHeads
     _recursive_: false
 
     embedding_args: ${model.embedding}
@@ -13,7 +13,7 @@ module:
     heads_args: ${model.heads}
 
 embedding:
-  _target_: yourprojectname.model.embedding.Embedding
+  _target_: chemflow.model.embedding.Embedding
   in_nf: 10
   out_nf: 32
 
@@ -30,7 +30,7 @@ egnn:
   tanh: False
 
 heads:
-  _target_: yourprojectname.model.heads.MultiHeadModule
+  _target_: chemflow.model.heads.MultiHeadModule
 
   heads_configs:
     node_heads:

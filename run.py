@@ -4,7 +4,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from omegaconf import DictConfig
 
-from yourprojectname.utils import build_callbacks
+from chemflow.utils import build_callbacks
 
 
 def run(cfg: DictConfig):
