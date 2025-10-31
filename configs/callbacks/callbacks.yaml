@@ -1,0 +1,19 @@
+## Put your callback args here
+callbacks:
+  monitor_metric: "val/loss" 
+  monitor_metric_mode: min
+
+  early_stopping:
+    patience: 20
+    verbose: False
+
+  model_checkpoints:
+    save_top_k: 1
+    verbose: False
+    save_last: False
+
+  every_n_epochs_checkpoint:
+    every_n_epochs: 5
+    save_top_k: 3
+    verbose: False
+    save_last: False

@@ -1,0 +1,12 @@
+## Put your model args here
+module:
+  _target_: yourprojectname.model.lightning_module.LightningModule
+  # args and kwargs 
+
+  model:
+    _target_: yourprojectname.model.torch_model.TorchModel
+    # args and kwargs
+    example_arg: 1
+    example_arg2: "example"
+
+    

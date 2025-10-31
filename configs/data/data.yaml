@@ -1,0 +1,37 @@
+## Put your data args here
+
+root_path: ${oc.env:PROJECT_ROOT}/data
+preprocess_workers: 0
+
+datamodule:
+  _target_: yourprojectname.dataset.lightning_datamodule.LightningDataModule
+
+  datasets:
+    train:
+      _target_: yourprojectname.dataset.torch_dataset.CustomGraphDataset
+      path: ${data.root_path}/raw/train.csv 
+      save_path: ${data.root_path}/processed/train.pt
+      preprocess_workers: ${data.preprocess_workers}
+
+    val:
+      - _target_: yourprojectname.dataset.CustomGraphDataset
+        path: ${data.root_path}/raw/val.csv 
+        save_path: ${data.root_path}/processed/val.pt
+        preprocess_workers: ${data.preprocess_workers}
+
+    test:
+      - _target_: yourprojectname.dataset.CustomGraphDataset
+        path: ${data.root_path}/raw/test.csv
+        save_path: ${data.root_path}/processed/test.pt
+        preprocess_workers: ${data.preprocess_workers}
+        
+
+  num_workers:
+    train: 0
+    val: 0
+    test: 0
+
+  batch_size:
+    train: 64
+    val: 64
+    test: 64

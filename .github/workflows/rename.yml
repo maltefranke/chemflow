@@ -1,0 +1,70 @@
+name: 🚀 Rename and Merge Template
+
+on:
+  # This makes it run automatically on creation (if org settings allow)
+  create:
+  # This adds a manual "Run workflow" button as a fallback
+  workflow_dispatch:
+
+jobs:
+  rename:
+    runs-on: ubuntu-latest
+    
+    # This 'if' condition allows the job to run EITHER
+    # manually (workflow_dispatch) OR automatically (create).
+    if: |
+      github.event_name == 'workflow_dispatch' || 
+      (github.event.ref_type == 'branch' && github.event.ref == github.event.repository.default_branch)
+      
+    # We need 'contents: write' and 'pull-requests: write'
+    permissions:
+      contents: write
+      pull-requests: write
+    
+    steps:
+      - name: 1. Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 2. Run rename action
+        # This action creates the PR
+        uses: kota65535/github-template-rename-action@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # We'll use a specific branch name to find it easily
+          pr-branch: "template-rename"
+          from-name: "yourprojectname"
+          paths-ignore: |
+            .github/workflows/**
+
+      - name: 3. Find and Merge PR
+        env:
+          # Pass the GITHUB_TOKEN to the gh CLI
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The branch name we used in the step above
+          BRANCH_NAME: "template-rename"
+        run: |
+          echo "Waiting for PR to be created..."
+          # The PR creation API can have a slight delay
+          sleep 5 
+          
+          echo "Finding PR number..."
+          PR_NUMBER=$(gh pr list --head "$BRANCH_NAME" --json number --jq '.[0].number')
+          
+          if [ "$PR_NUMBER" = "null" ]; then
+            echo "Could not find PR. Retrying..."
+            sleep 10
+            PR_NUMBER=$(gh pr list --head "$BRANCH_NAME" --json number --jq '.[0].number')
+          fi
+
+          if [ "$PR_NUMBER" = "null" ]; then
+            echo "::error::Failed to find the pull request."
+            exit 1
+          fi
+          
+          echo "Found PR number: $PR_NUMBER"
+          
+          echo "Merging PR..."
+          # We merge, squash, and delete the branch all in one command
+          gh pr merge "$PR_NUMBER" --squash --delete-branch
+          
+          echo "PR merged and branch deleted."

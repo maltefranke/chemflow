@@ -1,0 +1,6 @@
+## Put your model args here
+name: "my_model"
+save_dir: "logs"
+offline: True
+
+    
