@@ -5,10 +5,10 @@ description = "Your description"
 requires-python = ">=3.11.0"
 dependencies = [
     "hydra-core>=1.3.2",
-    # put your dependencies here
     "lightning>=2.5.5",
     "omegaconf>=2.3.0",
     "pandas>=2.3.3",
+    "scipy>=1.16.3",
     "torch>=2.9.0",
     "torchvision>=0.24.0",
     "wandb>=0.22.2",
