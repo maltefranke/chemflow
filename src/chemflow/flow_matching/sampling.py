@@ -13,24 +13,25 @@ def sample_prior_graph(
     N_atoms = p_n_atoms.sample()
 
     # sample atom types from train distribution
-    atom_types = p_atom_types.sample(N_atoms)
+    atom_types = p_atom_types.sample(sample_shape=(N_atoms,))
 
     # sample coordinates randomly
     coord = torch.randn(N_atoms, 3)
 
-    # sample edge types for upper triangle (including diagonal) of adjacency matrix
-    N_edges = N_atoms + (N_atoms**2 - N_atoms) // 2
-    edge_types = p_edge_types.sample((N_edges,))
+    # sample edge types for upper triangle (excluding diagonal) of adjacency matrix
+    N_edges = (N_atoms**2 - N_atoms) // 2
+    triu_edge_types = p_edge_types.sample((N_edges,))
+    triu_edge_types = triu_edge_types.to(torch.long)
 
-    # edge types to triu_matrix
-    triu_indices = torch.triu_indices(N_atoms, N_atoms)
-    edge_types_matrix = torch.zeros(N_atoms, N_atoms)
-    edge_types_matrix[triu_indices] = edge_types
+    """# edge types to triu_matrix
+    triu_indices = torch.triu_indices(N_atoms, N_atoms, offset=1)
+    edge_types_matrix = torch.zeros(N_atoms, N_atoms, dtype=torch.long)
+    edge_types_matrix[triu_indices[0], triu_indices[1]] = edge_types"""
 
     sampled_graph = {
         "atom_types": atom_types,
         "coord": coord,
-        "edge_types": edge_types_matrix,
+        "edge_types": triu_edge_types,
     }
     return sampled_graph
 
