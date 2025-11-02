@@ -4,6 +4,8 @@ import os
 import pandas as pd
 from chemflow.flow_matching.sampling import sample_prior_graph
 
+from torch_geometric.datasets import QM9
+
 
 def custom_preprocess(path, preprocess_workers):
     # TODO place your custom preprocess logic here
@@ -102,3 +104,7 @@ class FlowMatchingGraphDataset(Dataset):
 if __name__ == "__main__":
     data = custom_preprocess(None, None)
     print(data[0].keys())
+
+    qm9 = QM9(root="/cluster/project/krause/frankem/chemflow/data/qm9")
+
+    print(qm9[0])

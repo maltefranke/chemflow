@@ -5,6 +5,8 @@ from pytorch_lightning.callbacks import (
     EarlyStopping,
     ModelCheckpoint,
 )
+import torch
+from torch_geometric.utils import to_dense_adj
 
 
 def build_callbacks(cfg: DictConfig) -> list[Callback]:
@@ -48,3 +50,20 @@ def build_callbacks(cfg: DictConfig) -> list[Callback]:
         )
 
     return callbacks
+
+
+def edge_types_to_triu_entries(edge_index, edge_types_one_hot, num_atoms):
+    # By default, 0 is a single bond, 1 is a double bond etc.
+    # When creating the adj_matrix we need to add a NONE-BOND at 0
+    # Therefore, we add 1 to the edge types
+    # 0: no bond, 1: single, 2: double, 3: triple, 4: aromatic
+    edge_types = edge_types_one_hot.argmax(dim=-1) + 1
+
+    adj_matrix = to_dense_adj(edge_index, edge_attr=edge_types, max_num_nodes=num_atoms)
+    adj_matrix = adj_matrix.squeeze()
+
+    # only keep the upper triangle (excluding diagonal) of the adj matrix
+    triu_indices = torch.triu_indices(row=num_atoms, col=num_atoms, offset=1)
+    triu_edge_types = adj_matrix[triu_indices[0], triu_indices[1]]
+
+    return triu_edge_types
