@@ -169,6 +169,7 @@ def interpolate_different_size(
     birth_rate_target = []
     death_rate_target = []
     birth_next_locations = []
+    birth_next_locations_batch_ids = []
     point_wise_death_targets_per_graph = []
 
     # Process each graph separately
@@ -207,7 +208,7 @@ def interpolate_different_size(
                 x_sink = torch.zeros((1, D), device=device, dtype=dtype)
 
             # Sample death times
-            death_times, is_dead, x0_alive_at_xt = sample_deaths(unmatched_x0_b, t_b)
+            _, _, x0_alive_at_xt = sample_deaths(unmatched_x0_b, t_b)
 
             # Interpolate the unmatched x0 to the sink state
             if x0_alive_at_xt.shape[0] > 0:
@@ -286,6 +287,11 @@ def interpolate_different_size(
 
         point_wise_death_targets_per_graph.append(death_targets_b)
 
+        birth_next_locations_batch_id = torch.full(
+            (birth_next_locations[-1].shape[0],), b, dtype=torch.long, device=device
+        )
+        birth_next_locations_batch_ids.append(birth_next_locations_batch_id)
+
     # 3. Concatenate across all graphs and create batch_id
     xt = torch.cat(xt_per_graph, dim=0)
     target_vf = torch.cat(target_vf_per_graph, dim=0)
@@ -316,6 +322,8 @@ def interpolate_different_size(
     else:
         birth_next_locations = -1e3 * torch.ones((num_graphs, D), device=device)
 
+    birth_next_locations_batch_ids = torch.cat(birth_next_locations_batch_ids, dim=0)
+
     return (
         xt,
         xt_batch_id,
@@ -324,14 +332,15 @@ def interpolate_different_size(
         birth_rate_target,
         death_rate_target,
         birth_next_locations,
+        birth_next_locations_batch_ids,
     )
 
 
 if __name__ == "__main__":
-    x0 = torch.randn(10, 3)
-    x1 = torch.randn(10, 3)
-    x0_batch_id = torch.zeros(10)
-    x1_batch_id = torch.zeros(10)
+    x0 = torch.randn(6, 3)
+    x1 = torch.randn(8, 3)
+    x0_batch_id = torch.zeros(6)
+    x1_batch_id = torch.zeros(8)
     t = torch.tensor(0.5).view(1, 1)
     (
         xt,
@@ -341,6 +350,7 @@ if __name__ == "__main__":
         birth_rate_target,
         death_rate_target,
         birth_next_locations,
+        birth_next_locations_batch_ids,
     ) = interpolate_different_size(x0, x0_batch_id, x1, x1_batch_id, t)
     print(xt.shape)
     print(xt_batch_id.shape)
@@ -349,3 +359,4 @@ if __name__ == "__main__":
     print(birth_rate_target.shape)
     print(death_rate_target.shape)
     print(birth_next_locations.shape)
+    print(birth_next_locations_batch_ids.shape)

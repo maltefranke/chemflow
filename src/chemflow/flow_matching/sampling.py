@@ -1,74 +1,38 @@
 import torch
-from torch.nn.utils.rnn import pad_sequence
+from torch.distributions import Categorical, MixtureSameFamily, Normal, Independent
 
 
-def sample_different_sizes(
-    batch_size, N_mu, N_sigma, x_mu, x_sigma
-) -> tuple[torch.Tensor, torch.Tensor]:
-    N = (
-        torch.randn(
-            batch_size,
-        )
-        * N_sigma
-        + N_mu
-    )
-    N = N.int()
-
-    x = [(torch.randn(n, 1) * x_sigma + x_mu) for n in N]
-    x = pad_sequence(x, batch_first=True, padding_value=-1e3)
-    x_mask = (x != -1e3).bool()
-    return x, x_mask
-
-
-def sample_gmm_different_sizes(
-    batch_size, N_mu, N_sigma
-) -> tuple[torch.Tensor, torch.Tensor]:
-    N = (
-        torch.randn(
-            batch_size,
-        )
-        * N_sigma
-        + N_mu
-    )
-    N = N.int()
-
-    def draw_gmm_sample(n):
-        output = torch.empty(n, 1)
-        rand = torch.rand(n) < 0.5
-
-        output[rand] = torch.randn(rand.to(torch.int).sum(), 1) * 2 + 7
-        output[~rand] = torch.randn((n - rand.to(torch.int).sum()), 1) * 2 - 7
-        return output
-
-    x = [draw_gmm_sample(n) for n in N]
-    x = pad_sequence(x, batch_first=True, padding_value=-1e3)
-    x_mask = (x != -1e3).bool()
-    return x, x_mask
-
-
-def sample_prior(
-    batch_size,
-    prior_N_mu=100,
-    prior_N_sigma=7,
-    prior_x_mu=0,
-    prior_x_sigma=3,
-    target_N_mu=100,
-    target_N_sigma=1,
-    target_x_mu=0,
-    target_x_sigma=1,
+def sample_prior_graph(
+    atom_type_distribution, edge_type_distribution, n_atoms_distribution
 ):
-    # N = torch.randint(5, 25, (batch_size,))
-    x0, x0_mask = sample_different_sizes(
-        batch_size, prior_N_mu, prior_N_sigma, prior_x_mu, prior_x_sigma
-    )
+    p_atom_types = Categorical(probs=atom_type_distribution)
+    p_edge_types = Categorical(probs=edge_type_distribution)
+    p_n_atoms = Categorical(probs=n_atoms_distribution)
 
-    # M = torch.randint(15, 35, (batch_size,))
-    """x1, x1_mask = sample_different_sizes(
-        batch_size, target_N_mu, target_N_sigma, target_x_mu, target_x_sigma
-    )"""
+    # sample number of atoms from train distribution
+    N_atoms = p_n_atoms.sample()
 
-    x1, x1_mask = sample_gmm_different_sizes(batch_size, target_N_mu, target_N_sigma)
-    return x0, x0_mask, x1, x1_mask
+    # sample atom types from train distribution
+    atom_types = p_atom_types.sample(N_atoms)
+
+    # sample coordinates randomly
+    coord = torch.randn(N_atoms, 3)
+
+    # sample edge types for upper triangle (including diagonal) of adjacency matrix
+    N_edges = N_atoms + (N_atoms**2 - N_atoms) // 2
+    edge_types = p_edge_types.sample((N_edges,))
+
+    # edge types to triu_matrix
+    triu_indices = torch.triu_indices(N_atoms, N_atoms)
+    edge_types_matrix = torch.zeros(N_atoms, N_atoms)
+    edge_types_matrix[triu_indices] = edge_types
+
+    sampled_graph = {
+        "atom_types": atom_types,
+        "coord": coord,
+        "edge_types": edge_types_matrix,
+    }
+    return sampled_graph
 
 
 def sample_birth_locations(unmatched_x1, t, sigma=1.0):

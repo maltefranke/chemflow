@@ -42,26 +42,30 @@ class LightningDataModule(pl.LightningDataModule):
         Returns a batched graph with proper node and edge indexing.
         """
         # Extract required components
-        atom_feats_list = [item['atom_feats'] for item in batch]
-        coord_list = [item['coord'] for item in batch]
-        edge_index_list = [item['edge_index'] for item in batch]
-        
+        atom_feats_list = [item["atom_feats"] for item in batch]
+        coord_list = [item["coord"] for item in batch]
+        edge_index_list = [item["edge_index"] for item in batch]
+
         # Check if optional components exist in the first item
-        has_edge_attr = 'edge_attr' in batch[0] and batch[0]['edge_attr'] is not None
-        has_graph_attr = 'graph_attr' in batch[0] and batch[0]['graph_attr'] is not None
-        
+        has_edge_attr = "edge_attr" in batch[0] and batch[0]["edge_attr"] is not None
+        has_graph_attr = "graph_attr" in batch[0] and batch[0]["graph_attr"] is not None
+
         # Extract optional components if they exist
-        edge_attr_list = [item.get('edge_attr') for item in batch] if has_edge_attr else None
-        graph_attr_list = [item.get('graph_attr') for item in batch] if has_graph_attr else None
-        
+        edge_attr_list = (
+            [item.get("edge_attr") for item in batch] if has_edge_attr else None
+        )
+        graph_attr_list = (
+            [item.get("graph_attr") for item in batch] if has_graph_attr else None
+        )
+
         # Calculate cumulative node counts for batch indexing
         num_nodes = [feats.size(0) for feats in atom_feats_list]
         cumsum_nodes = torch.cumsum(torch.tensor([0] + num_nodes[:-1]), dim=0)
-        
+
         # Concatenate node features and coordinates
         batched_atom_feats = torch.cat(atom_feats_list, dim=0)
         batched_coord = torch.cat(coord_list, dim=0)
-        
+
         # Adjust edge indices by adding cumulative node counts
         batched_edge_index = []
         for i, edge_index in enumerate(edge_index_list):
@@ -69,41 +73,45 @@ class LightningDataModule(pl.LightningDataModule):
             offset = cumsum_nodes[i]
             adjusted_edge_index = edge_index + offset
             batched_edge_index.append(adjusted_edge_index)
-        
+
         # Concatenate edge indices
         batched_edge_index = torch.cat(batched_edge_index, dim=1)
-        
+
         # Handle optional edge attributes
         if has_edge_attr and edge_attr_list[0] is not None:
             batched_edge_attr = torch.cat(edge_attr_list, dim=0)
         else:
             batched_edge_attr = None
-        
+
         # Handle optional graph attributes
         if has_graph_attr and graph_attr_list[0] is not None:
             batched_graph_attr = torch.stack(graph_attr_list, dim=0)
         else:
             batched_graph_attr = None
-        
+
         # Create batch index tensor to track which nodes belong to which graph
-        batch_index = torch.cat([torch.full((num_nodes[i],), i, dtype=torch.long) 
-                                for i in range(len(batch))])
-        
+        batch_index = torch.cat(
+            [
+                torch.full((num_nodes[i],), i, dtype=torch.long)
+                for i in range(len(batch))
+            ]
+        )
+
         # Build result dictionary with only present attributes
         result = {
-            'atom_feats': batched_atom_feats,
-            'coord': batched_coord,
-            'edge_index': batched_edge_index,
-            'batch_index': batch_index,
-            'num_nodes': torch.tensor(num_nodes)
+            "atom_feats": batched_atom_feats,
+            "coord": batched_coord,
+            "edge_index": batched_edge_index,
+            "batch_index": batch_index,
+            "num_nodes": torch.tensor(num_nodes),
         }
-        
+
         # Add optional attributes if they exist
         if batched_edge_attr is not None:
-            result['edge_attr'] = batched_edge_attr
+            result["edge_attr"] = batched_edge_attr
         if batched_graph_attr is not None:
-            result['graph_attr'] = batched_graph_attr
-            
+            result["graph_attr"] = batched_graph_attr
+
         return result
 
     def train_dataloader(self):
