@@ -1,0 +1,61 @@
+## Put your model args here
+K: 10
+D: 3
+N_types: 4
+
+module:
+  _target_: chemflow.model.lightning_module.LightningModule
+  # args and kwargs 
+
+  # The 'model' key below is an argument to your LightningModule
+  model:
+    _target_: chemflow.model.gnn.EGNNwithHeads
+    _recursive_: false
+
+    embedding_args: ${model.embedding}
+    egnn_args: ${model.egnn}
+    heads_args: ${model.heads}
+
+embedding:
+  _target_: chemflow.model.embedding.Embedding
+  in_nf: 10
+  out_nf: 32
+
+egnn:
+  _target_: src.external_code.egnn.EGNN
+  in_node_nf: ${model.embedding.out_nf}
+  hidden_nf: 64
+  out_node_nf: 64
+  in_edge_nf: 0
+  n_layers: 3
+  residual: True
+  attention: False
+  normalize: False
+  tanh: False
+
+heads:
+  _target_: chemflow.model.heads.MultiHeadModule
+
+  heads_configs:
+    node_heads:
+      class_head:
+        input_dim: ${model.egnn.out_node_nf}
+        output_dim: 10
+        hidden_dim: 32
+
+      pos_head:
+        input_dim: ${model.egnn.out_node_nf}
+        output_dim: 3
+
+    graph_heads:
+      net_rate_head:
+        input_dim: ${model.egnn.out_node_nf}
+        output_dim: 1
+        hidden_dim: 32
+        aggregation: mean
+
+      gmm_head:
+        input_dim: ${model.egnn.out_node_nf}
+        output_dim: ${oc.eval:"${model.K} + 2*${model.K}*${model.D} + ${model.K}*${model.N_types}"}
+        aggregation: sum
+      

@@ -2,7 +2,7 @@ import numpy as np
 import torch
 
 from chemflow.flow_matching.assignment import distance_based_assignment
-from chemflow.flow_matching.gmm import sample_from_gmm
+from chemflow.flow_matching.gmm import interpolate_gmm
 from chemflow.flow_matching.sampling import sample_birth_locations, sample_deaths
 
 
@@ -253,7 +253,7 @@ def interpolate_different_size(
 
             if unborn_x1_b.shape[0] > 0:
                 # Store the GMM samples for NLL calculation during training
-                birth_samples = sample_from_gmm(
+                birth_samples = interpolate_gmm(
                     unborn_x1_b, t_b, num_samples=N_loc_samples
                 )
                 birth_next_locations.append(birth_samples)

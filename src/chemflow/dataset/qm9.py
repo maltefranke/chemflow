@@ -33,7 +33,7 @@ class FlowMatchingQM9Dataset(QM9):
             all_num_atoms = []
             all_edge_types = []
 
-            for i in range(5):  # len(self)):
+            for i in range(len(self)):
                 data = super(FlowMatchingQM9Dataset, self).__getitem__(i)
 
                 num_atoms = data.num_nodes

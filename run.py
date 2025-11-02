@@ -3,8 +3,11 @@ import omegaconf
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from omegaconf import DictConfig
+from omegaconf import OmegaConf
 
 from chemflow.utils import build_callbacks
+
+OmegaConf.register_new_resolver("oc.eval", eval)
 
 
 def run(cfg: DictConfig):

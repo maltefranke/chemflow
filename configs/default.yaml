@@ -1,7 +1,7 @@
 defaults:
   - _self_
   - data: data
-  - model: egnn
+  - model: egnn_qm9
   - trainer: trainer
   - callbacks: callbacks
   - logging: wandb_logger

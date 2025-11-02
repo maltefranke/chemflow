@@ -1,0 +1,32 @@
+## Put your data args here
+
+root_path: ${oc.env:PROJECT_ROOT}/data
+preprocess_workers: 0
+
+datamodule:
+  _target_: chemflow.dataset.lightning_datamodule.LightningDataModule
+
+  datasets:
+    train:
+      _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
+      root: ${data.root_path}/qm9_testing 
+      
+
+    val:
+      - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
+        root: ${data.root_path}/qm9_testing 
+
+    test:
+      - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
+        root: ${data.root_path}/qm9_testing 
+        
+
+  num_workers:
+    train: 0
+    val: 0
+    test: 0
+
+  batch_size:
+    train: 64
+    val: 64
+    test: 64
