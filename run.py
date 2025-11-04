@@ -1,5 +1,6 @@
 import hydra
 import omegaconf
+import torch
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from omegaconf import DictConfig
@@ -10,6 +11,8 @@ from chemflow.utils import build_callbacks
 OmegaConf.register_new_resolver("oc.eval", eval)
 OmegaConf.register_new_resolver("len", lambda x: len(x))
 
+torch.set_float32_matmul_precision("medium")
+
 
 def run(cfg: DictConfig):
     # Instantiate datamodule given the datamolecule
@@ -17,8 +20,6 @@ def run(cfg: DictConfig):
     datamodule: pl.LightningDataModule = hydra.utils.instantiate(
         cfg.data.datamodule, _recursive_=False
     )
-
-    print(datamodule.train_dataset[0])
 
     # Instantiate module
     hydra.utils.log.info(f"Instantiating <{cfg.model.module._target_}>")
@@ -42,6 +43,9 @@ def run(cfg: DictConfig):
         module,
         datamodule=datamodule,
     )
+
+    results = trainer.predict(module, dataloaders=datamodule.test_dataloader())
+    torch.save(results, "results.pt")
 
 
 @hydra.main(

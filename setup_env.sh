@@ -28,5 +28,20 @@ uv venv
 echo "Activating virtual environment..."
 source .venv/bin/activate
 
+# Install project in editable mode (without torch-scatter)
+echo "Installing project in editable mode..."
+uv pip install -e .
+
+# Get torch version
+TORCH_VERSION=$(python -c "import torch; print(torch.__version__)")
+CUDA_VERSION=$(python -c "import torch; print(torch.version.cuda.replace('.', ''))" || echo "cpu")
+
+# Determine the correct find-links URL
+SEARCH_URL="https://data.pyg.org/whl/torch-${TORCH_VERSION}.html"
+
+# Install torch-scatter with the correct version
+echo "Installing torch-cluster for torch ${TORCH_VERSION} with CUDA ${CUDA_VERSION}..."
+uv pip install torch-cluster -f "$SEARCH_URL" 
+
 echo "Environment setup complete! You can now activate it with:"
 echo "source .venv/bin/activate" 

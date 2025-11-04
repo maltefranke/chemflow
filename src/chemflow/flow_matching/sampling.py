@@ -42,7 +42,7 @@ def sample_births(unmatched_x1, unmatched_c1, t, sigma=1.0):
     num_unmatched_atoms = unmatched_x1.shape[0]
 
     # sample birth times
-    birth_times = torch.rand(num_unmatched_atoms)
+    birth_times = torch.rand(num_unmatched_atoms, device=unmatched_x1.device)
 
     # select birth times that are less than t
     birth_times_mask = birth_times < t
@@ -67,7 +67,7 @@ def sample_deaths(unmatched_x0, unmatched_c0, t):
     num_unmatched_atoms = unmatched_x0.shape[0]
 
     # sample death times
-    death_times = torch.rand(num_unmatched_atoms)
+    death_times = torch.rand(num_unmatched_atoms, device=unmatched_x0.device)
     is_dead = death_times < t
     x0_alive_at_xt = unmatched_x0[~is_dead]
     c0_alive_at_xt = unmatched_c0[~is_dead]

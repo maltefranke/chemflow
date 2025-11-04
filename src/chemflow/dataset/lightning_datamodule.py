@@ -87,7 +87,7 @@ class LightningDataModule(pl.LightningDataModule):
         # Create batch index tensor to track which nodes belong to which graph
         batch_index = torch.cat(
             [
-                torch.full((N_atoms[i],), i, dtype=torch.long)
+                torch.full((N_atoms[i],), i, dtype=torch.long, device=batched_atom_types.device)
                 for i in range(len(graph_dicts))
             ]
         )
@@ -95,7 +95,7 @@ class LightningDataModule(pl.LightningDataModule):
         N_triu_edges = (N_atoms**2 - N_atoms) // 2
         edge_type_batch_index = torch.cat(
             [
-                torch.full((N_triu_edges[i],), i, dtype=torch.long)
+                torch.full((N_triu_edges[i],), i, dtype=torch.long, device=batched_edge_types.device)
                 for i in range(len(graph_dicts))
             ]
         )

@@ -39,7 +39,7 @@ def interpolate_discrete(c0, c1, t):
     c1_idx = torch.argmax(c1, dim=-1)
 
     # Sample Bernoulli mask for which positions to keep from y0
-    mask = torch.rand(N) > t  # True = keep from y0
+    mask = torch.rand(N, device=c0.device) > t  # True = keep from y0
 
     # Start from y1 and overwrite with y0 where mask=True
     c1_idx[mask] = c0_idx[mask]
@@ -155,7 +155,7 @@ def interpolate_different_size(
             death_xt_i = interpolate_continuous(x0_alive_at_xt, x_sink, t_i)
 
             death_c1_i = death_token * torch.ones(
-                (death_xt_i.shape[0],), dtype=torch.long
+                (death_xt_i.shape[0],), dtype=torch.long, device=death_xt_i.device
             )
             death_c1_i = F.one_hot(death_c1_i, num_classes=len(tokens))
             death_ct_i = interpolate_discrete(c0_alive_at_xt, death_c1_i, t_i)
@@ -177,9 +177,9 @@ def interpolate_different_size(
             birth_ct.append(empty_c)
             birth_cvf.append(empty_c)
 
-            birth_rate_target.append(torch.zeros((1, 1)))
-            birth_locations.append(torch.ones((1, D)) * -1e3)
-            birth_types.append(torch.ones((1, M)) * -1e3)
+            birth_rate_target.append(torch.zeros((1, 1), device=x0.device))
+            birth_locations.append(-1e3 * torch.ones((1, D), device=x0.device) )
+            birth_types.append(-1e3 * torch.ones((1, M), device=x0.device))
 
         # 2.4 Birth process
         elif unmatched_x1_i.shape[0] > 0:
@@ -196,7 +196,7 @@ def interpolate_different_size(
             N_necessary_births = unmatched_x1_i.shape[0] - birth_xt_i.shape[0]
             birth_rate_target_i = N_necessary_births * instantaneous_rate
             birth_ct_i = mask_token * torch.ones(
-                (birth_xt_i.shape[0],), dtype=torch.long
+                (birth_xt_i.shape[0],), dtype=torch.long, device=birth_xt_i.device
             )
             birth_ct_i = F.one_hot(birth_ct_i, num_classes=len(tokens))
 
@@ -205,7 +205,7 @@ def interpolate_different_size(
 
             death_ct.append(empty_c)
             death_cvf.append(empty_c)
-            death_rate_target.append(torch.zeros((1, 1)))
+            death_rate_target.append(torch.zeros((1, 1), device=x0.device))
 
             birth_xt.append(birth_xt_i)
             birth_vf.append((birth_mu - birth_xt_i) * instantaneous_rate)
@@ -230,8 +230,10 @@ def interpolate_different_size(
                 birth_types.append(sampled_types)
             else:
                 # if no unborn x1, you're done, so pad with very negative numbers
-                birth_locations.append(-1e3 * torch.ones((1, D)))
-                birth_types.append(torch.ones((1, M)) * -1e3)
+                birth_locations.append(
+                    -1e3 * torch.ones((1, D), device=birth_xt_i.device)
+                )
+                birth_types.append(-1e3 * torch.ones((1, M), device=birth_xt_i.device))
 
         # 2.5 No birth or death process, just movement
         else:
@@ -240,7 +242,7 @@ def interpolate_different_size(
 
             death_ct.append(empty_c)
             death_cvf.append(empty_c)
-            death_rate_target.append(torch.zeros((1, 1)))
+            death_rate_target.append(torch.zeros((1, 1), device=x0.device))
 
             birth_xt.append(empty_x)
             birth_vf.append(empty_x)
@@ -248,9 +250,9 @@ def interpolate_different_size(
             birth_ct.append(empty_c)
             birth_cvf.append(empty_c)
 
-            birth_rate_target.append(torch.zeros((1, 1)))
-            birth_locations.append(-1e3 * torch.ones((1, D)))
-            birth_types.append(torch.ones((1, M)) * -1e3)
+            birth_rate_target.append(torch.zeros((1, 1), device=x0.device))
+            birth_locations.append(-1e3 * torch.ones((1, D), device=x0.device))
+            birth_types.append(torch.ones((1, M), device=x0.device) * -1e3)
 
     # 3. Concatenate the matched, death, and birth processes
     xt_list = [
@@ -275,7 +277,7 @@ def interpolate_different_size(
     ]
 
     N_t = torch.tensor([xt.shape[0] for xt in xt_list])
-    xt_batch_id = torch.repeat_interleave(torch.arange(len(xt_list)), N_t)
+    xt_batch_id = torch.repeat_interleave(torch.arange(len(xt_list)), N_t).to(x0.device)
 
     xt = torch.cat(xt_list, dim=0)
     ct = torch.cat(ct_list, dim=0)
@@ -292,7 +294,7 @@ def interpolate_different_size(
     )
     birth_locations_batch_ids = torch.repeat_interleave(
         torch.arange(len(birth_locations)), N_birth_samples, dim=0
-    )
+    ).to(x0.device)
     birth_locations = torch.cat(birth_locations, dim=0)
     birth_types = torch.cat(birth_types, dim=0)
 
