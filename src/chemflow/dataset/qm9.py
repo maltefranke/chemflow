@@ -1,14 +1,20 @@
 from torch_geometric.datasets import QM9
 import os
 import torch
-from torch_geometric.utils import to_dense_adj
+
 from chemflow.flow_matching.sampling import sample_prior_graph
-from chemflow.utils import edge_types_to_triu_entries
+from chemflow.utils import (
+    edge_types_to_triu_entries,
+    z_to_atom_types,
+    token_to_index,
+)
 
 
 class FlowMatchingQM9Dataset(QM9):
-    def __init__(self, root, transform=None, pre_transform=None):
+    def __init__(self, root, tokens: list[str], transform=None, pre_transform=None):
         super().__init__(root, transform, pre_transform)
+
+        self.tokens = tokens
 
         distributions = self.get_distributions()
         self.atom_type_distribution = distributions["atom_type_distribution"]
@@ -21,10 +27,18 @@ class FlowMatchingQM9Dataset(QM9):
             return torch.load(distributions_file)
         else:
             distributions = {}
-            atom_types = self.z.unique().sort()[0]
+            atom_types = z_to_atom_types(self.z.tolist())
+            atom_type_indices = [
+                token_to_index(self.tokens, token) for token in atom_types
+            ]
+            atom_type_indices = torch.tensor(atom_type_indices, dtype=torch.long)
+
             # add a NONE-ATOM at 0
-            atom_types = torch.cat([torch.tensor([0]), atom_types])
-            atom_type_distribution = (self.z.unsqueeze(1) == atom_types).sum(dim=0)
+            atom_types = torch.tensor(torch.arange(len(self.tokens)), dtype=torch.long)
+
+            atom_type_distribution = (atom_type_indices.unsqueeze(1) == atom_types).sum(
+                dim=0
+            )
             atom_type_distribution = (
                 atom_type_distribution / atom_type_distribution.sum()
             )
@@ -70,8 +84,13 @@ class FlowMatchingQM9Dataset(QM9):
         data = super().__getitem__(index)
 
         # remove center of mass
-        coord = data.pos - data.pos.mean(dim=1)
+        coord = data.pos - data.pos.mean(dim=0)
+
         atom_types = data.z
+        atom_types = z_to_atom_types(atom_types.tolist())
+        atom_types = [token_to_index(self.tokens, token) for token in atom_types]
+        atom_types = torch.tensor(atom_types, dtype=torch.long)
+
         edge_types = edge_types_to_triu_entries(
             data.edge_index, data.edge_attr, data.num_nodes
         )

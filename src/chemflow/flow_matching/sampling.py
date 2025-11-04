@@ -1,5 +1,6 @@
 import torch
 from torch.distributions import Categorical, MixtureSameFamily, Normal, Independent
+import torch.nn.functional as F
 
 
 def sample_prior_graph(
@@ -13,7 +14,8 @@ def sample_prior_graph(
     N_atoms = p_n_atoms.sample()
 
     # sample atom types from train distribution
-    atom_types = p_atom_types.sample(sample_shape=(N_atoms,))
+    # atom_types = p_atom_types.sample(sample_shape=(N_atoms,))
+    atom_types = torch.zeros(N_atoms, dtype=torch.long)
 
     # sample coordinates randomly
     coord = torch.randn(N_atoms, 3)
@@ -36,7 +38,7 @@ def sample_prior_graph(
     return sampled_graph
 
 
-def sample_birth_locations(unmatched_x1, t, sigma=1.0):
+def sample_births(unmatched_x1, unmatched_c1, t, sigma=1.0):
     num_unmatched_atoms = unmatched_x1.shape[0]
 
     # sample birth times
@@ -48,15 +50,16 @@ def sample_birth_locations(unmatched_x1, t, sigma=1.0):
     birth_mu = unmatched_x1[birth_times_mask]
 
     unborn_x1 = unmatched_x1[~birth_times_mask]
+    unborn_c1 = unmatched_c1[~birth_times_mask]
 
     # sigma has shrinking variance with time
     # intuition: we are more certain about the birth location as time goes on
     sigma = sigma * (1 - t)
     birth_location_t_birth = birth_mu + torch.randn_like(birth_mu) * sigma
-    return birth_times, birth_location_t_birth, birth_mu, unborn_x1
+    return birth_times, birth_location_t_birth, birth_mu, unborn_x1, unborn_c1
 
 
-def sample_deaths(unmatched_x0, t):
+def sample_deaths(unmatched_x0, unmatched_c0, t):
     """
     unmatched_x0 (N, D)
     t (float)
@@ -67,4 +70,5 @@ def sample_deaths(unmatched_x0, t):
     death_times = torch.rand(num_unmatched_atoms)
     is_dead = death_times < t
     x0_alive_at_xt = unmatched_x0[~is_dead]
-    return death_times, is_dead, x0_alive_at_xt
+    c0_alive_at_xt = unmatched_c0[~is_dead]
+    return death_times, is_dead, x0_alive_at_xt, c0_alive_at_xt

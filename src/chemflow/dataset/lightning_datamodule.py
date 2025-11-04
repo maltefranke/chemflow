@@ -12,8 +12,6 @@ class LightningDataModule(pl.LightningDataModule):
         num_workers: DictConfig,
         batch_size: DictConfig,
     ):
-        super().__init__()
-
         self.datasets = datasets
         self.num_workers = num_workers
         self.batch_size = batch_size
@@ -22,6 +20,10 @@ class LightningDataModule(pl.LightningDataModule):
         self.train_dataset = None
         self.val_datasets = None
         self.test_datasets = None
+
+        self.setup()
+
+        super().__init__()
 
     def setup(self, stage=None):
         """Construct datasets and assign data scalers."""
@@ -34,7 +36,7 @@ class LightningDataModule(pl.LightningDataModule):
             hydra.utils.instantiate(dataset_cfg) for dataset_cfg in self.datasets.test
         ]
 
-    def collate_fn(self, batch):
+    def collate_graphs(self, graph_dicts: list[dict]):
         """
         Collate function for graph datasets.
         Each item in batch is a dictionary with keys: atom_feats, coord, edge_index,
@@ -42,40 +44,33 @@ class LightningDataModule(pl.LightningDataModule):
         Returns a batched graph with proper node and edge indexing.
         """
         # Extract required components
-        atom_feats_list = [item["atom_feats"] for item in batch]
-        coord_list = [item["coord"] for item in batch]
-        edge_index_list = [item["edge_index"] for item in batch]
+        atom_types_list = [item["atom_types"] for item in graph_dicts]
+        coord_list = [item["coord"] for item in graph_dicts]
+        edge_types_list = [item["edge_types"] for item in graph_dicts]
 
         # Check if optional components exist in the first item
-        has_edge_attr = "edge_attr" in batch[0] and batch[0]["edge_attr"] is not None
-        has_graph_attr = "graph_attr" in batch[0] and batch[0]["graph_attr"] is not None
+        has_edge_attr = (
+            "edge_attr" in graph_dicts[0] and graph_dicts[0]["edge_attr"] is not None
+        )
+        has_graph_attr = (
+            "graph_attr" in graph_dicts[0] and graph_dicts[0]["graph_attr"] is not None
+        )
 
         # Extract optional components if they exist
         edge_attr_list = (
-            [item.get("edge_attr") for item in batch] if has_edge_attr else None
+            [item.get("edge_attr") for item in graph_dicts] if has_edge_attr else None
         )
         graph_attr_list = (
-            [item.get("graph_attr") for item in batch] if has_graph_attr else None
+            [item.get("graph_attr") for item in graph_dicts] if has_graph_attr else None
         )
 
-        # Calculate cumulative node counts for batch indexing
-        num_nodes = [feats.size(0) for feats in atom_feats_list]
-        cumsum_nodes = torch.cumsum(torch.tensor([0] + num_nodes[:-1]), dim=0)
+        # Calculate node counts for batch indexing
+        N_atoms = torch.tensor([feats.size(0) for feats in atom_types_list])
 
-        # Concatenate node features and coordinates
-        batched_atom_feats = torch.cat(atom_feats_list, dim=0)
+        # Concatenate node features, coordinates, and edge types
+        batched_atom_types = torch.cat(atom_types_list, dim=0)
         batched_coord = torch.cat(coord_list, dim=0)
-
-        # Adjust edge indices by adding cumulative node counts
-        batched_edge_index = []
-        for i, edge_index in enumerate(edge_index_list):
-            # Add offset to edge indices
-            offset = cumsum_nodes[i]
-            adjusted_edge_index = edge_index + offset
-            batched_edge_index.append(adjusted_edge_index)
-
-        # Concatenate edge indices
-        batched_edge_index = torch.cat(batched_edge_index, dim=1)
+        batched_edge_types = torch.cat(edge_types_list, dim=0)
 
         # Handle optional edge attributes
         if has_edge_attr and edge_attr_list[0] is not None:
@@ -92,18 +87,28 @@ class LightningDataModule(pl.LightningDataModule):
         # Create batch index tensor to track which nodes belong to which graph
         batch_index = torch.cat(
             [
-                torch.full((num_nodes[i],), i, dtype=torch.long)
-                for i in range(len(batch))
+                torch.full((N_atoms[i],), i, dtype=torch.long)
+                for i in range(len(graph_dicts))
+            ]
+        )
+
+        N_triu_edges = (N_atoms**2 - N_atoms) // 2
+        edge_type_batch_index = torch.cat(
+            [
+                torch.full((N_triu_edges[i],), i, dtype=torch.long)
+                for i in range(len(graph_dicts))
             ]
         )
 
         # Build result dictionary with only present attributes
         result = {
-            "atom_feats": batched_atom_feats,
+            "atom_types": batched_atom_types,
             "coord": batched_coord,
-            "edge_index": batched_edge_index,
+            "edge_types": batched_edge_types,
             "batch_index": batch_index,
-            "num_nodes": torch.tensor(num_nodes),
+            "edge_type_batch_index": edge_type_batch_index,
+            "N_atoms": torch.tensor(N_atoms),
+            "N_triu_edges": torch.tensor(N_triu_edges),
         }
 
         # Add optional attributes if they exist
@@ -113,6 +118,12 @@ class LightningDataModule(pl.LightningDataModule):
             result["graph_attr"] = batched_graph_attr
 
         return result
+
+    def collate_fn(self, batch):
+        samples, targets = zip(*batch)
+        samples_batched = self.collate_graphs(samples)
+        targets_batched = self.collate_graphs(targets)
+        return samples_batched, targets_batched
 
     def train_dataloader(self):
         # Return a DataLoader for training

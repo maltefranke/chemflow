@@ -7,6 +7,7 @@ from pytorch_lightning.callbacks import (
 )
 import torch
 from torch_geometric.utils import to_dense_adj
+from rdkit import Chem
 
 
 def build_callbacks(cfg: DictConfig) -> list[Callback]:
@@ -67,3 +68,20 @@ def edge_types_to_triu_entries(edge_index, edge_types_one_hot, num_atoms):
     triu_edge_types = adj_matrix[triu_indices[0], triu_indices[1]]
 
     return triu_edge_types
+
+
+def z_to_atom_types(z):
+    """Convert the atomic numbers to atom symbols with rdkit."""
+
+    atom_symbols = []
+    for z_i in z:
+        atom_symbols.append(Chem.GetPeriodicTable().GetElementSymbol(z_i))
+    return atom_symbols
+
+
+def token_to_index(token_list, token: str):
+    return token_list.index(token)
+
+
+def index_to_token(token_list, index: int):
+    return token_list[index]

@@ -13,12 +13,13 @@ class BaseEGNN(nn.Module):
         self.embedding = hydra.utils.instantiate(embedding_args)
         self.egnn = hydra.utils.instantiate(egnn_args)
 
-    def forward(self, atom_feats, coord, edge_index, edge_attr=None, node_attr=None):
+    def forward(self, atom_feats, coord, edge_index, edge_attr=None):
         # first embed the atom feats
         h = self.embedding(atom_feats)
+        edge_index = (edge_index[0], edge_index[1])
 
         # then pass the data through the EGNN
-        h, coord, _ = self.egnn(h, edge_index, coord, edge_attr, node_attr)
+        h, coord = self.egnn(h, coord, edge_index, edge_attr)
 
         return h, coord
 
@@ -32,9 +33,7 @@ class EGNNwithHeads(BaseEGNN):
         super().__init__(embedding_args, egnn_args)
         self.heads = hydra.utils.instantiate(heads_args)
 
-    def forward(
-        self, atom_feats, coord, edge_index, edge_attr=None, node_attr=None, batch=None
-    ):
+    def forward(self, atom_feats, coord, edge_index, edge_attr=None, batch=None):
         """
         Forward pass through EGNN with heads.
 
@@ -43,13 +42,12 @@ class EGNNwithHeads(BaseEGNN):
             coord: Node coordinates
             edge_index: Edge indices
             edge_attr: Edge attributes (optional)
-            node_attr: Node attributes (optional)
             batch: Batch assignment for each node (required for graph-level heads)
 
         Returns:
             Dictionary mapping head names to their outputs
         """
-        h, coord = super().forward(atom_feats, coord, edge_index, edge_attr, node_attr)
+        h, coord = super().forward(atom_feats, coord, edge_index, edge_attr)
 
         # Pass through heads
         if batch is not None:

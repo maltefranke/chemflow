@@ -3,6 +3,8 @@
 root_path: ${oc.env:PROJECT_ROOT}/data
 preprocess_workers: 0
 
+tokens: [<MASK>, <DEATH>, C, H, O, N, F, Cl, Br, I]
+
 datamodule:
   _target_: chemflow.dataset.lightning_datamodule.LightningDataModule
 
@@ -10,16 +12,18 @@ datamodule:
     train:
       _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
       root: ${data.root_path}/qm9_testing 
+      tokens: ${data.tokens}
       
 
     val:
       - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
         root: ${data.root_path}/qm9_testing 
+        tokens: ${data.tokens}
 
     test:
       - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
         root: ${data.root_path}/qm9_testing 
-        
+        tokens: ${data.tokens}
 
   num_workers:
     train: 0
@@ -27,6 +31,6 @@ datamodule:
     test: 0
 
   batch_size:
-    train: 64
-    val: 64
-    test: 64
+    train: 4
+    val: 4
+    test: 4

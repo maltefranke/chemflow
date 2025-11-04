@@ -14,7 +14,11 @@ dependencies = [
     "torch-geometric>=2.7.0",
     "torchvision>=0.24.0",
     "wandb>=0.22.2",
+    "torch-cluster>=1.6.3"
 ]
+
+ [tool.uv.extra-build-dependencies]
+      torch-cluster = ["torch"]
 
 [build-system]
 requires = ["hatchling"]

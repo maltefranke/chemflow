@@ -8,6 +8,7 @@ from omegaconf import OmegaConf
 from chemflow.utils import build_callbacks
 
 OmegaConf.register_new_resolver("oc.eval", eval)
+OmegaConf.register_new_resolver("len", lambda x: len(x))
 
 
 def run(cfg: DictConfig):
@@ -16,6 +17,8 @@ def run(cfg: DictConfig):
     datamodule: pl.LightningDataModule = hydra.utils.instantiate(
         cfg.data.datamodule, _recursive_=False
     )
+
+    print(datamodule.train_dataset[0])
 
     # Instantiate module
     hydra.utils.log.info(f"Instantiating <{cfg.model.module._target_}>")

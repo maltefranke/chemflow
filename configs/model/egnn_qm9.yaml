@@ -1,11 +1,12 @@
 ## Put your model args here
 K: 10
 D: 3
-N_types: 4
 
 module:
   _target_: chemflow.model.lightning_module.LightningModule
   # args and kwargs 
+
+  tokens: ${data.tokens}
 
   # The 'model' key below is an argument to your LightningModule
   model:
@@ -18,7 +19,7 @@ module:
 
 embedding:
   _target_: chemflow.model.embedding.Embedding
-  in_nf: 10
+  in_nf: ${len:${data.tokens}}
   out_nf: 32
 
 egnn:
@@ -40,7 +41,7 @@ heads:
     node_heads:
       class_head:
         input_dim: ${model.egnn.out_node_nf}
-        output_dim: 10
+        output_dim: ${len:${data.tokens}}
         hidden_dim: 32
 
       pos_head:
@@ -56,6 +57,6 @@ heads:
 
       gmm_head:
         input_dim: ${model.egnn.out_node_nf}
-        output_dim: ${oc.eval:"${model.K} + 2*${model.K}*${model.D} + ${model.K}*${model.N_types}"}
+        output_dim: ${oc.eval:"${model.K} + 2*${model.K}*${model.D} + ${model.K}*${len:${data.tokens}}"}
         aggregation: sum
       
