@@ -5,8 +5,29 @@ D: 3
 module:
   _target_: chemflow.model.lightning_module.LightningModule
   # args and kwargs 
+  # tokens and atom_type_distribution will be passed from preprocessing in run.py
 
-  tokens: ${data.tokens}
+  weight_alpha: 1.0
+
+  # Loss component weights
+  loss_weights:
+    a_loss: 1.0
+    x_loss: 1.0
+    gmm_loss: 1.0
+    death_rate_loss: 0.1
+    birth_rate_loss: 0.1
+
+  # Optimizer configuration
+  optimizer_config:
+    optimizer:
+      _target_: torch.optim.Adam
+      lr: 1e-2
+    scheduler:
+      _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+      mode: min
+      factor: 0.85
+      patience: 10
+    monitor: val_loss
 
   # The 'model' key below is an argument to your LightningModule
   model:

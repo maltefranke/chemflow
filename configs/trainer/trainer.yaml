@@ -11,4 +11,4 @@ trainer:
   gradient_clip_algorithm: value
   profiler: simple
 
-  val_check_interval: 5
+  val_check_interval: 1

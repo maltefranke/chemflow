@@ -302,6 +302,7 @@ def interpolate_typed_gmm(
 
     # Sample types
     sampled_types = Categorical(probs=chosen_type_probs).sample()
+    sampled_types = sampled_types.view(-1)
 
     return sampled_locations, sampled_types
 

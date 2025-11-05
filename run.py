@@ -15,16 +15,49 @@ torch.set_float32_matmul_precision("medium")
 
 
 def run(cfg: DictConfig):
-    # Instantiate datamodule given the datamolecule
+    # Instantiate preprocessing to compute distributions from training dataset
+    hydra.utils.log.info("Instantiating preprocessing...")
+    preprocessing = hydra.utils.instantiate(cfg.data.preprocessing)
+
+    # Extract tokens and distributions from preprocessing
+    tokens = preprocessing.tokens
+    atom_type_distribution = preprocessing.atom_type_distribution
+    edge_type_distribution = preprocessing.edge_type_distribution
+    n_atoms_distribution = preprocessing.n_atoms_distribution
+
+    OmegaConf.update(cfg.data, "tokens", tokens)
+
+    hydra.utils.log.info(
+        f"Preprocessing complete. Found {len(tokens)} tokens: {tokens}"
+    )
+    hydra.utils.log.info("Distributions computed from training dataset.")
+
+    # Instantiate datamodule
     hydra.utils.log.info(f"Instantiating <{cfg.data.datamodule._target_}>")
     datamodule: pl.LightningDataModule = hydra.utils.instantiate(
-        cfg.data.datamodule, _recursive_=False
+        cfg.data.datamodule,
+        _recursive_=False,
     )
+    # Set tokens and distributions after initialization
+    datamodule.set_tokens_and_distributions(
+        tokens=tokens,
+        atom_type_distribution=atom_type_distribution,
+        edge_type_distribution=edge_type_distribution,
+        n_atoms_distribution=n_atoms_distribution,
+    )
+    # Call setup to create datasets with tokens and distributions
+    datamodule.setup()
 
     # Instantiate module
     hydra.utils.log.info(f"Instantiating <{cfg.model.module._target_}>")
     module: pl.LightningModule = hydra.utils.instantiate(
-        cfg.model.module, _recursive_=False
+        cfg.model.module,
+        _recursive_=False,
+    )
+    # Set tokens and distribution after initialization
+    module.set_tokens_and_distribution(
+        tokens=tokens,
+        atom_type_distribution=atom_type_distribution,
     )
 
     # Setup logging and callbacks

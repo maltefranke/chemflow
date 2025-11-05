@@ -168,7 +168,6 @@ def integrate_step_gnn(
     birth_gmm_params: torch.Tensor,
     xt: torch.Tensor,
     ct: torch.Tensor,
-    xt_mask: torch.Tensor,
     batch_id: torch.Tensor,
     t: torch.Tensor,
     dt: float,
@@ -194,7 +193,6 @@ def integrate_step_gnn(
         birth_gmm_params: Shape (num_graphs, K + 2*K*D + K*N_types)
         xt: Shape (N_total, D) - current positions
         ct: Shape (N_total, num_classes) - current types (one-hot)
-        xt_mask: Shape (N_total,) - mask indicating which nodes are alive
         batch_id: Shape (N_total,) - batch assignment for each node
         t: Shape (num_graphs,) - current time for each graph
         dt: Time step
@@ -211,6 +209,9 @@ def integrate_step_gnn(
         xt_mask_new: Shape (N_final,) - updated masks
         batch_id_new: Shape (N_final,) - updated batch assignments
     """
+
+    xt_mask = torch.ones_like(batch_id, dtype=torch.bool, device=device)
+
     # 1. Update positions (Euler-Maruyama scheme)
     xt_new = xt + velocity * dt
 
@@ -266,17 +267,10 @@ def integrate_step_gnn(
         xt_final = torch.cat([xt_alive, new_particles], dim=0)
         ct_final = torch.cat([ct_alive, new_types], dim=0)
         batch_id_final = torch.cat([batch_id_alive, new_batch_ids], dim=0)
-        xt_mask_final = torch.cat(
-            [
-                torch.ones_like(batch_id_alive, dtype=torch.bool),
-                torch.ones_like(new_batch_ids, dtype=torch.bool),
-            ],
-            dim=0,
-        )
+
     else:
         xt_final = xt_alive
         ct_final = ct_alive
         batch_id_final = batch_id_alive
-        xt_mask_final = torch.ones_like(batch_id_alive, dtype=torch.bool)
 
-    return xt_final, ct_final, xt_mask_final, batch_id_final
+    return xt_final, ct_final, batch_id_final

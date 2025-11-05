@@ -4,6 +4,8 @@ from omegaconf import DictConfig
 import hydra
 import torch
 
+from chemflow.flow_matching.sampling import sample_prior_graph
+
 
 class LightningDataModule(pl.LightningDataModule):
     def __init__(
@@ -16,25 +18,54 @@ class LightningDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.batch_size = batch_size
 
+        # Will be set via setter methods
+        self.tokens = None
+        self.atom_type_distribution = None
+        self.edge_type_distribution = None
+        self.n_atoms_distribution = None
+
         # will be set later
         self.train_dataset = None
         self.val_datasets = None
         self.test_datasets = None
 
-        self.setup()
-
         super().__init__()
+
+    def set_tokens_and_distributions(
+        self,
+        tokens: list[str],
+        atom_type_distribution: torch.Tensor,
+        edge_type_distribution: torch.Tensor,
+        n_atoms_distribution: torch.Tensor,
+    ):
+        """Set tokens and distributions after initialization."""
+        self.tokens = tokens
+        self.atom_type_distribution = atom_type_distribution
+        self.edge_type_distribution = edge_type_distribution
+        self.n_atoms_distribution = n_atoms_distribution
 
     def setup(self, stage=None):
         """Construct datasets and assign data scalers."""
-        self.train_dataset = hydra.utils.instantiate(self.datasets.train)
-        self.val_datasets = [
-            hydra.utils.instantiate(dataset_cfg) for dataset_cfg in self.datasets.val
-        ]
+        # Check that tokens and distributions are set
+        if self.tokens is None:
+            raise ValueError(
+                "tokens and distributions must be set before calling setup(). "
+                "Call set_tokens_and_distributions() first."
+            )
 
-        self.test_datasets = [
-            hydra.utils.instantiate(dataset_cfg) for dataset_cfg in self.datasets.test
-        ]
+        # Inject tokens and distributions into dataset configs
+        train_cfg = self.datasets.train.copy()
+        self.train_dataset = hydra.utils.instantiate(train_cfg)
+
+        self.val_datasets = []
+        for dataset_cfg in self.datasets.val:
+            val_cfg = dataset_cfg.copy()
+            self.val_datasets.append(hydra.utils.instantiate(val_cfg))
+
+        self.test_datasets = []
+        for dataset_cfg in self.datasets.test:
+            test_cfg = dataset_cfg.copy()
+            self.test_datasets.append(hydra.utils.instantiate(test_cfg))
 
     def collate_graphs(self, graph_dicts: list[dict]):
         """
@@ -87,7 +118,9 @@ class LightningDataModule(pl.LightningDataModule):
         # Create batch index tensor to track which nodes belong to which graph
         batch_index = torch.cat(
             [
-                torch.full((N_atoms[i],), i, dtype=torch.long, device=batched_atom_types.device)
+                torch.full(
+                    (N_atoms[i],), i, dtype=torch.long, device=batched_atom_types.device
+                )
                 for i in range(len(graph_dicts))
             ]
         )
@@ -95,7 +128,12 @@ class LightningDataModule(pl.LightningDataModule):
         N_triu_edges = (N_atoms**2 - N_atoms) // 2
         edge_type_batch_index = torch.cat(
             [
-                torch.full((N_triu_edges[i],), i, dtype=torch.long, device=batched_edge_types.device)
+                torch.full(
+                    (N_triu_edges[i],),
+                    i,
+                    dtype=torch.long,
+                    device=batched_edge_types.device,
+                )
                 for i in range(len(graph_dicts))
             ]
         )
@@ -120,7 +158,17 @@ class LightningDataModule(pl.LightningDataModule):
         return result
 
     def collate_fn(self, batch):
-        samples, targets = zip(*batch)
+        targets = batch
+
+        samples = [
+            sample_prior_graph(
+                self.atom_type_distribution,
+                self.edge_type_distribution,
+                self.n_atoms_distribution,
+            )
+            for _ in range(len(targets))
+        ]
+
         samples_batched = self.collate_graphs(samples)
         targets_batched = self.collate_graphs(targets)
         return samples_batched, targets_batched

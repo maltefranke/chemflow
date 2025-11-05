@@ -107,7 +107,7 @@ def typed_gmm_loss(
         target_types = target_types.unsqueeze(0)  # Shape: (1, N_samples)
         B = 1"""
         target_locations = target_locations.reshape(B, -1, D)
-        target_types = target_types.reshape(B, -1, N_types)
+        target_types = target_types.reshape(B, -1)
 
     # Ensure we have the right batch size
     if predicted_gmm_params.shape[0] != B:
@@ -141,7 +141,7 @@ def typed_gmm_loss(
     # Unsqueeze target to [B, N_samples, 1] for broadcasting.
     # Broadcasting [B, N_samples, 1] with [B, 1, K] gives [B, N_samples, K]
     # Resulting shape: [B, N_samples, K]
-    log_prob_types = type_dist.log_prob(target_types)
+    log_prob_types = type_dist.log_prob(target_types.unsqueeze(-1))
 
     # 4. Combine: log p(m) + log p(x|m) + log p(c|m)
     # log_mix_weights (B, 1, K) broadcasts to (B, N_samples, K)

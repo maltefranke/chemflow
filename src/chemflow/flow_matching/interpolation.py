@@ -178,8 +178,8 @@ def interpolate_different_size(
             birth_cvf.append(empty_c)
 
             birth_rate_target.append(torch.zeros((1, 1), device=x0.device))
-            birth_locations.append(-1e3 * torch.ones((1, D), device=x0.device) )
-            birth_types.append(-1e3 * torch.ones((1, M), device=x0.device))
+            birth_locations.append(-1e3 * torch.ones((1, D), device=x0.device))
+            birth_types.append(-1e3 * torch.ones((1), device=x0.device))
 
         # 2.4 Birth process
         elif unmatched_x1_i.shape[0] > 0:
@@ -220,7 +220,7 @@ def interpolate_different_size(
                 # birth_samples = interpolate_gmm(unborn_x1_i, t_i, num_samples=N_samples)
                 sampled_locations, sampled_types = interpolate_typed_gmm(
                     unborn_x1_i,
-                    unborn_c1_i,
+                    unborn_c1_i.argmax(dim=-1),
                     t_i,
                     M,
                     num_samples=N_samples,
@@ -233,7 +233,7 @@ def interpolate_different_size(
                 birth_locations.append(
                     -1e3 * torch.ones((1, D), device=birth_xt_i.device)
                 )
-                birth_types.append(-1e3 * torch.ones((1, M), device=birth_xt_i.device))
+                birth_types.append(-1e3 * torch.ones((1), device=birth_xt_i.device))
 
         # 2.5 No birth or death process, just movement
         else:
@@ -252,7 +252,7 @@ def interpolate_different_size(
 
             birth_rate_target.append(torch.zeros((1, 1), device=x0.device))
             birth_locations.append(-1e3 * torch.ones((1, D), device=x0.device))
-            birth_types.append(torch.ones((1, M), device=x0.device) * -1e3)
+            birth_types.append(-1e3 * torch.ones((1), device=x0.device))
 
     # 3. Concatenate the matched, death, and birth processes
     xt_list = [
