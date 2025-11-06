@@ -99,10 +99,15 @@ class EGNNwithHeads(BaseEGNN):
         self, embedding_args: DictConfig, egnn_args: DictConfig, heads_args: DictConfig
     ):
         super().__init__(embedding_args, egnn_args)
+        self.time_embedding = nn.Sequential(
+            nn.Linear(1, embedding_args["out_nf"]),
+            nn.SiLU(),
+            nn.Linear(embedding_args["out_nf"], embedding_args["out_nf"]),
+        )
         self.sinusoidal_embedding = SinusoidalEmbedding(embedding_args["out_nf"])
         self.heads = hydra.utils.instantiate(heads_args)
 
-    def forward(self, atom_feats, coord, edge_index, edge_attr=None, batch=None):
+    def forward(self, atom_feats, coord, edge_index, t, batch, edge_attr=None):
         """
         Forward pass through EGNN with heads.
 
@@ -116,12 +121,14 @@ class EGNNwithHeads(BaseEGNN):
         Returns:
             Dictionary mapping head names to their outputs
         """
+        N_nodes = torch.bincount(batch)
 
         h = self.embedding(atom_feats)
 
-        N_nodes = torch.bincount(batch)
+        # calculate conditioning embeddings
         N_nodes_embedding = self.sinusoidal_embedding(N_nodes)[batch]
-        h = h + N_nodes_embedding
+        t_embedding = self.time_embedding(t)[batch]
+        h = h + N_nodes_embedding + t_embedding
 
         edge_index = (edge_index[0], edge_index[1])
 

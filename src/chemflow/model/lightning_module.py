@@ -90,46 +90,48 @@ class LightningModule(pl.LightningModule):
         Returns:
             Weights tensor with same shape as atom_type_distribution
         """
-        # Compute weights: inverse frequency weighting
-        # To avoid division by zero, we use a small epsilon
+        # --- 1. Initial Weight Calculation (Inverse Frequency) ---
         epsilon = 1e-8
         weights = 1.0 / (atom_type_distribution + epsilon)
         weights = weights**self.weight_alpha  # Apply alpha scaling
 
-        # Handle special tokens
-        # Get indices of special tokens
+        # --- 2. Isolate & Normalize REGULAR Tokens ---
         special_token_indices = {self.mask_index, self.death_token_index}
-        # Get indices of regular (non-special) tokens
         all_indices = set(range(len(self.tokens)))
-        regular_token_indices = all_indices - special_token_indices
+        # Convert to list for indexing
+        regular_token_indices = list(all_indices - special_token_indices)
 
-        # Find the highest weight among regular tokens
-        if regular_token_indices:
-            regular_weights = weights[list(regular_token_indices)]
-            max_regular_weight = regular_weights.max()
-        else:
-            # Fallback if no regular tokens (shouldn't happen)
-            max_regular_weight = weights.max()
+        if not regular_token_indices:
+            # Fallback if no regular tokens (unlikely, but good to handle)
+            final_weights = torch.ones_like(weights)
+            final_weights[self.mask_index] = 0.0
+            # Death token gets a default 'high' weight of 1.0
+            final_weights[self.death_token_index] = 1.0
+            return final_weights
 
-        # Set mask token weight to 0 (never want to predict it)
-        weights[self.mask_index] = 0.0
+        # Get weights for only the regular tokens
+        regular_weights = weights[regular_token_indices]
 
-        # Set death token weight to highest regular token weight
-        # (since death tokens have count 0 but we do want to predict them)
-        weights[self.death_token_index] = max_regular_weight
+        # Normalize *only* the regular weights to have a mean of 1.0
+        mean_regular_weight = regular_weights.mean()
+        if mean_regular_weight > 0:
+            regular_weights = regular_weights / mean_regular_weight
 
-        # Normalize weights to have mean 1.0 (excluding mask token from normalization)
-        # We normalize based on non-mask tokens to maintain proper scaling
-        non_mask_indices = [i for i in range(len(weights)) if i != self.mask_index]
-        if non_mask_indices:
-            non_mask_weights = weights[non_mask_indices]
-            mean_non_mask_weight = non_mask_weights.mean()
-            if mean_non_mask_weight > 0:
-                weights = weights / mean_non_mask_weight
-                # Re-apply zero weight to mask after normalization
-                weights[self.mask_index] = 0.0
+        # Find the max weight *after* normalization
+        max_regular_weight = regular_weights.max()
 
-        return weights
+        # --- 3. Build Final Weights Tensor ---
+        # Start with zeros
+        final_weights = torch.zeros_like(weights)
+
+        # Assign normalized regular weights to their correct positions
+        final_weights[regular_token_indices] = regular_weights
+
+        # Assign special token weights based on the normalized regular weights
+        final_weights[self.mask_index] = 0.0
+        final_weights[self.death_token_index] = max_regular_weight
+
+        return final_weights
 
     def forward(self, x):
         # Define the forward pass of your model here
@@ -190,7 +192,7 @@ class LightningModule(pl.LightningModule):
         # TODO: make k a hyperparameter
         edge_index = knn_graph(xt, k=10, batch=xt_batch_id)
 
-        preds = self.model(at_ind, xt, edge_index, batch=xt_batch_id)
+        preds = self.model(at_ind, xt, edge_index, t.view(-1, 1), batch=xt_batch_id)
 
         a_pred = preds["class_head"]
         x_pred = preds["pos_head"]
@@ -319,7 +321,9 @@ class LightningModule(pl.LightningModule):
 
             # Get model predictions
             with torch.no_grad():
-                preds = self.model(at_ind, xt, edge_index, batch=batch_id)
+                preds = self.model(
+                    at_ind, xt, edge_index, t.view(-1, 1), batch=batch_id
+                )
 
             # Extract predictions
             type_pred = preds["class_head"]  # (N_total, num_classes)
@@ -389,7 +393,11 @@ class LightningModule(pl.LightningModule):
 
         return {
             "optimizer": optimizer,
-            "lr_scheduler": scheduler,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "monitor": self.optimizer_config.monitor,
+            },
             "monitor": self.optimizer_config.monitor,
         }
 
