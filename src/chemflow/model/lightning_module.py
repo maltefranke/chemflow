@@ -9,6 +9,7 @@ from torch_geometric.nn import knn_graph
 from chemflow.flow_matching.interpolation import interpolate_different_size
 from chemflow.flow_matching.integration import integrate_step_gnn
 from chemflow.utils import token_to_index
+from external_code.egnn import unsorted_segment_mean
 
 
 class LightningModule(pl.LightningModule):
@@ -190,11 +191,13 @@ class LightningModule(pl.LightningModule):
 
         # build kNN graph
         # TODO: make k a hyperparameter
-        edge_index = knn_graph(xt, k=10, batch=xt_batch_id)
+        edge_index = knn_graph(xt, k=20, batch=xt_batch_id)
 
         preds = self.model(at_ind, xt, edge_index, t.view(-1, 1), batch=xt_batch_id)
 
         a_pred = preds["class_head"]
+        a_pred = F.softmax(a_pred, dim=-1)
+
         x_pred = preds["pos_head"]
         gmm_pred = preds["gmm_head"]
 
@@ -214,11 +217,11 @@ class LightningModule(pl.LightningModule):
         # Always use weighted cross-entropy loss
         a_loss = F.cross_entropy(
             a_pred[mask],
-            targets["target_c"][mask],
+            targets["target_c"][mask].argmax(dim=-1),
             weight=self.token_weights,
         )
 
-        x_loss = F.mse_loss(x_pred, targets["target_x"])
+        x_loss = F.l1_loss(x_pred, targets["target_x"])
 
         gmm_loss = typed_gmm_loss(
             gmm_pred,
@@ -241,11 +244,16 @@ class LightningModule(pl.LightningModule):
             + self.loss_weights.death_rate_loss * death_rate_loss
             + self.loss_weights.birth_rate_loss * birth_rate_loss
         )
-        self.log("a_loss", a_loss, prog_bar=True)
-        self.log("x_loss", x_loss, prog_bar=True)
-        self.log("gmm_loss", gmm_loss, prog_bar=True)
-        self.log("death_rate_loss", death_rate_loss, prog_bar=True)
-        self.log("birth_rate_loss", birth_rate_loss, prog_bar=True)
+        self.log("loss", loss, prog_bar=True)
+        self.log("a_loss", self.loss_weights.a_loss * a_loss, prog_bar=True)
+        self.log("x_loss", self.loss_weights.x_loss * x_loss, prog_bar=True)
+        self.log("gmm_loss", self.loss_weights.gmm_loss * gmm_loss, prog_bar=True)
+        self.log(
+            "rate_loss",
+            self.loss_weights.death_rate_loss * death_rate_loss
+            + self.loss_weights.birth_rate_loss * birth_rate_loss,
+            prog_bar=True,
+        )
         loss = self.safe_loss(loss)
 
         return loss
@@ -317,7 +325,7 @@ class LightningModule(pl.LightningModule):
         # Integration loop: integrate from t=0 to t=1
         for _ in range(num_steps):
             # Build kNN graph
-            edge_index = knn_graph(xt, k=10, batch=batch_id)
+            edge_index = knn_graph(xt, k=20, batch=batch_id)
 
             # Get model predictions
             with torch.no_grad():
@@ -327,12 +335,14 @@ class LightningModule(pl.LightningModule):
 
             # Extract predictions
             type_pred = preds["class_head"]  # (N_total, num_classes)
+            type_pred = F.softmax(type_pred, dim=-1)
+
             velocity = preds["pos_head"]  # (N_total, D)
             # (num_graphs, K + 2*K*D + K*N_types)
             gmm_pred = preds["gmm_head"]
-            net_rate_pred = preds["net_rate_head"]  # (num_graphs, 1)
 
             # Process rates
+            net_rate_pred = preds["net_rate_head"]  # (num_graphs, 1)
             death_rate = F.relu(-net_rate_pred).squeeze(-1)  # (num_graphs,)
             birth_rate = F.relu(net_rate_pred).squeeze(-1)  # (num_graphs,)
 
@@ -355,6 +365,10 @@ class LightningModule(pl.LightningModule):
                 cat_noise_level=cat_noise_level,
                 device=self.device,
             )
+
+            # remove mean from xt for each batch
+            xt_mean_batch = unsorted_segment_mean(xt, batch_id, batch_size)
+            xt = xt - xt_mean_batch[batch_id]
 
             # Update time forward
             # Number of graphs stays constant (batch_size)

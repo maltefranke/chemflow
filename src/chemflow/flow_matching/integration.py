@@ -217,7 +217,7 @@ def integrate_step_gnn(
 
     # 2. Update types
     pred = torch.distributions.Categorical(F.softmax(type_pred, dim=-1)).sample()
-    curr = torch.argmax(type_pred, dim=-1)
+    curr = torch.argmax(ct, dim=-1)
 
     # Get time for each node (expand t to match nodes)
     num_graphs = t.shape[0]
@@ -254,6 +254,8 @@ def integrate_step_gnn(
     new_particles, new_types, new_batch_ids = sample_birth_process_gnn(
         birth_rate, birth_gmm_params, batch_id, dt, K, D, ct.shape[-1], device
     )
+    # TODO: quick fix to make new_types the mask. remove for final version
+    new_types = mask_index * torch.ones_like(new_types, dtype=torch.long, device=device)
 
     # 5. Remove dead nodes and combine with new particles
     # Keep only alive nodes from existing particles

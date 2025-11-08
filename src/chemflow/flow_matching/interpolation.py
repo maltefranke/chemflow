@@ -195,6 +195,8 @@ def interpolate_different_size(
 
             N_necessary_births = unmatched_x1_i.shape[0] - birth_xt_i.shape[0]
             birth_rate_target_i = N_necessary_births * instantaneous_rate
+
+            # TODO: change to sample from atom type distribution instead
             birth_ct_i = mask_token * torch.ones(
                 (birth_xt_i.shape[0],), dtype=torch.long, device=birth_xt_i.device
             )
@@ -211,6 +213,7 @@ def interpolate_different_size(
             birth_vf.append((birth_mu - birth_xt_i) * instantaneous_rate)
 
             birth_ct.append(birth_ct_i)
+            # TODO: needs to be changed if we sample from atom type distribution
             birth_cvf.append(birth_ct_i)
 
             birth_rate_target.append(birth_rate_target_i.view(1, 1))
