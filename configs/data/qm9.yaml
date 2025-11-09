@@ -10,9 +10,9 @@ n_atoms_distribution: None
 # Preprocessing configuration - computes tokens from data and distributions from training dataset only
 preprocessing:
   _target_: chemflow.dataset.preprocessing.Preprocessing
-  root: ${data.root_path}/qm9_testing
-  tokens_path: ${data.root_path}/processed/tokens.txt
-  distributions_path: ${data.root_path}/processed/distributions.pt
+  root: ${data.root_path}/qm9
+  tokens_path: ${data.root_path}/qm9/processed/tokens.txt
+  distributions_path: ${data.root_path}/qm9/processed/distributions.pt
   # Tokens and distributions will be discovered from data and saved to files
   # On subsequent runs, they will be loaded from the files
 
@@ -23,7 +23,7 @@ datamodule:
   datasets:
     train:
       _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
-      root: ${data.root_path}/qm9_testing
+      root: ${data.root_path}/qm9
       tokens: ${data.tokens}
       
 
@@ -43,6 +43,8 @@ datamodule:
     test: 0
 
   batch_size:
-    train: 4 # 1024
-    val: 4 # 1024
-    test: 4 # 1024
+    train: 784
+    val: 32
+    test: 32
+  
+  typed_gmm: ${model.module.typed_gmm}

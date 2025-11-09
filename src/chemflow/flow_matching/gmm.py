@@ -126,7 +126,7 @@ def sample_from_gmm(gmm_params, num_samples, K=10, D=1):
 # Includes a class label for each component
 
 
-def get_typed_gmm_components(gmm_params, K=10, D=1, N_types=4):
+def get_typed_gmm_components(gmm_params, K=10, D=3, N_types=4):
     """
     Create GMM component distributions from predicted parameters for the
     joint distribution p(m)p(x|m)p(c|m).
@@ -213,7 +213,12 @@ def get_typed_gmm_components(gmm_params, K=10, D=1, N_types=4):
 
 
 def interpolate_typed_gmm(
-    means, types, t, N_types, sigma=1.0, num_samples=100, mask_token_index=0
+    p_x_1,
+    p_c_0,
+    p_c_1,
+    t,
+    num_samples=20,
+    sigma=0.2,
 ):
     """
     Draws interpolated samples (x_t, c_t) given targets (x_1, c_1).
@@ -238,41 +243,37 @@ def interpolate_typed_gmm(
             - sampled_locations (torch.Tensor): Shape (num_samples, D)
             - sampled_types (torch.Tensor): Shape (num_samples,)
     """
-    N, D = means.shape
-    if N != types.shape[0]:
-        raise ValueError(
-            f"Shape mismatch: means.shape[0] ({N}) != types.shape[0] ({types.shape[0]})"
-        )
+    N, D = p_x_1.shape
 
     # Ensure t is a scalar
     t_scalar = t.item() if t.numel() == 1 else t
 
     # --- 1. Define Mixture Weights (Uniform) ---
     # We will pick one of the N target pairs uniformly to sample from.
-    mixture_weights = Categorical(probs=torch.ones(N, device=means.device))
+    mixture_weights = Categorical(probs=torch.ones(N, device=p_x_1.device))
 
     # --- 2. Define Spatial Components p(x|m) ---
     # Calculate the time-dependent sigma for all components
     # This is the standard deviation sigma(t)
     sigma_val = sigma * (1 - t_scalar)
-    sigmas = sigma_val * torch.ones_like(means)
+    sigmas = sigma_val * torch.ones_like(p_x_1)
 
     # The N spatial distributions are N(x_1, sigma(t)^2)
-    spatial_components = Independent(Normal(means, sigmas), 1)
+    spatial_components = Independent(Normal(p_x_1, sigmas), 1)
 
     # --- 3. Define Type Components p(c|m) ---
     # Define the "noise" distribution (p0) as all mask tokens
     # p0 = torch.ones(N_types, device=types.device) / N_types
-    p0 = torch.zeros(N_types, device=types.device)
-    p0[mask_token_index] = 1.0
+    # p0 = torch.zeros(N_types, device=types.device)
+    # p0[mask_token_index] = 1.0
 
     # Define the "data" distribution (p1) as one-hots
     # Shape: (N, N_types)
-    p1 = torch.nn.functional.one_hot(types, num_classes=N_types).float()
+    # p1 = torch.nn.functional.one_hot(types, num_classes=N_types).float()
 
     # Interpolate the probabilities: p_t = (1-t)*p0 + t*p1
     # Shapes: (1, N_types) + (N, N_types) -> (N, N_types)
-    p_t_probs = (1 - t_scalar) * p0.unsqueeze(0) + t_scalar * p1
+    p_t_probs = (1 - t_scalar) * p_c_0 + t_scalar * p_c_1
 
     # Renormalize just in case of float precision issues
     p_t_probs = p_t_probs / torch.sum(p_t_probs, dim=-1, keepdim=True)
@@ -290,7 +291,7 @@ def interpolate_typed_gmm(
 
     # b. Sample locations from the chosen spatial components
     # Gather the means and sigmas for the chosen components
-    chosen_means = means[chosen_indices]  # Shape: (num_samples, D)
+    chosen_means = p_x_1[chosen_indices]  # Shape: (num_samples, D)
     chosen_sigmas = sigmas[chosen_indices]  # Shape: (num_samples, D)
 
     # Sample locations

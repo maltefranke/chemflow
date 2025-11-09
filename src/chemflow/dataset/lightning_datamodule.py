@@ -5,6 +5,7 @@ import hydra
 import torch
 
 from chemflow.flow_matching.sampling import sample_prior_graph
+from chemflow.utils import token_to_index
 
 
 class LightningDataModule(pl.LightningDataModule):
@@ -13,16 +14,19 @@ class LightningDataModule(pl.LightningDataModule):
         datasets: DictConfig,
         num_workers: DictConfig,
         batch_size: DictConfig,
+        typed_gmm: bool = True,
     ):
         self.datasets = datasets
         self.num_workers = num_workers
         self.batch_size = batch_size
+        self.typed_gmm = typed_gmm
 
         # Will be set via setter methods
         self.tokens = None
         self.atom_type_distribution = None
         self.edge_type_distribution = None
         self.n_atoms_distribution = None
+        self.mask_token = None
 
         # will be set later
         self.train_dataset = None
@@ -43,6 +47,7 @@ class LightningDataModule(pl.LightningDataModule):
         self.atom_type_distribution = atom_type_distribution
         self.edge_type_distribution = edge_type_distribution
         self.n_atoms_distribution = n_atoms_distribution
+        self.mask_token = token_to_index(self.tokens, "<MASK>")
 
     def setup(self, stage=None):
         """Construct datasets and assign data scalers."""
@@ -165,6 +170,8 @@ class LightningDataModule(pl.LightningDataModule):
                 self.atom_type_distribution,
                 self.edge_type_distribution,
                 self.n_atoms_distribution,
+                self.typed_gmm,
+                self.mask_token,
             )
             for _ in range(len(targets))
         ]

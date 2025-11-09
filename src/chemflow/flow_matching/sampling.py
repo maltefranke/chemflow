@@ -4,7 +4,11 @@ import torch.nn.functional as F
 
 
 def sample_prior_graph(
-    atom_type_distribution, edge_type_distribution, n_atoms_distribution
+    atom_type_distribution,
+    edge_type_distribution,
+    n_atoms_distribution,
+    typed_gmm=True,
+    mask_token=0,
 ):
     p_atom_types = Categorical(probs=atom_type_distribution)
     p_edge_types = Categorical(probs=edge_type_distribution)
@@ -14,8 +18,10 @@ def sample_prior_graph(
     N_atoms = p_n_atoms.sample()
 
     # sample atom types from train distribution
-    # atom_types = p_atom_types.sample(sample_shape=(N_atoms,))
-    atom_types = torch.zeros(N_atoms, dtype=torch.long)
+    if typed_gmm:
+        atom_types = p_atom_types.sample(sample_shape=(N_atoms,))
+    else:
+        atom_types = mask_token * torch.ones(N_atoms, dtype=torch.long)
 
     # sample coordinates randomly
     coord = torch.randn(N_atoms, 3)
@@ -47,7 +53,8 @@ def sample_births(unmatched_x1, unmatched_c1, t, sigma=1.0):
     # select birth times that are less than t
     birth_times_mask = birth_times < t
     birth_times = birth_times[birth_times_mask]
-    birth_mu = unmatched_x1[birth_times_mask]
+    birth_x1 = unmatched_x1[birth_times_mask]
+    birth_c1 = unmatched_c1[birth_times_mask]
 
     unborn_x1 = unmatched_x1[~birth_times_mask]
     unborn_c1 = unmatched_c1[~birth_times_mask]
@@ -55,8 +62,8 @@ def sample_births(unmatched_x1, unmatched_c1, t, sigma=1.0):
     # sigma has shrinking variance with time
     # intuition: we are more certain about the birth location as time goes on
     sigma = sigma * (1 - t)
-    birth_location_t_birth = birth_mu + torch.randn_like(birth_mu) * sigma
-    return birth_times, birth_location_t_birth, birth_mu, unborn_x1, unborn_c1
+    birth_xt = birth_x1 + torch.randn_like(birth_x1, device=unmatched_x1.device) * sigma
+    return birth_times, birth_xt, birth_x1, birth_c1, unborn_x1, unborn_c1
 
 
 def sample_deaths(unmatched_x0, unmatched_c0, t):

@@ -8,6 +8,11 @@ module:
   # tokens and atom_type_distribution will be passed from preprocessing in run.py
 
   weight_alpha: 1.0
+  k_nn_edges: 20
+  typed_gmm: True
+  N_samples: 10
+  K: ${model.K}
+  D: ${model.D}
 
   # Loss component weights
   loss_weights:
@@ -21,11 +26,11 @@ module:
   optimizer_config:
     optimizer:
       _target_: torch.optim.Adam
-      lr: 1e-2
+      lr: 1e-3
     scheduler:
       _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
       mode: min
-      factor: 0.85
+      factor: 0.8
       patience: 10
     monitor: val_loss
 
@@ -41,18 +46,18 @@ module:
 embedding:
   _target_: chemflow.model.embedding.Embedding
   in_nf: ${len:${data.tokens}}
-  out_nf: 32
+  out_nf: 64
 
 egnn:
   _target_: src.external_code.egnn.EGNN
   in_node_nf: ${model.embedding.out_nf}
-  hidden_nf: 64
+  hidden_nf: 128
   out_node_nf: 64
   in_edge_nf: 0
-  n_layers: 3
+  n_layers: 4
   residual: True
   attention: False
-  normalize: False
+  normalize: True
   tanh: False
 
 heads:
@@ -67,7 +72,7 @@ heads:
 
       pos_head:
         input_dim: ${model.egnn.out_node_nf}
-        output_dim: 3
+        output_dim: ${model.D}
 
     graph_heads:
       net_rate_head:
@@ -79,5 +84,5 @@ heads:
       gmm_head:
         input_dim: ${model.egnn.out_node_nf}
         output_dim: ${oc.eval:"${model.K} + 2*${model.K}*${model.D} + ${model.K}*${len:${data.tokens}}"}
-        aggregation: sum
+        aggregation: mean
       

@@ -57,8 +57,8 @@ def typed_gmm_loss(
     target_types,
     target_batch_ids,
     K=10,
-    D=1,
-    N_types=4,
+    D=3,
+    N_types=6,
 ):
     """
     Computes the NLL loss for joint GMM predictions.
@@ -151,7 +151,7 @@ def typed_gmm_loss(
     # 5. LogSumExp over the K components (dim=2)
     # This computes log( sum_m( p(m, x, c) ) ) = log p(x, c)
     # Resulting shape: (B, N_samples)
-    log_likelihood = torch.logsumexp(log_per_component, dim=2)
+    log_likelihood = torch.logsumexp(log_per_component, dim=-1)
 
     # The loss is the negative log-likelihood, averaged over all samples
     loss = -torch.mean(log_likelihood)
