@@ -209,7 +209,7 @@ class Interpolator:
                     birth_c1_i,
                     unborn_x1_i,
                     unborn_c1_i,
-                ) = sample_births(unmatched_x1_i, unmatched_c1_i, t_i)
+                ) = sample_births(unmatched_x1_i, unmatched_c1_i, t_i, sigma=0.5)
 
                 # check if any births are happening
                 if birth_xt_i.shape[0] > 0:
@@ -286,7 +286,8 @@ class Interpolator:
                     # Store the GMM samples for NLL calculation during training
                     if self.typed_gmm:
                         p_c_0 = self.atom_type_distribution.unsqueeze(0).to(x0.device)
-                        p_c_1 = F.one_hot(unborn_c1_i.argmax(dim=-1), num_classes=M)
+                        # p_c_1 = F.one_hot(unborn_c1_i.argmax(dim=-1), num_classes=M)
+                        p_c_1 = unborn_c1_i
                         # TODO make sigma hyperparameter
                         sampled_locations, sampled_types = interpolate_typed_gmm(
                             p_x_1=unborn_x1_i,

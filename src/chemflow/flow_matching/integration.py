@@ -2,10 +2,14 @@ import torch
 import torch.nn.functional as F
 
 from chemflow.flow_matching.gmm import sample_from_typed_gmm, sample_from_gmm
+from chemflow.utils import token_to_index
 
 
 class Integrator:
-    def __init__(self, K, D, typed_gmm=True, device="cpu"):
+    def __init__(self, tokens, K, D, typed_gmm=True, device="cpu"):
+        self.tokens = tokens
+        self.mask_index = token_to_index(tokens, "<MASK>")
+        self.death_token_index = token_to_index(tokens, "<DEATH>")
         self.K = K
         self.D = D
         self.typed_gmm = typed_gmm
@@ -133,8 +137,8 @@ class Integrator:
                 sampled_locations = sample_from_gmm(
                     gmm_params, num_births, self.K, self.D
                 )
-                sampled_types = self.mask_token * torch.ones(
-                    (sampled_locations.shape[0],),
+                sampled_types = self.mask_index * torch.ones(
+                    (num_births,),
                     dtype=torch.long,
                     device=self.device,
                 )
