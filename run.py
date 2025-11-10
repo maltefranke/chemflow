@@ -13,6 +13,8 @@ OmegaConf.register_new_resolver("len", lambda x: len(x))
 
 torch.set_float32_matmul_precision("medium")
 
+pl.seed_everything(42)
+
 
 def run(cfg: DictConfig):
     # Instantiate preprocessing to compute distributions from training dataset
@@ -77,7 +79,10 @@ def run(cfg: DictConfig):
         datamodule=datamodule,
     )
 
-    results = trainer.predict(module, dataloaders=datamodule.test_dataloader())
+    results = trainer.predict(
+        module,
+        dataloaders=datamodule.test_dataloader(),
+    )
     torch.save(results, "results.pt")
 
 

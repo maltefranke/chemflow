@@ -127,7 +127,7 @@ def typed_gmm_loss(
     # 1. Get log p(m)
     # Use logits_normalized for stable log-probabilities of the mixture weights
     # Shape: (B, 1, K)
-    log_mix_weights = mixture_weights.probs
+    log_mix_weights = F.log_softmax(mixture_weights.logits, dim=-1)
 
     # 2. Get log p(x|m)
     # We need log_prob of [B, N_samples, D] target under [B, 1, K] dists.

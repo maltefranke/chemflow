@@ -255,22 +255,13 @@ def interpolate_typed_gmm(
     # --- 2. Define Spatial Components p(x|m) ---
     # Calculate the time-dependent sigma for all components
     # This is the standard deviation sigma(t)
-    sigma_val = sigma * (1 - t_scalar)
+    sigma_val = sigma * (1 - t_scalar) + 1e-6
     sigmas = sigma_val * torch.ones_like(p_x_1)
 
     # The N spatial distributions are N(x_1, sigma(t)^2)
     spatial_components = Independent(Normal(p_x_1, sigmas), 1)
 
     # --- 3. Define Type Components p(c|m) ---
-    # Define the "noise" distribution (p0) as all mask tokens
-    # p0 = torch.ones(N_types, device=types.device) / N_types
-    # p0 = torch.zeros(N_types, device=types.device)
-    # p0[mask_token_index] = 1.0
-
-    # Define the "data" distribution (p1) as one-hots
-    # Shape: (N, N_types)
-    # p1 = torch.nn.functional.one_hot(types, num_classes=N_types).float()
-
     # Interpolate the probabilities: p_t = (1-t)*p0 + t*p1
     # Shapes: (1, N_types) + (N, N_types) -> (N, N_types)
     p_t_probs = (1 - t_scalar) * p_c_0 + t_scalar * p_c_1

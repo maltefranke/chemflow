@@ -6,6 +6,7 @@ from chemflow.flow_matching.gmm import interpolate_gmm, interpolate_typed_gmm
 from chemflow.flow_matching.sampling import sample_births, sample_deaths
 from chemflow.flow_matching.assignment import assign_targets_batched
 from chemflow.utils import token_to_index
+from external_code.egnn import unsorted_segment_mean
 
 
 class Interpolator:
@@ -193,8 +194,10 @@ class Interpolator:
                 birth_cvf.append(empty_c)
 
                 birth_rate_target.append(torch.zeros((1, 1), device=x0.device))
-                birth_locations.append(-1e3 * torch.ones((1, D), device=x0.device))
-                birth_types.append(-1e3 * torch.ones((1), device=x0.device))
+                # birth_locations.append(-1e3 * torch.ones((1, D), device=x0.device))
+                # birth_types.append(-1e3 * torch.ones((1), device=x0.device))
+                birth_locations.append(empty_x)
+                birth_types.append(torch.zeros((0), device=x0.device))
 
             # 2.4 Birth process
             elif unmatched_x1_i.shape[0] > 0:
@@ -291,7 +294,7 @@ class Interpolator:
                             p_c_1=p_c_1,
                             t=t_i,
                             num_samples=self.N_samples,
-                            sigma=0.2,
+                            sigma=0.5,
                         )
                     else:
                         sampled_locations = interpolate_gmm(
@@ -306,10 +309,12 @@ class Interpolator:
                     birth_types.append(sampled_types)
                 else:
                     # if no unborn x1, you're done, so pad with very negative numbers
-                    birth_locations.append(
+                    """birth_locations.append(
                         -1e3 * torch.ones((1, D), device=birth_xt_i.device)
                     )
-                    birth_types.append(-1e3 * torch.ones((1), device=birth_xt_i.device))
+                    birth_types.append(-1e3 * torch.ones((1), device=birth_xt_i.device))"""
+                    birth_locations.append(empty_x)
+                    birth_types.append(torch.zeros((0), device=birth_xt_i.device))
 
             # 2.5 No birth or death process, just movement
             else:
@@ -327,8 +332,10 @@ class Interpolator:
                 birth_cvf.append(empty_c)
 
                 birth_rate_target.append(torch.zeros((1, 1), device=x0.device))
-                birth_locations.append(-1e3 * torch.ones((1, D), device=x0.device))
-                birth_types.append(-1e3 * torch.ones((1), device=x0.device))
+                # birth_locations.append(-1e3 * torch.ones((1, D), device=x0.device))
+                # birth_types.append(-1e3 * torch.ones((1), device=x0.device))
+                birth_locations.append(empty_x)
+                birth_types.append(torch.zeros((0), device=x0.device))
 
         # 3. Concatenate the matched, death, and birth processes
         xt_list = [
@@ -362,8 +369,11 @@ class Interpolator:
         xt_batch_id = torch.repeat_interleave(torch.arange(len(xt_list)), N_t).to(
             x0.device
         )
-
+        # concatenate and remove mean of xt
         xt = torch.cat(xt_list, dim=0)
+        xt_mean = unsorted_segment_mean(xt, xt_batch_id, len(xt_list))
+        xt = xt - xt_mean[xt_batch_id]
+
         ct = torch.cat(ct_list, dim=0)
 
         target_vf = torch.cat(target_vf_list, dim=0)
@@ -379,7 +389,11 @@ class Interpolator:
         birth_locations_batch_ids = torch.repeat_interleave(
             torch.arange(len(birth_locations)), N_birth_samples, dim=0
         ).to(x0.device)
+
+        # remove xt_mean from birth locations
         birth_locations = torch.cat(birth_locations, dim=0)
+        birth_locations = birth_locations - xt_mean[birth_locations_batch_ids]
+
         birth_types = torch.cat(birth_types, dim=0)
 
         targets = {
