@@ -150,8 +150,9 @@ class LightningDataModule(pl.LightningDataModule):
             "edge_types": batched_edge_types,
             "batch_index": batch_index,
             "edge_type_batch_index": edge_type_batch_index,
-            "N_atoms": torch.tensor(N_atoms),
-            "N_triu_edges": torch.tensor(N_triu_edges),
+            "N_atoms": N_atoms,
+            "N_triu_edges": N_triu_edges,
+            "N_mols": torch.Tensor(len(graph_dicts))
         }
 
         # Add optional attributes if they exist

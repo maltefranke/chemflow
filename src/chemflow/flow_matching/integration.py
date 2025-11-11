@@ -227,7 +227,29 @@ class Integrator:
         pred = torch.distributions.Categorical(type_pred).sample()
 
         if self.typed_gmm:
-            # for the typed GMM, we use the predicted types directly
+            print(type_pred.shape)
+            print(curr.shape)
+            print(ct.shape)
+            # probability to stay in the current type
+            pred_probs_curr = torch.gather(type_pred, -1, curr.unsqueeze(-1))
+
+            # Setup batched time tensor and noise tensor
+            ones = [1] * (len(type_pred.shape) - 1)
+            times = t[batch_id].view(-1, *ones).clamp(min=1e-3, max=1.0 - 1e-3)
+            noise = torch.zeros_like(times)
+            noise[times + dt < 1.0] = cat_noise_level
+
+            # Off-diagonal step probs
+            mult = ((1 + ((2 * noise) * (ct.shape[-1] - 1) * times)) / (1 - times))
+            print(mult.shape)
+            first_term = dt * mult * type_pred
+            second_term = dt * noise * pred_probs_curr
+            step_probs = (first_term + second_term).clamp(max=1.0)
+            # On-diagonal step probs
+            step_probs.scatter_(-1, curr.unsqueeze(-1), 0.0)
+            diags = (1.0 - step_probs.sum(dim=-1, keepdim=True)).clamp(min=0.0)
+            step_probs.scatter_(-1, curr.unsqueeze(-1), diags)
+            pred = torch.distributions.Categorical(step_probs).sample()
             ct_new = F.one_hot(pred, num_classes=ct.shape[-1]).float()
         else:
             # Get time for each node (expand t to match nodes)
