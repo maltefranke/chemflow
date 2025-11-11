@@ -9,13 +9,17 @@ def sample_prior_graph(
     n_atoms_distribution,
     typed_gmm=True,
     mask_token=0,
+    n_atoms = None,
 ):
     p_atom_types = Categorical(probs=atom_type_distribution)
     p_edge_types = Categorical(probs=edge_type_distribution)
     p_n_atoms = Categorical(probs=n_atoms_distribution)
 
     # sample number of atoms from train distribution
-    N_atoms = p_n_atoms.sample()
+    if n_atoms:
+        N_atoms = n_atoms
+    else:
+        N_atoms = p_n_atoms.sample()
 
     # sample atom types from train distribution
     if typed_gmm:

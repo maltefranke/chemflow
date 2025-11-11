@@ -16,8 +16,8 @@ module:
 
   # Loss component weights
   loss_weights:
-    a_loss: 1.0
-    x_loss: 1.0
+    a_loss: 0.4
+    x_loss: 3.0
     gmm_loss: 1.0
     death_rate_loss: 0.1
     birth_rate_loss: 0.1

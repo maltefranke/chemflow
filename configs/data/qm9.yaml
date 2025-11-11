@@ -6,6 +6,7 @@ tokens: None
 atom_type_distribution: None
 edge_type_distribution: None
 n_atoms_distribution: None
+n_atoms_strategy: fixed
 
 # Preprocessing configuration - computes tokens from data and distributions from training dataset only
 preprocessing:
@@ -18,6 +19,7 @@ preprocessing:
 
 datamodule:
   _target_: chemflow.dataset.lightning_datamodule.LightningDataModule
+  n_atoms_strategy: ${data.n_atoms_strategy}
   # tokens and distributions will be passed from preprocessing in run.py
 
   datasets:
@@ -38,13 +40,14 @@ datamodule:
         tokens: ${data.tokens}
 
   num_workers:
-    train: 0
-    val: 0
-    test: 0
+    train: 4
+    val: 4
+    test: 4
+    predict: 4
 
   batch_size:
-    train: 784
-    val: 32
-    test: 32
+    train: 256
+    val: 256
+    test: 256
   
   typed_gmm: ${model.module.typed_gmm}

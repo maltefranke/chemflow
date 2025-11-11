@@ -227,9 +227,6 @@ class Integrator:
         pred = torch.distributions.Categorical(type_pred).sample()
 
         if self.typed_gmm:
-            print(type_pred.shape)
-            print(curr.shape)
-            print(ct.shape)
             # probability to stay in the current type
             pred_probs_curr = torch.gather(type_pred, -1, curr.unsqueeze(-1))
 
@@ -241,7 +238,6 @@ class Integrator:
 
             # Off-diagonal step probs
             mult = ((1 + ((2 * noise) * (ct.shape[-1] - 1) * times)) / (1 - times))
-            print(mult.shape)
             first_term = dt * mult * type_pred
             second_term = dt * noise * pred_probs_curr
             step_probs = (first_term + second_term).clamp(max=1.0)
