@@ -15,11 +15,15 @@ class LightningDataModule(pl.LightningDataModule):
         num_workers: DictConfig,
         batch_size: DictConfig,
         typed_gmm: bool = True,
+        cat_prior: str = "train_distribution-sample",
+        n_atoms_strategy: str = "flexible"
     ):
         self.datasets = datasets
         self.num_workers = num_workers
         self.batch_size = batch_size
         self.typed_gmm = typed_gmm
+        self.cat_prior = cat_prior
+        self.n_atoms_strategy = n_atoms_strategy
 
         # Will be set via setter methods
         self.tokens = None
@@ -41,6 +45,7 @@ class LightningDataModule(pl.LightningDataModule):
         atom_type_distribution: torch.Tensor,
         edge_type_distribution: torch.Tensor,
         n_atoms_distribution: torch.Tensor,
+        cat_strategy: str = "train_dataset-sample",
     ):
         """Set tokens and distributions after initialization."""
         self.tokens = tokens
@@ -48,6 +53,16 @@ class LightningDataModule(pl.LightningDataModule):
         self.edge_type_distribution = edge_type_distribution
         self.n_atoms_distribution = n_atoms_distribution
         self.mask_token = token_to_index(self.tokens, "<MASK>")
+        if cat_strategy == "uniform-sample":
+            self.atom_type_distribution = torch.ones_like(self.atom_type_distribution)
+            self.atom_type_distribution[self.mask_token] = 0.0
+            self.atom_type_distribution[token_to_index(self.tokens), "<DEATH>"] = 0.0
+            self.edge_type_distribution = torch.ones_like(self.edge_type_distribution)
+        elif cat_strategy == "mask":
+            self.atom_type_distribution = torch.zeros_like(self.atom_type_distribution)
+            self.atom_type_distribution[self.mask_token] = 1.0
+            # what about edges?
+
 
     def setup(self, stage=None):
         """Construct datasets and assign data scalers."""
@@ -164,7 +179,11 @@ class LightningDataModule(pl.LightningDataModule):
 
     def collate_fn(self, batch):
         targets = batch
-
+        if self.n_atoms_strategy == "fixed":
+            n_atoms = [target["atom_types"].shape[-1] for target in targets]
+        else:
+            n_atoms = [None for target in targets]
+        
         samples = [
             sample_prior_graph(
                 self.atom_type_distribution,
@@ -172,8 +191,9 @@ class LightningDataModule(pl.LightningDataModule):
                 self.n_atoms_distribution,
                 self.typed_gmm,
                 self.mask_token,
+                n_atoms=n_atoms_i
             )
-            for _ in range(len(targets))
+            for n_atoms_i in n_atoms
         ]
 
         samples_batched = self.collate_graphs(samples)

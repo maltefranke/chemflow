@@ -1,6 +1,7 @@
 ## Put your model args here
-name: "my_model"
+project: "chemflow"
+name: "base"
 save_dir: "logs"
-offline: True
+offline: False
 
     

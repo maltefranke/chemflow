@@ -105,6 +105,6 @@ if __name__ == "__main__":
     data = custom_preprocess(None, None)
     print(data[0].keys())
 
-    qm9 = QM9(root="/cluster/project/krause/frankem/chemflow/data/qm9")
+    qm9 = QM9(root="/cluster/project/jorner/zivkovic/chemflow/data/qm9")
 
     print(qm9[0])

@@ -75,6 +75,7 @@ class LightningModule(pl.LightningModule):
             )
         self.optimizer_config = optimizer_config
 
+        self.save_hyperparameters()
         self.model = hydra.utils.instantiate(model)
         # Lightning will handle device placement automatically
 
@@ -195,6 +196,8 @@ class LightningModule(pl.LightningModule):
 
         samples_batched, targets_batched = batch
 
+        batch_size = batch[-1]["N_atoms"].shape[-1]
+
         x0 = samples_batched["coord"]
         x1 = targets_batched["coord"]
 
@@ -290,30 +293,27 @@ class LightningModule(pl.LightningModule):
             + self.loss_weights.death_rate_loss * death_rate_loss
             + self.loss_weights.birth_rate_loss * birth_rate_loss
         )
-        self.log("loss", loss, prog_bar=True)
-        self.log("a_loss", self.loss_weights.a_loss * a_loss, prog_bar=True)
-        self.log("x_loss", self.loss_weights.x_loss * x_loss, prog_bar=True)
-        self.log("gmm_loss", self.loss_weights.gmm_loss * gmm_loss, prog_bar=True)
+        self.log("loss", loss, prog_bar=True, logger=True, batch_size=batch_size)
+        self.log("a_loss", a_loss, prog_bar=True, logger=True, batch_size=batch_size)
+        self.log("x_loss", x_loss, prog_bar=True, logger=True, batch_size=batch_size)
+        self.log("gmm_loss", gmm_loss, prog_bar=True, logger=True, batch_size=batch_size)
         self.log(
-            "rate_loss",
-            self.loss_weights.death_rate_loss * death_rate_loss
-            + self.loss_weights.birth_rate_loss * birth_rate_loss,
-            prog_bar=True,
-        )
+            "death_rate_loss", death_rate_loss, prog_bar=True, logger=True, batch_size=batch_size)
+        self.log("birth_rate_loss", birth_rate_loss, prog_bar=True, logger=True, batch_size=batch_size)
         loss = self.safe_loss(loss)
 
         return loss
 
     def training_step(self, batch, batch_idx):
         loss = self.shared_step(batch, batch_idx)
-        self.log("train_loss", loss, prog_bar=False)
+        self.log("train_loss", loss, prog_bar=False, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         # Define the validation step logic here
         loss = self.shared_step(batch, batch_idx)
         # Log val_loss at epoch level for ReduceLROnPlateau scheduler
-        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=False)
+        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch[-1]["N_atoms"].shape[-1])
         return loss
 
     def test_step(self, batch, batch_idx):
