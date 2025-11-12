@@ -4,6 +4,7 @@ import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
 import hydra
 from chemflow.losses import typed_gmm_loss, rate_loss
+from chemflow.losses import gmm_loss as untyped_gmm_loss
 from torch_geometric.nn import knn_graph
 
 from chemflow.flow_matching.integration import Integrator
@@ -32,6 +33,7 @@ class LightningModule(pl.LightningModule):
         self.mask_index = None
         self.death_token_index = None
         self.interpolator = None
+        self.integrator = None
 
         self.weight_alpha = weight_alpha
 
@@ -40,12 +42,6 @@ class LightningModule(pl.LightningModule):
         self.k_nn_edges = k_nn_edges
         self.K = K
         self.D = D
-        self.integrator = Integrator(
-            self.K,
-            self.D,
-            self.typed_gmm,
-            device="cuda" if torch.cuda.is_available() else "cpu",
-        )
 
         # Set default loss weights if not provided
         if loss_weights is None:
@@ -98,6 +94,13 @@ class LightningModule(pl.LightningModule):
             atom_type_distribution.to(self.device),
             typed_gmm=self.typed_gmm,
             N_samples=self.N_samples,
+        )
+        self.integrator = Integrator(
+            self.tokens,
+            self.K,
+            self.D,
+            self.typed_gmm,
+            device="cuda" if torch.cuda.is_available() else "cpu",
         )
         # Always compute token distribution weights for weighted cross-entropy loss
         weights = self._compute_token_weights(atom_type_distribution)
@@ -248,24 +251,36 @@ class LightningModule(pl.LightningModule):
             # predict final class for all tokens
             mask = torch.ones_like(at_ind, dtype=torch.bool)
 
+        # only compute loss for tokens where at is not already correct (i.e. requires an edit)
+        mask = mask & (at_ind != targets["target_c"].argmax(dim=-1))
+
         # Always use weighted cross-entropy loss
         a_loss = F.cross_entropy(
             a_pred[mask],
             targets["target_c"][mask].argmax(dim=-1),
-            weight=self.token_weights,
+            # weight=self.token_weights,
         )
 
         x_loss = F.l1_loss(x_pred, targets["target_x"])
 
-        gmm_loss = typed_gmm_loss(
-            gmm_pred,
-            targets["birth_locations"],
-            targets["birth_types"],
-            targets["birth_batch_ids"],
-            D=self.D,
-            K=self.K,
-            N_types=len(self.tokens),
-        )
+        if self.typed_gmm:
+            gmm_loss = typed_gmm_loss(
+                gmm_pred,
+                targets["birth_locations"],
+                targets["birth_types"],
+                targets["birth_batch_ids"],
+                D=self.D,
+                K=self.K,
+                N_types=len(self.tokens),
+            )
+        else:
+            gmm_loss = untyped_gmm_loss(
+                gmm_pred,
+                targets["birth_locations"],
+                # targets["birth_batch_ids"],
+                D=self.D,
+                K=self.K,
+            )
 
         death_rate_loss = rate_loss(death_rate_pred, targets["death_rate_target"])
 
@@ -291,7 +306,7 @@ class LightningModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         loss = self.shared_step(batch, batch_idx)
-        self.log("train_loss", loss, prog_bar=True, logger=True)
+        self.log("train_loss", loss, prog_bar=False, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):

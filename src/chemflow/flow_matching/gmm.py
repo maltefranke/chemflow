@@ -118,6 +118,7 @@ def sample_from_gmm(gmm_params, num_samples, K=10, D=1):
     """
     gmm = get_gmm(gmm_params, K, D)
     samples = gmm.sample((num_samples,))
+    samples = samples.reshape(gmm_params.shape[0], num_samples, D)
     return samples
 
 
