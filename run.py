@@ -26,6 +26,7 @@ def run(cfg: DictConfig):
     atom_type_distribution = preprocessing.atom_type_distribution
     edge_type_distribution = preprocessing.edge_type_distribution
     n_atoms_distribution = preprocessing.n_atoms_distribution
+    coordinate_std = preprocessing.coordinate_std
 
     OmegaConf.update(cfg.data, "tokens", tokens)
 
@@ -60,6 +61,7 @@ def run(cfg: DictConfig):
     module.set_tokens_and_distribution(
         tokens=tokens,
         atom_type_distribution=atom_type_distribution,
+        coordinate_std=coordinate_std,
     )
 
     # Setup logging and callbacks

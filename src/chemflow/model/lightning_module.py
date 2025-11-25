@@ -11,6 +11,7 @@ from chemflow.flow_matching.integration import Integrator
 from chemflow.utils import token_to_index
 from external_code.egnn import unsorted_segment_mean
 from chemflow.flow_matching.interpolation import Interpolator
+from chemflow.flow_matching.gmm import compute_equivariant_gmm
 
 
 class LightningModule(pl.LightningModule):
@@ -83,6 +84,7 @@ class LightningModule(pl.LightningModule):
         self,
         tokens: list[str],
         atom_type_distribution: torch.Tensor,
+        coordinate_std: torch.Tensor = None,
     ):
         """Set tokens and atom type distribution after initialization."""
         self.tokens = tokens
@@ -105,6 +107,11 @@ class LightningModule(pl.LightningModule):
         # Always compute token distribution weights for weighted cross-entropy loss
         weights = self._compute_token_weights(atom_type_distribution)
         self.register_buffer("token_weights", weights)
+
+        # Register coordinate_std as a buffer so it moves to the correct device
+        if coordinate_std is not None:
+            # Register new buffer
+            self.register_buffer("coordinate_std", coordinate_std.to(self.device))
 
     def _compute_token_weights(
         self, atom_type_distribution: torch.Tensor
@@ -215,6 +222,8 @@ class LightningModule(pl.LightningModule):
 
         # interpolate
         t = torch.rand(batch_size, device=self.device)
+        # NOTE WARNING t is not sampled
+        # t = 0.65 + 0.35 * torch.rand(batch_size, device=self.device)
         xt, at, xt_batch_id, targets = self.interpolator.interpolate_different_size(
             x0, a0, samples_batch_id, x1, a1, targets_batch_id, t
         )
@@ -231,10 +240,22 @@ class LightningModule(pl.LightningModule):
 
         x_pred = preds["pos_head"]
         gmm_pred = preds["gmm_head"]
+        gmm_dict = compute_equivariant_gmm(
+            gmm_pred,
+            xt,
+            xt_batch_id,
+            self.K,
+            self.D,
+            len(self.tokens) if self.typed_gmm else 0,
+        )
 
         net_rate_pred = preds["net_rate_head"]
         death_rate_pred = F.relu(-net_rate_pred)
         birth_rate_pred = F.relu(net_rate_pred)
+
+        # Scale position predictions by coordinate_std before loss calculation
+        if hasattr(self, "coordinate_std") is not None:
+            x_pred = x_pred * self.coordinate_std
 
         # Calculate losses
         # only do class prediction on non-mask tokens
@@ -254,32 +275,38 @@ class LightningModule(pl.LightningModule):
         # only compute loss for tokens where at is not already correct (i.e. requires an edit)
         mask = mask & (at_ind != targets["target_c"].argmax(dim=-1))
 
-        # Always use weighted cross-entropy loss
-        a_loss = F.cross_entropy(
-            a_pred[mask],
-            targets["target_c"][mask].argmax(dim=-1),
-            # weight=self.token_weights,
-        )
+        if mask.sum() > 0:
+            # Always use weighted cross-entropy loss
+            a_loss = F.cross_entropy(
+                a_pred[mask],
+                targets["target_c"][mask].argmax(dim=-1),
+                weight=self.token_weights,
+            )
+        else:
+            # all tokens are correct, so no loss
+            a_loss = torch.tensor(0.0, device=self.device)
 
-        x_loss = F.l1_loss(x_pred, targets["target_x"])
+        # Scale target_x by coordinate_std as well to match scaled predictions
+        if hasattr(self, "coordinate_std") and self.coordinate_std is not None:
+            x_pred = x_pred * self.coordinate_std
+        else:
+            x_pred = x_pred
+
+        x_pred = xt + x_pred
+        x_loss = F.mse_loss(x_pred, targets["target_x"])
 
         if self.typed_gmm:
             gmm_loss = typed_gmm_loss(
-                gmm_pred,
+                gmm_dict,
                 targets["birth_locations"],
                 targets["birth_types"],
                 targets["birth_batch_ids"],
-                D=self.D,
-                K=self.K,
-                N_types=len(self.tokens),
             )
         else:
             gmm_loss = untyped_gmm_loss(
-                gmm_pred,
+                gmm_dict,
                 targets["birth_locations"],
-                # targets["birth_batch_ids"],
-                D=self.D,
-                K=self.K,
+                targets["birth_batch_ids"],
             )
 
         death_rate_loss = rate_loss(death_rate_pred, targets["death_rate_target"])
@@ -296,10 +323,23 @@ class LightningModule(pl.LightningModule):
         self.log("loss", loss, prog_bar=True, logger=True, batch_size=batch_size)
         self.log("a_loss", a_loss, prog_bar=True, logger=True, batch_size=batch_size)
         self.log("x_loss", x_loss, prog_bar=True, logger=True, batch_size=batch_size)
-        self.log("gmm_loss", gmm_loss, prog_bar=True, logger=True, batch_size=batch_size)
         self.log(
-            "death_rate_loss", death_rate_loss, prog_bar=True, logger=True, batch_size=batch_size)
-        self.log("birth_rate_loss", birth_rate_loss, prog_bar=True, logger=True, batch_size=batch_size)
+            "gmm_loss", gmm_loss, prog_bar=True, logger=True, batch_size=batch_size
+        )
+        self.log(
+            "death_rate_loss",
+            death_rate_loss,
+            prog_bar=True,
+            logger=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            "birth_rate_loss",
+            birth_rate_loss,
+            prog_bar=True,
+            logger=True,
+            batch_size=batch_size,
+        )
         loss = self.safe_loss(loss)
 
         return loss
@@ -313,7 +353,15 @@ class LightningModule(pl.LightningModule):
         # Define the validation step logic here
         loss = self.shared_step(batch, batch_idx)
         # Log val_loss at epoch level for ReduceLROnPlateau scheduler
-        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch[-1]["N_atoms"].shape[-1])
+        self.log(
+            "val_loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            batch_size=batch[-1]["N_atoms"].shape[-1],
+        )
         return loss
 
     def test_step(self, batch, batch_idx):
@@ -368,6 +416,9 @@ class LightningModule(pl.LightningModule):
 
         # Integration loop: integrate from t=0 to t=1
         for _ in range(num_steps):
+            instantaneous_rate = 1 / torch.clamp(1 - t, min=1e-6)
+            instantaneous_rate = instantaneous_rate[batch_id].view(-1, 1)
+
             # Build kNN graph
             edge_index = knn_graph(xt, k=self.k_nn_edges, batch=batch_id)
 
@@ -381,9 +432,20 @@ class LightningModule(pl.LightningModule):
             type_pred = preds["class_head"]  # (N_total, num_classes)
             type_pred = F.softmax(type_pred, dim=-1)
 
-            velocity = preds["pos_head"]  # (N_total, D)
+            x1_pred = preds["pos_head"]  # (N_total, D)
+            x1_pred = x1_pred * self.coordinate_std
+            x1_pred = xt + x1_pred
+
             # (num_graphs, K + 2*K*D + K*N_types)
             gmm_pred = preds["gmm_head"]
+            gmm_dict = compute_equivariant_gmm(
+                gmm_pred,
+                xt,
+                batch_id,
+                self.K,
+                self.D,
+                len(self.tokens) if self.typed_gmm else 0,
+            )
 
             # Process rates
             net_rate_pred = preds["net_rate_head"]  # (num_graphs, 1)
@@ -392,11 +454,11 @@ class LightningModule(pl.LightningModule):
 
             # Integrate one step
             xt, at, batch_id = self.integrator.integrate_step_gnn(
-                velocity=velocity,
+                velocity=(x1_pred - xt) * instantaneous_rate,
                 type_pred=type_pred,
                 global_death_rate=death_rate,
                 birth_rate=birth_rate,
-                birth_gmm_params=gmm_pred,
+                birth_gmm_dict=gmm_dict,
                 xt=xt,
                 ct=at.float(),
                 batch_id=batch_id,

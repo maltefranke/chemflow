@@ -18,7 +18,7 @@ class NodeHead(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim),
+            nn.Linear(hidden_dim, output_dim, bias=False),
         )
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
@@ -49,7 +49,7 @@ class GraphHead(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim),
+            nn.Linear(hidden_dim, output_dim, bias=False),
         )
 
     def forward(self, h: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:

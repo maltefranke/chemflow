@@ -2,6 +2,8 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 import torch
 
+from chemflow.utils import rigid_alignment
+
 
 def distance_based_assignment(valid_x0, valid_x1):
     """
@@ -29,10 +31,6 @@ def distance_based_assignment(valid_x0, valid_x1):
     # K_b = len(row_ind)
 
     return row_ind, col_ind
-
-
-def distance_and_class_based_assignment(valid_x0, valid_x1, class_x0, class_x1):
-    pass
 
 
 def assign_targets_batched(x0, c0, x0_batch_id, x1, c1, x1_batch_id):
@@ -137,6 +135,10 @@ def assign_targets_batched(x0, c0, x0_batch_id, x1, c1, x1_batch_id):
         matched_c0_b = valid_c0[row_ind]
         matched_c1_b = valid_c1[col_ind]
 
+        # Align the matched items
+        R, t = rigid_alignment(matched_x0_b, matched_x1_b)
+        matched_x0_b = matched_x0_b.mm(R.T) + t
+
         all_matched_x0.append(matched_x0_b)
         all_matched_x1.append(matched_x1_b)
         all_matched_c0.append(matched_c0_b)
@@ -147,11 +149,18 @@ def assign_targets_batched(x0, c0, x0_batch_id, x1, c1, x1_batch_id):
         unmatched_indices_x0 = np.setdiff1d(np.arange(N_valid), row_ind)
         unmatched_indices_x1 = np.setdiff1d(np.arange(M_valid), col_ind)
 
-        all_unmatched_x0.append(valid_x0[unmatched_indices_x0])
-        all_unmatched_x1.append(valid_x1[unmatched_indices_x1])
+        unmatched_x0_b = valid_x0[unmatched_indices_x0]
+        unmatched_x1_b = valid_x1[unmatched_indices_x1]
+        unmatched_c0_b = valid_c0[unmatched_indices_x0]
+        unmatched_c1_b = valid_c1[unmatched_indices_x1]
 
-        all_unmatched_c0.append(valid_c0[unmatched_indices_x0])
-        all_unmatched_c1.append(valid_c1[unmatched_indices_x1])
+        # Align the unmatched items
+        unmatched_x0_b = unmatched_x0_b.mm(R.T) + t
+
+        all_unmatched_x0.append(unmatched_x0_b)
+        all_unmatched_x1.append(unmatched_x1_b)
+        all_unmatched_c0.append(unmatched_c0_b)
+        all_unmatched_c1.append(unmatched_c1_b)
 
     assigned_targets = {
         "matched": {
@@ -165,3 +174,73 @@ def assign_targets_batched(x0, c0, x0_batch_id, x1, c1, x1_batch_id):
     }
 
     return assigned_targets
+
+
+def distance_and_class_based_assignment(
+    valid_x0, valid_x1, class_x0, class_x1, C_dist=1.0, C_class=10.0, C_birth=5.0
+):
+    """
+    Assigns targets considering distance, class consistency, and birth/death costs.
+
+    Args:
+        valid_x0 (np.ndarray): Source points / Previous frame (N, D)
+        valid_x1 (np.ndarray): Target points / Current frame (M, D)
+        class_x0 (np.ndarray): Source classes (N,)
+        class_x1 (np.ndarray): Target classes (M,)
+        C_dist (float): Multiplier for Euclidean distance cost.
+        C_class (float): Penalty added if classes do not match.
+        C_birth (float): Cost threshold. If matching costs > 2*C_birth,
+                         the match is skipped.
+
+    Returns:
+        tuple:
+        - row_ind (np.ndarray): Indices into valid_x0 for successful matches.
+        - col_ind (np.ndarray): Indices into valid_x1 for successful matches.
+    """
+    N = valid_x0.shape[0]
+    M = valid_x1.shape[0]
+
+    if N == 0 or M == 0:
+        return np.array([], dtype=int), np.array([], dtype=int)
+
+    # --- 1. Calculate Real Costs ---
+    dist_matrix = np.linalg.norm(
+        valid_x0[:, np.newaxis] - valid_x1[np.newaxis, :], axis=2
+    )
+    class_diff_matrix = class_x0[:, np.newaxis] != class_x1[np.newaxis, :]
+    cost_real = (C_dist * dist_matrix) + (C_class * class_diff_matrix)
+
+    # --- 2. Construct Augmented Cost Matrix (N+M, N+M) ---
+    aug_cost = np.full((N + M, N + M), fill_value=1e9)
+
+    # [Top-Left] Real Matches: x0 matches x1
+    aug_cost[:N, :M] = cost_real
+
+    # [Top-Right] DEATH (Unmatched Rows):
+    # If x0[i] matches here, it maps to a dummy.
+    # Conceptually: x0[i] is "killed" or "lost" because matching was too expensive.
+    aug_cost[:N, M : M + N] = np.eye(N) * C_birth
+
+    # [Bottom-Left] BIRTH (Unmatched Cols):
+    # If x1[j] matches here, it maps from a dummy.
+    # Conceptually: x1[j] is "born" or "new" because it found no cheap x0 source.
+    aug_cost[N : N + M, :M] = np.eye(M) * C_birth
+
+    # [Bottom-Right] Unused Dummies:
+    # Dummies matching dummies (free).
+    aug_cost[N:, M:] = 0.0
+
+    # --- 3. Solve Assignment ---
+    full_row_ind, full_col_ind = linear_sum_assignment(aug_cost)
+
+    # --- 4. Filter for Real Matches ---
+    # We only return indices where both row < N and col < M.
+    # Any row index in the result >= N implies a Dummy Source -> Real Target (Birth).
+    # Any col index in the result >= M implies Real Source -> Dummy Target (Death).
+
+    valid_matches_mask = (full_row_ind < N) & (full_col_ind < M)
+
+    row_ind = full_row_ind[valid_matches_mask]
+    col_ind = full_col_ind[valid_matches_mask]
+
+    return row_ind, col_ind

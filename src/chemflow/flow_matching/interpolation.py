@@ -132,12 +132,14 @@ class Interpolator:
         ]
         # 2.2 Handle unmatched samples / targets
         death_xt = []
+        death_x1 = []
         death_vf = []
         death_ct = []
         death_cvf = []
         death_rate_target = []
 
         birth_xt = []
+        birth_x1 = []
         birth_vf = []
         birth_ct = []
         birth_cvf = []
@@ -181,6 +183,7 @@ class Interpolator:
                 death_rate_target_i = N_necessary_deaths * instantaneous_rate
 
                 death_xt.append(death_xt_i)
+                death_x1.append(x_sink.repeat(death_xt_i.shape[0], 1))
                 death_vf.append(x_sink.repeat(death_xt_i.shape[0], 1) - x0_alive_at_xt)
 
                 death_ct.append(death_ct_i)
@@ -188,6 +191,7 @@ class Interpolator:
                 death_rate_target.append(death_rate_target_i.view(1, 1))
 
                 birth_xt.append(empty_x)
+                birth_x1.append(empty_x)
                 birth_vf.append(empty_x)
 
                 birth_ct.append(empty_c)
@@ -258,6 +262,7 @@ class Interpolator:
                     birth_ct_i = birth_ct_i.to(x0.device)
 
                     birth_xt.append(birth_xt_i)
+                    birth_x1.append(birth_x1_i)
                     birth_vf.append((birth_x1_i - birth_xt_i) * instantaneous_rate)
 
                     birth_ct.append(birth_ct_i)
@@ -266,12 +271,14 @@ class Interpolator:
                 else:
                     # no birth was sampled
                     birth_xt.append(empty_x)
+                    birth_x1.append(empty_x)
                     birth_vf.append(empty_x)
 
                     birth_ct.append(empty_c)
                     birth_cvf.append(empty_c)
 
                 death_xt.append(empty_x)
+                death_x1.append(empty_x)
                 death_vf.append(empty_x)
 
                 death_ct.append(empty_c)
@@ -320,6 +327,7 @@ class Interpolator:
             # 2.5 No birth or death process, just movement
             else:
                 death_xt.append(empty_x)
+                death_x1.append(empty_x)
                 death_vf.append(empty_x)
 
                 death_ct.append(empty_c)
@@ -327,6 +335,7 @@ class Interpolator:
                 death_rate_target.append(torch.zeros((1, 1), device=x0.device))
 
                 birth_xt.append(empty_x)
+                birth_x1.append(empty_x)
                 birth_vf.append(empty_x)
 
                 birth_ct.append(empty_c)
@@ -353,12 +362,19 @@ class Interpolator:
         ]
 
         # 4. Concatenate the matched, death, and birth targets
-        target_vf_list = [
+        """target_vf_list = [
             torch.cat([matched_vf_i, death_vf_i, birth_vf_i], dim=0)
             for matched_vf_i, death_vf_i, birth_vf_i in zip(
                 matched_vf, death_vf, birth_vf
             )
+        ]"""
+        target_x_list = [
+            torch.cat([matched_x1_i, death_x1_i, birth_x1_i], dim=0)
+            for matched_x1_i, death_x1_i, birth_x1_i in zip(
+                matched_x1, death_x1, birth_x1
+            )
         ]
+
         target_cvf_list = [
             torch.cat([matched_cvf_i, death_cvf_i, birth_cvf_i], dim=0)
             for matched_cvf_i, death_cvf_i, birth_cvf_i in zip(
@@ -377,7 +393,8 @@ class Interpolator:
 
         ct = torch.cat(ct_list, dim=0)
 
-        target_vf = torch.cat(target_vf_list, dim=0)
+        # target_vf = torch.cat(target_vf_list, dim=0)
+        target_x = torch.cat(target_x_list, dim=0)
         target_cvf = torch.cat(target_cvf_list, dim=0)
 
         birth_rate_target = torch.cat(birth_rate_target, dim=0)
@@ -398,7 +415,7 @@ class Interpolator:
         birth_types = torch.cat(birth_types, dim=0)
 
         targets = {
-            "target_x": target_vf,
+            "target_x": target_x,
             "target_c": target_cvf,
             "birth_rate_target": birth_rate_target,
             "death_rate_target": death_rate_target,

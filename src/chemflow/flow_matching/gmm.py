@@ -9,44 +9,56 @@ GMM creation, sampling, and loss computation.
 import torch
 from torch.distributions import Categorical, MixtureSameFamily, Normal, Independent
 
+from chemflow.utils import segment_softmax
+from external_code.egnn import unsorted_segment_mean
+import torch.nn.functional as F
 
-def get_gmm(gmm_params, K=10, D=1):
+
+def get_gmm(gmm_output, D=3):
     """
-    Create a GMM distribution from predicted parameters.
-    ...
+    Create a standard GMM distribution from the equivariant output dictionary.
+
+    Args:
+        gmm_output (dict): Contains 'mu' [B, K, D], 'sigma' [B, K], 'pi' [B, K]
+        D (int): Dimension of data.
+
+    Returns:
+        MixtureSameFamily:
+            batch_shape=[B, 1]
+            event_shape=[D]
     """
-    # ... (Handle single batch case) ...
-    B = gmm_params.shape[0]
+    mu = gmm_output["mu"]  # [B, K, D]
+    sigma = gmm_output["sigma"]  # [B, K]
+    pi = gmm_output["pi"]  # [B, K]
 
-    # Extract GMM parameters
-    # Logits: (B, K) -> (B, 1, K)
-    logits = gmm_params[:, :K].unsqueeze(1)
+    # Handle single batch case (unbatched inputs)
+    if mu.dim() == 2:
+        mu = mu.unsqueeze(0)
+        sigma = sigma.unsqueeze(0)
+        pi = pi.unsqueeze(0)
 
-    # Means: (B, K*D) -> (B, K, D) -> (B, 1, K, D)
-    means = gmm_params[:, K : K + K * D].reshape(B, K, D).unsqueeze(1)
+    # --- 1. Prepare Mixture Weights ---
+    # Shape: [B, K] -> [B, 1, K]
+    # This defines the probability of selecting component k for the single sample in dim 1
+    mix_dist = Categorical(probs=pi.unsqueeze(1))
 
-    # Log-Variances: (B, K*D) -> (B, K, D) -> (B, 1, K, D)
-    log_vars = gmm_params[:, K + K * D :].reshape(B, K, D).unsqueeze(1)
+    # --- 2. Prepare Components ---
+    # Means: [B, K, D] -> [B, 1, K, D]
+    mu_expanded = mu.unsqueeze(1)
 
-    # Calculate sigmas (std devs) from log-variances
-    # Shape is now (B, 1, K, D)
-    sigmas = torch.sqrt(torch.exp(log_vars) + 1e-6)
+    """# Sigmas: [B, K] -> [B, 1, K] -> [B, 1, K, D] (Isotropic expansion)
+    sigma_expanded = sigma.unsqueeze(1).unsqueeze(-1).expand(-1, -1, D)"""
+    # Sigmas: [B, K] -> [B, 1, K] -> [B, 1, K, 1] -> [B, 1, K, D] (Isotropic expansion)
+    sigma_expanded = sigma.unsqueeze(1).unsqueeze(-1).expand(-1, -1, -1, D)
 
-    # Create the K component distributions
-    # Normal's batch_shape=[B, 1, K, D], event_shape=[]
-    # Independent's batch_shape=[B, 1, K], event_shape=[D]
-    component_dist = Independent(Normal(means, sigmas), 1)
+    # Define Component Distribution
+    # Batch Shape: [B, 1, K] | Event Shape: [D]
+    comp_dist = Independent(Normal(mu_expanded, sigma_expanded), 1)
 
-    # Create the mixture weights
-    # Categorical's batch_shape=[B, 1]
-    mixture_weights = Categorical(logits=logits)
+    # --- 3. Combine into GMM ---
+    # Resulting Batch Shape: [B, 1] | Event Shape: [D]
+    gmm = MixtureSameFamily(mix_dist, comp_dist)
 
-    # Create the final GMM distribution
-    # gmm.batch_shape is now [B, 1]
-    # gmm.event_shape is [D]
-    gmm = MixtureSameFamily(mixture_weights, component_dist)
-
-    # ... (Squeeze output) ...
     return gmm
 
 
@@ -107,8 +119,12 @@ def sample_from_gmm(gmm_params, num_samples, K=10, D=1):
     Sample from a GMM created from predicted parameters.
 
     Args:
-        gmm_params (torch.Tensor): Predicted GMM parameters.
-            Shape: (K + 2 * K * D,) for single batch or (B, K + 2 * K * D) for batch
+        gmm_params (dict): Predicted GMM parameters.
+            Shape: {
+                "mu": [B, K, D],
+                "sigma": [B, K],
+                "pi": [B, K],
+            }
         num_samples (int): Number of samples to draw
         K (int): Number of GMM components
         D (int): Dimension of the data
@@ -116,9 +132,9 @@ def sample_from_gmm(gmm_params, num_samples, K=10, D=1):
     Returns:
         torch.Tensor: Samples from the GMM. Shape: (num_samples, D) or (B, num_samples, D)
     """
-    gmm = get_gmm(gmm_params, K, D)
+    gmm = get_gmm(gmm_params, D)
     samples = gmm.sample((num_samples,))
-    samples = samples.reshape(gmm_params.shape[0], num_samples, D)
+    samples = samples.reshape(gmm_params["mu"].shape[0], num_samples, D)
     return samples
 
 
@@ -127,8 +143,8 @@ def sample_from_gmm(gmm_params, num_samples, K=10, D=1):
 # Includes a class label for each component
 
 
-def get_typed_gmm_components(gmm_params, K=10, D=3, N_types=4):
-    """
+"""def get_typed_gmm_components(gmm_params, K=10, D=3, N_types=4):
+    
     Create GMM component distributions from predicted parameters for the
     joint distribution p(m)p(x|m)p(c|m).
 
@@ -150,7 +166,7 @@ def get_typed_gmm_components(gmm_params, K=10, D=3, N_types=4):
             - mixture_weights (Categorical): Dist for p(m). batch_shape=[B, 1].
             - spatial_dist (Independent): Dist for p(x|m). batch_shape=[B, 1, K].
             - type_dist (Categorical): Dist for p(c|m). batch_shape=[B, 1, K].
-    """
+    
     # ... (Handle single batch case) ...
     if gmm_params.dim() == 1:
         # Unsqueeze to add batch dimension if not present
@@ -210,7 +226,160 @@ def get_typed_gmm_components(gmm_params, K=10, D=3, N_types=4):
 
     # ... (Squeeze output logic from original function would go here if B==1) ...
 
+    return mixture_weights, spatial_dist, type_dist"""
+
+
+def get_typed_gmm_components(gmm_output, D=3):
+    """
+    Create GMM component distributions from the pre-computed equivariant output dictionary.
+
+    Args:
+        gmm_output (dict): The dictionary returned by compute_equivariant_gmm containing:
+            - 'mu': [B, K, D] (Equivariant Means)
+            - 'sigma': [B, K] (Invariant Isotropic Scales)
+            - 'pi': [B, K] (Invariant Mixture Weights)
+            - 'types': [B, K, N_types] (Invariant Type Probs)
+        D (int): Dimension of the spatial data (usually 3).
+
+    Returns:
+        tuple:
+            - mixture_weights (Categorical): Batch shape [B, 1]. Event shape [].
+            - spatial_dist (Independent): Batch shape [B, 1, K]. Event shape [D].
+            - type_dist (Categorical): Batch shape [B, 1, K]. Event shape [].
+    """
+
+    # 1. Unpack and handle single-batch case (if necessary)
+    mu = gmm_output["mu"]  # [B, K, D]
+    sigma = gmm_output["sigma"]  # [B, K]
+    pi = gmm_output["pi"]  # [B, K]
+    type_probs = gmm_output["types"]  # [B, K, T]
+
+    # If the input was unbatched (K, D), add batch dim to make it (1, K, D)
+    if mu.dim() == 2:
+        mu = mu.unsqueeze(0)
+        sigma = sigma.unsqueeze(0)
+        pi = pi.unsqueeze(0)
+        type_probs = type_probs.unsqueeze(0)
+
+    # 2. Reshape for Broadcasting: (B, ...) -> (B, 1, ...)
+    # This prepares the distributions to be evaluated against N_samples
+    # (broadcasting B, 1, K against B, N, K)
+
+    # --- Mixture Weights ---
+    # Shape: [B, K] -> [B, 1, K]
+    # We use 'probs' because compute_equivariant_gmm already applied softmax
+    mixture_weights = Categorical(probs=pi.unsqueeze(1))
+
+    # --- Spatial Distribution ---
+    # Means: [B, K, D] -> [B, 1, K, D]
+    mu_expanded = mu.unsqueeze(1)
+
+    # Sigmas: [B, K] -> [B, 1, K, 1]
+    # Note: We append a trailing 1 so it broadcasts against the D dimension of Mu.
+    # Since sigma is isotropic, it applies to x, y, and z equally.
+    sigma_expanded = sigma.unsqueeze(1).unsqueeze(-1)
+
+    # Create Normal [B, 1, K, D] -> Wrap in Independent to sum log-probs over D
+    spatial_dist = Independent(Normal(mu_expanded, sigma_expanded), 1)
+
+    # --- Type Distribution ---
+    # Shape: [B, K, T] -> [B, 1, K, T]
+    type_dist = Categorical(probs=type_probs.unsqueeze(1))
+
     return mixture_weights, spatial_dist, type_dist
+
+
+import torch
+import torch.nn.functional as F
+
+
+def compute_equivariant_gmm(gmm_pred, xt, batch_id, K, D, num_tokens=0):
+    """
+    Computes GMM parameters from EGNN output.
+
+    Args:
+        gmm_pred: [N, Output_Dim] Raw output from EGNN head.
+        xt:       [N, 3]          Equivariant node coordinates.
+        batch_id: [N]             Graph assignment index.
+        K:        int             Number of Gaussians.
+        D:        int             Spatial dimension (usually 3).
+        num_tokens: int (Optional) Number of discrete types.
+                                   If 0, types are skipped.
+    """
+    num_graphs = batch_id.max().item() + 1
+
+    # --- 1. Slice the Raw Predictions ---
+    cursor = 0
+
+    # A. Mixture Logits (K)
+    raw_mix = gmm_pred[:, cursor : cursor + K]
+    cursor += K
+
+    # B. Position Attention Logits (K)
+    # Used to calculate the weighted center of mass
+    raw_pos_attn = gmm_pred[:, cursor : cursor + K]
+    cursor += K
+
+    # C. Variances (K)
+    # Isotropic scalar variances
+    raw_vars = gmm_pred[:, cursor : cursor + K]
+    cursor += K
+
+    # D. Types (K * T) - Conditional
+    raw_types = None
+    if num_tokens is not None and num_tokens > 0:
+        raw_types = gmm_pred[:, cursor : cursor + (K * num_tokens)]
+        # cursor += (K * num_tokens) # Update if there were more fields after types
+
+    # --- 2. Compute Invariant Properties (Pool over nodes) ---
+
+    # Global Mixture Weights
+    mix_logits = unsorted_segment_mean(raw_mix, batch_id, num_graphs)
+    pi = F.softmax(mix_logits, dim=-1)  # Shape: [B, K]
+
+    # Global Variances
+    # Softplus ensures positivity.
+    vars_pooled = unsorted_segment_mean(raw_vars, batch_id, num_graphs)
+    sigma = F.softplus(vars_pooled)  # Shape: [B, K]
+
+    # Global Types (Optional)
+    type_probs = None
+    if raw_types is not None:
+        types_pooled = unsorted_segment_mean(raw_types, batch_id, num_graphs)
+        # Reshape to [B, K, T] and softmax over types
+        type_probs = F.softmax(types_pooled.view(num_graphs, K, num_tokens), dim=-1)
+
+    # --- 3. Compute Equivariant Means (Weighted Center of Mass) ---
+
+    # Calculate attention weights (Softmax over nodes within each graph)
+    # alpha shape: [N, K]
+    # Note: Requires the segment_softmax helper defined previously
+    alpha = segment_softmax(raw_pos_attn, batch_id, num_graphs)
+
+    # Weighted Sum of Coordinates
+    # xt shape: [N, 3] -> [N, 1, 3]
+    # alpha shape: [N, K] -> [N, K, 1]
+    weighted_pos = xt.unsqueeze(1) * alpha.unsqueeze(-1)  # Shape: [N, K, 3]
+
+    # Sum over nodes belonging to the same graph
+    weighted_pos_flat = weighted_pos.view(weighted_pos.size(0), -1)
+
+    means_flat = torch.zeros(num_graphs, K * 3, device=xt.device)
+    means_flat.index_add_(0, batch_id, weighted_pos_flat)
+
+    mu = means_flat.view(num_graphs, K, 3)  # Shape: [B, K, 3]
+
+    # --- 4. Return Dictionary ---
+    output = {
+        "mu": mu,  # Equivariant [B, K, 3]
+        "sigma": sigma,  # Invariant [B, K]
+        "pi": pi,  # Invariant [B, K]
+    }
+
+    if type_probs is not None:
+        output["types"] = type_probs  # Invariant [B, K, T]
+
+    return output
 
 
 def interpolate_typed_gmm(
@@ -404,46 +573,3 @@ def sample_from_typed_gmm(gmm_params, num_samples, K=10, D=1, N_types=4):
         sampled_types = sampled_types.squeeze(0)
 
     return sampled_locations, sampled_types
-
-
-if __name__ == "__main__":
-    num_samples = 100
-    K = 10
-    D = 3
-    N_types = 4
-
-    batch_size = 10
-    predicted_gmm_params = torch.randn(batch_size, K + 2 * K * D + K * N_types)
-
-    mixture_weights, spatial_dist, type_dist = get_typed_gmm_components(
-        predicted_gmm_params, K, D, N_types
-    )
-    print(mixture_weights.probs.shape)
-    print(spatial_dist.base_dist.mean.shape)
-    print(type_dist.probs.shape)
-
-    means = torch.randn(K, D)
-    types = torch.randint(0, N_types, (K,))
-    t = torch.tensor(0.5)
-    sigma = 1.0
-    sampled_locations, sampled_types = interpolate_typed_gmm(
-        means, types, t, N_types, sigma, num_samples
-    )
-    print(sampled_locations.shape)
-    print(sampled_types.shape)
-
-    target_locations = torch.randn(batch_size, num_samples, D)
-    target_types = torch.randint(0, N_types, (batch_size, num_samples))
-    loss = typed_gmm_loss(
-        predicted_gmm_params, target_locations, target_types, K, D, N_types
-    )
-    print(f"Loss: {loss.item()}")
-
-    n_params = get_typed_gmm_parameters_shape(K, D, N_types)
-    print(f"Number of parameters: {n_params}")
-
-    sampled_locations, sampled_types = sample_from_typed_gmm(
-        predicted_gmm_params, num_samples, K, D, N_types
-    )
-    print(sampled_locations.shape)
-    print(sampled_types.shape)

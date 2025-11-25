@@ -87,7 +87,7 @@ class Integrator:
     def sample_birth_process_gnn(
         self,
         birth_rate: torch.Tensor,
-        birth_gmm_params: torch.Tensor,
+        birth_gmm_dict: dict,
         batch_id: torch.Tensor,
         dt: float,
         N_types: int,
@@ -98,7 +98,7 @@ class Integrator:
         Args:
             birth_rate: Shape (num_graphs,) - graph-level birth rates
             # GMM parameters per graph
-            birth_gmm_params: Shape (num_graphs, K + 2*K*D + K*N_types)
+            birth_gmm_dict: dict - GMM parameters per graph
             batch_id: Shape (N_total,) - current batch assignments (for determining num_graphs)
             dt: Time step
             N_types: Number of atom types
@@ -128,7 +128,11 @@ class Integrator:
 
             # Sample from GMM for this graph
             # Keep batch dimension
-            gmm_params = birth_gmm_params[graph_id : graph_id + 1]
+            gmm_params = {
+                "mu": birth_gmm_dict["mu"][graph_id].unsqueeze(0),
+                "sigma": birth_gmm_dict["sigma"][graph_id].unsqueeze(0),
+                "pi": birth_gmm_dict["pi"][graph_id].unsqueeze(0),
+            }
             if self.typed_gmm:
                 sampled_locations, sampled_types = sample_from_typed_gmm(
                     gmm_params, num_births, self.K, self.D, N_types
@@ -181,7 +185,7 @@ class Integrator:
         type_pred: torch.Tensor,
         global_death_rate: torch.Tensor,
         birth_rate: torch.Tensor,
-        birth_gmm_params: torch.Tensor,
+        birth_gmm_dict: dict,
         xt: torch.Tensor,
         ct: torch.Tensor,
         batch_id: torch.Tensor,
@@ -203,7 +207,7 @@ class Integrator:
             global_death_rate: Shape (num_graphs,) - graph-level death rates
             birth_rate: Shape (num_graphs,) - graph-level birth rates
             # GMM parameters per graph
-            birth_gmm_params: Shape (num_graphs, K + 2*K*D + K*N_types)
+            birth_gmm_dict: dict - GMM parameters per graph
             xt: Shape (N_total, D) - current positions
             ct: Shape (N_total, num_classes) - current types (one-hot)
             batch_id: Shape (N_total,) - batch assignment for each node
@@ -241,16 +245,18 @@ class Integrator:
             noise[times + dt < 1.0] = cat_noise_level
 
             # Off-diagonal step probs
-            mult = ((1 + ((2 * noise) * (ct.shape[-1] - 1) * times)) / (1 - times))
+            mult = (1 + ((2 * noise) * (ct.shape[-1] - 1) * times)) / (1 - times)
             first_term = dt * mult * type_pred
             second_term = dt * noise * pred_probs_curr
             step_probs = (first_term + second_term).clamp(max=1.0)
+
             # On-diagonal step probs
             step_probs.scatter_(-1, curr.unsqueeze(-1), 0.0)
             diags = (1.0 - step_probs.sum(dim=-1, keepdim=True)).clamp(min=0.0)
             step_probs.scatter_(-1, curr.unsqueeze(-1), diags)
             pred = torch.distributions.Categorical(step_probs).sample()
             ct_new = F.one_hot(pred, num_classes=ct.shape[-1]).float()
+
         else:
             # Get time for each node (expand t to match nodes)
             num_graphs = t.shape[0]
@@ -287,7 +293,7 @@ class Integrator:
         # 4. Sample birth process
         new_particles, new_types, new_batch_ids = self.sample_birth_process_gnn(
             birth_rate,
-            birth_gmm_params,
+            birth_gmm_dict,
             batch_id,
             dt,
             ct.shape[-1],

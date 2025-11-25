@@ -60,6 +60,7 @@ class Preprocessing:
         self.atom_type_distribution = None
         self.edge_type_distribution = None
         self.n_atoms_distribution = None
+        self.coordinate_std = None
         self.distributions = None
 
         # Load or compute distributions
@@ -131,6 +132,7 @@ class Preprocessing:
             self.atom_type_distribution = distributions["atom_type_distribution"]
             self.edge_type_distribution = distributions["edge_type_distribution"]
             self.n_atoms_distribution = distributions["n_atoms_distribution"]
+            self.coordinate_std = distributions.get("coordinate_std", None)
             self.distributions = distributions
             return
 
@@ -144,6 +146,7 @@ class Preprocessing:
         self.atom_type_distribution = distributions["atom_type_distribution"]
         self.edge_type_distribution = distributions["edge_type_distribution"]
         self.n_atoms_distribution = distributions["n_atoms_distribution"]
+        self.coordinate_std = distributions["coordinate_std"]
         self.distributions = distributions
 
     def _compute_distributions(self) -> dict[str, torch.Tensor]:
@@ -164,8 +167,10 @@ class Preprocessing:
         atom_type_distribution = atom_type_distribution / atom_type_distribution.sum()
 
         # Compute edge type and number of atoms distributions
+        # Also collect coordinates for std calculation
         all_num_atoms = []
         all_edge_types = []
+        all_coords = []
 
         for i in range(len(dataset)):
             data = dataset[i]
@@ -174,6 +179,10 @@ class Preprocessing:
             triu_edge_types = edge_types_to_triu_entries(
                 data.edge_index, data.edge_attr, num_atoms
             )
+
+            # Remove center of mass for each molecule (same as in FlowMatchingQM9Dataset)
+            coord = data.pos - data.pos.mean(dim=0)
+            all_coords.append(coord)
 
             all_num_atoms.append(num_atoms)
             all_edge_types.append(triu_edge_types)
@@ -186,10 +195,19 @@ class Preprocessing:
         edge_type_distribution = all_edge_types.bincount()
         edge_type_distribution = edge_type_distribution / edge_type_distribution.sum()
 
+        # Compute coordinate std across all coordinates in the dataset
+        all_coords = torch.cat(all_coords, dim=0)  # Shape: (total_atoms, 3)
+        coordinate_std = all_coords.std(dim=0)  # Shape: (3,) - std for each dimension
+        # Use overall std (mean of per-dimension stds) or keep per-dimension
+        # Using overall std as a scalar for simplicity
+        coordinate_std = coordinate_std.mean().item()
+        coordinate_std = torch.tensor(coordinate_std, dtype=torch.float32)
+
         return {
             "atom_type_distribution": atom_type_distribution,
             "edge_type_distribution": edge_type_distribution,
             "n_atoms_distribution": n_atoms_distribution,
+            "coordinate_std": coordinate_std,
         }
 
     def _save_distributions(self, distributions: dict[str, torch.Tensor]):
