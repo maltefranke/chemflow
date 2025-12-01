@@ -137,7 +137,11 @@ class EGNNwithHeads(BaseEGNN):
 
         # Pass through heads
         if batch is not None:
-            return self.heads(h, batch)
+            out_dict = self.heads(h, batch)
         else:
             # If no batch info provided, only node-level heads will work
-            return self.heads(h, batch=None)
+            out_dict = self.heads(h, batch=None)
+
+        out_dict["pos_head"] = coord
+
+        return out_dict

@@ -26,6 +26,7 @@ class LightningModule(pl.LightningModule):
         N_samples: int = 20,
         K: int = 10,
         D: int = 3,
+        n_atoms_strategy: str = "fixed",
     ):
         super().__init__()
 
@@ -43,6 +44,7 @@ class LightningModule(pl.LightningModule):
         self.k_nn_edges = k_nn_edges
         self.K = K
         self.D = D
+        self.n_atoms_strategy = n_atoms_strategy
 
         # Set default loss weights if not provided
         if loss_weights is None:
@@ -245,7 +247,6 @@ class LightningModule(pl.LightningModule):
             xt,
             xt_batch_id,
             self.K,
-            self.D,
             len(self.tokens) if self.typed_gmm else 0,
         )
 
@@ -272,8 +273,8 @@ class LightningModule(pl.LightningModule):
             # predict final class for all tokens
             mask = torch.ones_like(at_ind, dtype=torch.bool)
 
-        # only compute loss for tokens where at is not already correct (i.e. requires an edit)
-        mask = mask & (at_ind != targets["target_c"].argmax(dim=-1))
+            # only compute loss for tokens where at is not already correct (i.e. requires an edit)
+            mask = mask & (at_ind != targets["target_c"].argmax(dim=-1))
 
         if mask.sum() > 0:
             # Always use weighted cross-entropy loss
@@ -292,7 +293,6 @@ class LightningModule(pl.LightningModule):
         else:
             x_pred = x_pred
 
-        x_pred = xt + x_pred
         x_loss = F.mse_loss(x_pred, targets["target_x"])
 
         if self.typed_gmm:
@@ -433,8 +433,10 @@ class LightningModule(pl.LightningModule):
             type_pred = F.softmax(type_pred, dim=-1)
 
             x1_pred = preds["pos_head"]  # (N_total, D)
-            x1_pred = x1_pred * self.coordinate_std
-            x1_pred = xt + x1_pred
+            if hasattr(self, "coordinate_std") and self.coordinate_std is not None:
+                x1_pred = x1_pred * self.coordinate_std
+            else:
+                x1_pred = x1_pred
 
             # (num_graphs, K + 2*K*D + K*N_types)
             gmm_pred = preds["gmm_head"]
@@ -443,14 +445,18 @@ class LightningModule(pl.LightningModule):
                 xt,
                 batch_id,
                 self.K,
-                self.D,
                 len(self.tokens) if self.typed_gmm else 0,
             )
 
             # Process rates
             net_rate_pred = preds["net_rate_head"]  # (num_graphs, 1)
-            death_rate = F.relu(-net_rate_pred).squeeze(-1)  # (num_graphs,)
-            birth_rate = F.relu(net_rate_pred).squeeze(-1)  # (num_graphs,)
+            # if we fix the number of atoms, we will not use the jump process
+            if self.n_atoms_strategy == "fixed":
+                death_rate = F.relu(-net_rate_pred).squeeze(-1)  # (num_graphs,)
+                birth_rate = F.relu(net_rate_pred).squeeze(-1)  # (num_graphs,)
+            else:
+                death_rate = torch.zeros_like(net_rate_pred).squeeze(-1)
+                birth_rate = torch.zeros_like(net_rate_pred).squeeze(-1)
 
             # Integrate one step
             xt, at, batch_id = self.integrator.integrate_step_gnn(

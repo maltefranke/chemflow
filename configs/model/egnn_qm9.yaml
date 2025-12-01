@@ -8,17 +8,18 @@ module:
   # tokens and atom_type_distribution will be passed from preprocessing in run.py
 
   weight_alpha: 1.0
-  k_nn_edges: 20
-  typed_gmm: True
-  N_samples: 10
+  k_nn_edges: 10
+  typed_gmm: False
+  N_samples: 30
   K: ${model.K}
   D: ${model.D}
-
+  n_atoms_strategy: ${data.n_atoms_strategy}
+  
   # Loss component weights
   loss_weights:
-    a_loss: 0.4
+    a_loss: 1.0
     x_loss: 3.0
-    gmm_loss: 1.0
+    gmm_loss: 3.0
     death_rate_loss: 0.1
     birth_rate_loss: 0.1
 
@@ -54,7 +55,7 @@ egnn:
   hidden_nf: 128
   out_node_nf: 64
   in_edge_nf: 0
-  n_layers: 4
+  n_layers: 6
   residual: True
   attention: False
   normalize: True
@@ -70,9 +71,18 @@ heads:
         output_dim: ${len:${data.tokens}}
         hidden_dim: 32
 
-      pos_head:
+      # pos_head:
+      #  input_dim: ${model.egnn.out_node_nf}
+      #  output_dim: ${model.D}
+
+      gmm_head:
         input_dim: ${model.egnn.out_node_nf}
-        output_dim: ${model.D}
+        # Components:
+        # 1. Mixture Logits (K)
+        # 2. Position Attention Logits (K) -> Replaces K*D
+        # 3. Variances (K * 1)
+        # 4. Type Logits (K * T)
+        output_dim: ${oc.eval:"${model.K} + ${model.K}"} #+ ${model.K}*${len:${data.tokens}}"}
 
     graph_heads:
       net_rate_head:
@@ -81,8 +91,8 @@ heads:
         hidden_dim: 32
         aggregation: mean
 
-      gmm_head:
-        input_dim: ${model.egnn.out_node_nf}
-        output_dim: ${oc.eval:"${model.K} + 2*${model.K}*${model.D} + ${model.K}*${len:${data.tokens}}"}
-        aggregation: mean
+      #gmm_head:
+      #  input_dim: ${model.egnn.out_node_nf}
+      #  output_dim: ${oc.eval:"${model.K} + 2*${model.K}*${model.D} + ${model.K}*${len:${data.tokens}}"}
+      #  aggregation: mean
       

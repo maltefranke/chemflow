@@ -289,11 +289,7 @@ def get_typed_gmm_components(gmm_output, D=3):
     return mixture_weights, spatial_dist, type_dist
 
 
-import torch
-import torch.nn.functional as F
-
-
-def compute_equivariant_gmm(gmm_pred, xt, batch_id, K, D, num_tokens=0):
+def compute_equivariant_gmm_old(gmm_pred, xt, batch_id, K, num_tokens=0):
     """
     Computes GMM parameters from EGNN output.
 
@@ -378,6 +374,132 @@ def compute_equivariant_gmm(gmm_pred, xt, batch_id, K, D, num_tokens=0):
 
     if type_probs is not None:
         output["types"] = type_probs  # Invariant [B, K, T]
+
+    return output
+
+
+def compute_equivariant_gmm(gmm_pred, xt, batch_id, K, num_tokens=0):
+    """
+    Decodes GMM parameters using the Hybrid (2K) approach.
+
+    Args:
+        gmm_pred: [N, Output_Dim] Raw logits from GMMHead.
+        xt:       [N, 3]          Equivariant node coordinates.
+        batch_id: [N]             Graph assignment index.
+        K:        int             Number of Gaussians.
+        num_tokens: int           Number of discrete types.
+
+    Returns:
+        dict: {
+            "mu":    [B, K, 3], # Equivariant Means
+            "sigma": [B, K],    # Invariant Variances (Isotropic)
+            "pi":    [B, K],    # Invariant Mixing Weights
+            "types": [B, K, T]  # (Optional) Invariant Type Probs
+        }
+    """
+    device = xt.device
+    num_graphs = batch_id.max().item() + 1
+    N = xt.shape[0]
+
+    # --- 1. Slice Inputs ---
+    # First K: Assignment Logits (Where is the node?)
+    # Second K: Variance Logits (How spread out is the cluster?)
+    assign_logits = gmm_pred[:, :K]
+    var_logits = gmm_pred[:, K : 2 * K]
+
+    # --- 2. Compute Assignments (w) ---
+    # w_ik: Probability node i belongs to component k
+    # Softmax implies competition: a node distributes its mass among K clusters.
+    w = F.softmax(assign_logits, dim=-1)  # [N, K]
+
+    # Calculate total mass per cluster per graph
+    # w_sum: [B, K]
+    w_sum = torch.zeros(num_graphs, K, device=device)
+    w_sum.index_add_(0, batch_id, w)
+
+    # Add epsilon to prevent division by zero in empty clusters
+    denominator = w_sum + 1e-6
+
+    # --- 3. Mixing Weights (Pi) ---
+    # pi = (Total mass in cluster) / (Total nodes in graph)
+
+    # Get graph sizes: [B, 1]
+    graph_sizes = torch.bincount(batch_id, minlength=num_graphs).unsqueeze(-1).float()
+
+    # [B, K]
+    pi = w_sum / (graph_sizes + 1e-6)
+
+    # --- 4. Means (Mu) - Translation & Rotation Equivariant ---
+    # Weighted average of coordinates: sum(w * x) / sum(w)
+
+    # xt: [N, 3] -> [N, 1, 3]
+    # w:  [N, K] -> [N, K, 1]
+    # weighted_pos: [N, K, 3]
+    weighted_pos = xt.unsqueeze(1) * w.unsqueeze(-1)
+
+    # Flatten to [N, K*3] for index_add_
+    flat_weighted_pos = weighted_pos.view(N, -1)
+
+    flat_mu_sum = torch.zeros(num_graphs, K * 3, device=device)
+    flat_mu_sum.index_add_(0, batch_id, flat_weighted_pos)
+
+    # Reshape back to [B, K, 3]
+    mu_sum = flat_mu_sum.view(num_graphs, K, 3)
+
+    # Divide by total weight
+    # [B, K, 3] / [B, K, 1]
+    mu = mu_sum / denominator.unsqueeze(-1)
+
+    # --- 5. Variances (Sigma) - Invariant ---
+    # Weighted average of predicted variances.
+    # Logic: If node i is strongly in cluster k, its prediction for sigma_k matters more.
+
+    # Enforce positivity on raw logits
+    sigma_per_node = F.softplus(var_logits)  # [N, K]
+
+    # Weight by assignment probability
+    weighted_sigma = w * sigma_per_node  # [N, K]
+
+    sigma_sum = torch.zeros(num_graphs, K, device=device)
+    sigma_sum.index_add_(0, batch_id, weighted_sigma)
+
+    # [B, K]
+    sigma = sigma_sum / denominator
+
+    # --- 6. Types (Optional) ---
+    type_probs = None
+    if num_tokens > 0:
+        # Slice the remaining part
+        raw_types = gmm_pred[:, 2 * K : 2 * K + (K * num_tokens)]
+
+        # Reshape: [N, K, T]
+        type_logits_per_node = raw_types.view(N, K, num_tokens)
+
+        # Softmax over types -> probs per node
+        node_type_probs = F.softmax(type_logits_per_node, dim=-1)
+
+        # Weight by assignment w: [N, K, 1] * [N, K, T] -> [N, K, T]
+        weighted_types = w.unsqueeze(-1) * node_type_probs
+
+        # Sum over graph
+        flat_types = weighted_types.view(N, -1)  # [N, K*T]
+        flat_types_sum = torch.zeros(num_graphs, K * num_tokens, device=device)
+        flat_types_sum.index_add_(0, batch_id, flat_types)
+
+        # Normalize
+        type_probs = flat_types_sum.view(
+            num_graphs, K, num_tokens
+        ) / denominator.unsqueeze(-1)
+
+    # --- 7. Output ---
+    output = {
+        "mu": mu,
+        "sigma": sigma,
+        "pi": pi,
+    }
+
+    if type_probs is not None:
+        output["types"] = type_probs
 
     return output
 
