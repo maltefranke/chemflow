@@ -6,7 +6,8 @@ tokens: None
 atom_type_distribution: None
 edge_type_distribution: None
 n_atoms_distribution: None
-n_atoms_strategy: fixed
+n_atoms_strategy: "fixed"
+cat_strategy: "uniform-sample"
 
 # Preprocessing configuration - computes tokens from data and distributions from training dataset only
 preprocessing:

@@ -7,8 +7,6 @@ def sample_prior_graph(
     atom_type_distribution,
     edge_type_distribution,
     n_atoms_distribution,
-    typed_gmm=True,
-    mask_token=0,
     n_atoms = None,
 ):
     p_atom_types = Categorical(probs=atom_type_distribution)
@@ -22,10 +20,7 @@ def sample_prior_graph(
         N_atoms = p_n_atoms.sample()
 
     # sample atom types from train distribution
-    if typed_gmm:
-        atom_types = p_atom_types.sample(sample_shape=(N_atoms,))
-    else:
-        atom_types = mask_token * torch.ones(N_atoms, dtype=torch.long)
+    atom_types = p_atom_types.sample(sample_shape=(N_atoms,))
 
     # sample coordinates randomly
     coord = torch.randn(N_atoms, 3)

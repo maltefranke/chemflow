@@ -33,7 +33,7 @@ def distance_based_assignment(valid_x0, valid_x1):
     return row_ind, col_ind
 
 
-def assign_targets_batched(x0, c0, x0_batch_id, x1, c1, x1_batch_id):
+def assign_targets_batched(x0, c0, x0_batch_id, x1, c1, x1_batch_id, optimal_transport="equivariant"):
     """
     Assigns targets from x1 to x0 using the Hungarian algorithm,
     handling batches with flexible graph sizes using batch_id.
@@ -135,9 +135,10 @@ def assign_targets_batched(x0, c0, x0_batch_id, x1, c1, x1_batch_id):
         matched_c0_b = valid_c0[row_ind]
         matched_c1_b = valid_c1[col_ind]
 
-        # Align the matched items
-        R, t = rigid_alignment(matched_x0_b, matched_x1_b)
-        matched_x0_b = matched_x0_b.mm(R.T) + t
+        if optimal_transport == "equivariant":
+            # Align the matched items
+            R, t = rigid_alignment(matched_x0_b, matched_x1_b)
+            matched_x0_b = matched_x0_b.mm(R.T) + t
 
         all_matched_x0.append(matched_x0_b)
         all_matched_x1.append(matched_x1_b)
