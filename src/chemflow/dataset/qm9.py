@@ -13,12 +13,14 @@ class FlowMatchingQM9Dataset(QM9):
         self,
         root,
         tokens: list[str],
+        coord_std: float = None,
         transform=None,
         pre_transform=None,
     ):
         super().__init__(root, transform, pre_transform)
 
         self.tokens = tokens
+        self.coord_std = coord_std
 
     def __getitem__(self, index):
         data = super().__getitem__(index)
@@ -34,6 +36,8 @@ class FlowMatchingQM9Dataset(QM9):
         edge_types = edge_types_to_triu_entries(
             data.edge_index, data.edge_attr, data.num_nodes
         )
+        if self.coord_std is not None:
+            coord = coord / self.coord_std
         target = {
             "coord": coord,
             "atom_types": atom_types,

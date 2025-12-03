@@ -181,7 +181,7 @@ class Integrator:
 
     def integrate_step_gnn(
         self,
-        velocity: torch.Tensor,
+        x_pred: torch.Tensor,
         type_pred: torch.Tensor,
         global_death_rate: torch.Tensor,
         birth_rate: torch.Tensor,
@@ -194,6 +194,7 @@ class Integrator:
         mask_index: int,
         death_token_index: int,
         cat_noise_level: float = 0.0,
+        eps: float = 1e-6
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Integrate one step of the stochastic process for GNN models.
@@ -228,6 +229,7 @@ class Integrator:
         xt_mask = torch.ones_like(batch_id, dtype=torch.bool, device=self.device)
 
         # 1. Update positions (Euler-Maruyama scheme)
+        velocity = (x_pred - xt) / (1 - t[batch_id].unsqueeze(-1)).clamp(min=eps, max=1.0 - eps)
         xt_new = xt + velocity * dt
 
         # 2. Update types

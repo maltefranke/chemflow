@@ -3,6 +3,7 @@ import omegaconf
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
+from lightning.pytorch.callbacks import LearningRateMonitor
 from omegaconf import DictConfig
 from omegaconf import OmegaConf
 
@@ -47,6 +48,7 @@ def run(cfg: DictConfig):
         atom_type_distribution=atom_type_distribution,
         edge_type_distribution=edge_type_distribution,
         n_atoms_distribution=n_atoms_distribution,
+        coord_std=coordinate_std,
     )
     # Call setup to create datasets with tokens and distributions
     datamodule.setup()
@@ -61,13 +63,13 @@ def run(cfg: DictConfig):
     module.set_tokens_and_distribution(
         tokens=tokens,
         atom_type_distribution=atom_type_distribution,
-        coordinate_std=coordinate_std,
     )
 
     # Setup logging and callbacks
     wandb_logger = WandbLogger(**cfg.logging)
     callbacks = build_callbacks(cfg)
-
+    lr_monitor = LearningRateMonitor(logging_interval="step")
+    callbacks.append(lr_monitor)
     # Instantiate trainer
     trainer = pl.Trainer(
         logger=wandb_logger,

@@ -27,6 +27,11 @@ class LightningModule(pl.LightningModule):
         K: int = 10,
         D: int = 3,
         n_atoms_strategy: str = "fixed",
+        cat_strategy: str = "uniform-sample", # "mask" or "uniform-sample"
+        type_loss_token_weights: str = "uniform", # "uniform" or "training"
+        num_integration_steps: int = 100,
+        cat_noise_level: float = 0.0,
+        coord_noise_level: float = 0.0,
     ):
         super().__init__()
 
@@ -45,6 +50,11 @@ class LightningModule(pl.LightningModule):
         self.K = K
         self.D = D
         self.n_atoms_strategy = n_atoms_strategy
+        self.cat_strategy = cat_strategy
+        self.type_loss_token_weights = type_loss_token_weights
+        self.cat_noise_level = cat_noise_level
+        self.num_integration_steps = num_integration_steps
+        self.coord_noise_level = coord_noise_level
 
         # Set default loss weights if not provided
         if loss_weights is None:
@@ -86,7 +96,6 @@ class LightningModule(pl.LightningModule):
         self,
         tokens: list[str],
         atom_type_distribution: torch.Tensor,
-        coordinate_std: torch.Tensor = None,
     ):
         """Set tokens and atom type distribution after initialization."""
         self.tokens = tokens
@@ -109,11 +118,6 @@ class LightningModule(pl.LightningModule):
         # Always compute token distribution weights for weighted cross-entropy loss
         weights = self._compute_token_weights(atom_type_distribution)
         self.register_buffer("token_weights", weights)
-
-        # Register coordinate_std as a buffer so it moves to the correct device
-        if coordinate_std is not None:
-            # Register new buffer
-            self.register_buffer("coordinate_std", coordinate_std.to(self.device))
 
     def _compute_token_weights(
         self, atom_type_distribution: torch.Tensor
@@ -170,6 +174,8 @@ class LightningModule(pl.LightningModule):
         # TODO: e.g. look at N_t and compare to data, then weight accordingly
         final_weights[self.mask_index] = 0.0
         final_weights[self.death_token_index] = min_regular_weight
+        if self.type_loss_token_weights == "uniform":
+            final_weights = torch.ones_like(final_weights)
 
         return final_weights
 
@@ -253,11 +259,6 @@ class LightningModule(pl.LightningModule):
         net_rate_pred = preds["net_rate_head"]
         death_rate_pred = F.relu(-net_rate_pred)
         birth_rate_pred = F.relu(net_rate_pred)
-
-        # Scale position predictions by coordinate_std before loss calculation
-        if hasattr(self, "coordinate_std") is not None:
-            x_pred = x_pred * self.coordinate_std
-
         # Calculate losses
         # only do class prediction on non-mask tokens
         if self.token_weights is None:
@@ -266,15 +267,12 @@ class LightningModule(pl.LightningModule):
                 "Call set_tokens_and_distribution() first."
             )
 
-        if not self.typed_gmm:
+        if self.cat_strategy == "mask":
             # predict final class only for mask tokens
             mask = at_ind != self.mask_index
         else:
             # predict final class for all tokens
             mask = torch.ones_like(at_ind, dtype=torch.bool)
-
-            # only compute loss for tokens where at is not already correct (i.e. requires an edit)
-            mask = mask & (at_ind != targets["target_c"].argmax(dim=-1))
 
         if mask.sum() > 0:
             # Always use weighted cross-entropy loss
@@ -286,12 +284,6 @@ class LightningModule(pl.LightningModule):
         else:
             # all tokens are correct, so no loss
             a_loss = torch.tensor(0.0, device=self.device)
-
-        # Scale target_x by coordinate_std as well to match scaled predictions
-        if hasattr(self, "coordinate_std") and self.coordinate_std is not None:
-            x_pred = x_pred * self.coordinate_std
-        else:
-            x_pred = x_pred
 
         x_loss = F.mse_loss(x_pred, targets["target_x"])
 
@@ -320,23 +312,23 @@ class LightningModule(pl.LightningModule):
             + self.loss_weights.death_rate_loss * death_rate_loss
             + self.loss_weights.birth_rate_loss * birth_rate_loss
         )
-        self.log("loss", loss, prog_bar=True, logger=True, batch_size=batch_size)
-        self.log("a_loss", a_loss, prog_bar=True, logger=True, batch_size=batch_size)
-        self.log("x_loss", x_loss, prog_bar=True, logger=True, batch_size=batch_size)
+        self.log("loss", loss, prog_bar=False, logger=True, batch_size=batch_size)
+        self.log("a_loss", a_loss, prog_bar=False, logger=True, batch_size=batch_size)
+        self.log("x_loss", x_loss, prog_bar=False, logger=True, batch_size=batch_size)
         self.log(
-            "gmm_loss", gmm_loss, prog_bar=True, logger=True, batch_size=batch_size
+            "gmm_loss", gmm_loss, prog_bar=False, logger=True, batch_size=batch_size
         )
         self.log(
             "death_rate_loss",
             death_rate_loss,
-            prog_bar=True,
+            prog_bar=False,
             logger=True,
             batch_size=batch_size,
         )
         self.log(
             "birth_rate_loss",
             birth_rate_loss,
-            prog_bar=True,
+            prog_bar=False,
             logger=True,
             batch_size=batch_size,
         )
@@ -402,12 +394,12 @@ class LightningModule(pl.LightningModule):
         batch_id = samples_batched["batch_index"]
 
         # Time parameters
-        num_steps = 100  # TODO: make this a hyperparameter
+        num_steps = self.num_integration_steps
         dt = 1.0 / num_steps
         t = torch.zeros(batch_size, device=self.device)  # Start at t=0
 
         # Hyperparameters
-        cat_noise_level = 0.0  # TODO: make this a hyperparameter
+        cat_noise_level = self.cat_noise_level
 
         # Trajectory storage
         xt_trajectory = [xt.clone()]
@@ -416,27 +408,19 @@ class LightningModule(pl.LightningModule):
 
         # Integration loop: integrate from t=0 to t=1
         for _ in range(num_steps):
-            instantaneous_rate = 1 / torch.clamp(1 - t, min=1e-6)
-            instantaneous_rate = instantaneous_rate[batch_id].view(-1, 1)
 
             # Build kNN graph
             edge_index = knn_graph(xt, k=self.k_nn_edges, batch=batch_id)
 
             # Get model predictions
-            with torch.no_grad():
-                preds = self.model(
-                    at_ind, xt, edge_index, t.view(-1, 1), batch=batch_id
-                )
-
+            preds = self.model(
+                at_ind, xt, edge_index, t.view(-1, 1), batch=batch_id
+            )
             # Extract predictions
             type_pred = preds["class_head"]  # (N_total, num_classes)
             type_pred = F.softmax(type_pred, dim=-1)
 
             x1_pred = preds["pos_head"]  # (N_total, D)
-            if hasattr(self, "coordinate_std") and self.coordinate_std is not None:
-                x1_pred = x1_pred * self.coordinate_std
-            else:
-                x1_pred = x1_pred
 
             # (num_graphs, K + 2*K*D + K*N_types)
             gmm_pred = preds["gmm_head"]
@@ -452,15 +436,15 @@ class LightningModule(pl.LightningModule):
             net_rate_pred = preds["net_rate_head"]  # (num_graphs, 1)
             # if we fix the number of atoms, we will not use the jump process
             if self.n_atoms_strategy == "fixed":
-                death_rate = F.relu(-net_rate_pred).squeeze(-1)  # (num_graphs,)
-                birth_rate = F.relu(net_rate_pred).squeeze(-1)  # (num_graphs,)
-            else:
                 death_rate = torch.zeros_like(net_rate_pred).squeeze(-1)
                 birth_rate = torch.zeros_like(net_rate_pred).squeeze(-1)
+            else:
+                death_rate = F.relu(-net_rate_pred).squeeze(-1)  # (num_graphs,)
+                birth_rate = F.relu(net_rate_pred).squeeze(-1)  # (num_graphs,)
 
             # Integrate one step
             xt, at, batch_id = self.integrator.integrate_step_gnn(
-                velocity=(x1_pred - xt) * instantaneous_rate,
+                x_pred=x1_pred,
                 type_pred=type_pred,
                 global_death_rate=death_rate,
                 birth_rate=birth_rate,
@@ -518,7 +502,7 @@ class LightningModule(pl.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "epoch",
+                "interval": self.optimizer_config.interval,
                 "monitor": self.optimizer_config.monitor,
             },
             "monitor": self.optimizer_config.monitor,

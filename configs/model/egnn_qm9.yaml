@@ -14,26 +14,32 @@ module:
   K: ${model.K}
   D: ${model.D}
   n_atoms_strategy: ${data.n_atoms_strategy}
+  cat_strategy: ${data.cat_strategy}
+  num_integration_steps: 100
+  cat_noise_level: 5.0
+  coord_noise_level: 0.0
   
   # Loss component weights
   loss_weights:
     a_loss: 1.0
-    x_loss: 3.0
-    gmm_loss: 3.0
-    death_rate_loss: 0.1
-    birth_rate_loss: 0.1
+    x_loss: 2.0
+    gmm_loss: 0.0
+    death_rate_loss: 0.0
+    birth_rate_loss: 0.0
 
   # Optimizer configuration
   optimizer_config:
     optimizer:
       _target_: torch.optim.Adam
-      lr: 1e-3
+      lr: 1e-4
+
     scheduler:
-      _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
-      mode: min
-      factor: 0.8
-      patience: 10
-    monitor: val_loss
+      _target_: chemflow.schedulers.LinearOneCycleLR
+      max_lr: 1e-3
+      warmup_steps: 1000
+
+    interval: step
+    monitor: null
 
   # The 'model' key below is an argument to your LightningModule
   model:
@@ -47,17 +53,17 @@ module:
 embedding:
   _target_: chemflow.model.embedding.Embedding
   in_nf: ${len:${data.tokens}}
-  out_nf: 64
+  out_nf: 256
 
 egnn:
   _target_: src.external_code.egnn.EGNN
   in_node_nf: ${model.embedding.out_nf}
-  hidden_nf: 128
-  out_node_nf: 64
+  hidden_nf: 256
+  out_node_nf: 128
   in_edge_nf: 0
   n_layers: 6
   residual: True
-  attention: False
+  attention: True
   normalize: True
   tanh: False
 
