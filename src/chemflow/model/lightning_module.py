@@ -55,6 +55,7 @@ class LightningModule(pl.LightningModule):
         self.cat_noise_level = cat_noise_level
         self.num_integration_steps = num_integration_steps
         self.coord_noise_level = coord_noise_level
+        self.time_dist = torch.distributions.Uniform(0.0, 1.0)
 
         # Set default loss weights if not provided
         if loss_weights is None:
@@ -229,7 +230,9 @@ class LightningModule(pl.LightningModule):
         targets_batch_id = targets_batched["batch_index"]
 
         # interpolate
-        t = torch.rand(batch_size, device=self.device)
+        #t = torch.rand(batch_size, device=self.device)
+        
+        t = self.time_dist.sample((batch_size,)).to(self.device)
         # NOTE WARNING t is not sampled
         # t = 0.65 + 0.35 * torch.rand(batch_size, device=self.device)
         xt, at, xt_batch_id, targets = self.interpolator.interpolate_different_size(
@@ -244,8 +247,6 @@ class LightningModule(pl.LightningModule):
         preds = self.model(at_ind, xt, edge_index, t.view(-1, 1), batch=xt_batch_id)
 
         a_pred = preds["class_head"]
-        a_pred = F.softmax(a_pred, dim=-1)
-
         x_pred = preds["pos_head"]
         gmm_pred = preds["gmm_head"]
         gmm_dict = compute_equivariant_gmm(
