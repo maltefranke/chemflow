@@ -56,11 +56,13 @@ class LightningDataModule(pl.LightningDataModule):
         self.edge_type_distribution = edge_type_distribution
         self.n_atoms_distribution = n_atoms_distribution
         self.mask_token = token_to_index(self.tokens, "<MASK>")
+
         if cat_strategy == "uniform-sample":
             self.atom_type_distribution = torch.ones_like(self.atom_type_distribution)
             self.atom_type_distribution[token_to_index(self.tokens, "<MASK>")] = 0.0
             self.atom_type_distribution[token_to_index(self.tokens, "<DEATH>")] = 0.0
             self.edge_type_distribution = torch.ones_like(self.edge_type_distribution)
+
         elif cat_strategy == "mask":
             self.atom_type_distribution = torch.zeros_like(self.atom_type_distribution)
             self.atom_type_distribution[self.mask_token] = 1.0
@@ -127,7 +129,8 @@ class LightningDataModule(pl.LightningDataModule):
         # Concatenate node features, coordinates, and edge types
         batched_atom_types = torch.cat(atom_types_list, dim=0)
         batched_coord = torch.cat(coord_list, dim=0)
-        batched_edge_types = torch.cat(edge_types_list, dim=0)
+        # batched_edge_types = torch.cat(edge_types_list, dim=0)
+        batched_edge_types = torch.block_diag(*edge_types_list)
 
         # Handle optional edge attributes
         if has_edge_attr and edge_attr_list[0] is not None:
@@ -151,7 +154,7 @@ class LightningDataModule(pl.LightningDataModule):
             ]
         )
 
-        N_triu_edges = (N_atoms**2 - N_atoms) // 2
+        """N_triu_edges = (N_atoms**2 - N_atoms) // 2
         edge_type_batch_index = torch.cat(
             [
                 torch.full(
@@ -162,7 +165,7 @@ class LightningDataModule(pl.LightningDataModule):
                 )
                 for i in range(len(graph_dicts))
             ]
-        )
+        )"""
 
         # Build result dictionary with only present attributes
         result = {
@@ -170,9 +173,9 @@ class LightningDataModule(pl.LightningDataModule):
             "coord": batched_coord,
             "edge_types": batched_edge_types,
             "batch_index": batch_index,
-            "edge_type_batch_index": edge_type_batch_index,
+            # "edge_type_batch_index": edge_type_batch_index,
             "N_atoms": N_atoms,
-            "N_triu_edges": N_triu_edges,
+            # "N_triu_edges": N_triu_edges,
         }
 
         # Add optional attributes if they exist
@@ -194,7 +197,7 @@ class LightningDataModule(pl.LightningDataModule):
                 self.atom_type_distribution,
                 self.edge_type_distribution,
                 self.n_atoms_distribution,
-                n_atoms=n_atoms_i
+                n_atoms=n_atoms_i,
             )
             for n_atoms_i in n_atoms
         ]

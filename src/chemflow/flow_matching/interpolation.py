@@ -66,9 +66,11 @@ class Interpolator:
         self,
         x0,
         c0,
+        edge_feats0,
         x0_batch_id,
         x1,
         c1,
+        edge_feats1,
         x1_batch_id,
         t,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
@@ -79,9 +81,11 @@ class Interpolator:
         Args:
             x0: Shape (N_total, D) - concatenated nodes from all graphs
             c0: Shape (N_total, M+1) - concatenated types from all graphs
+            edge_feats0: Shape (N_total, N_total) - concatenated edge features from all graphs
             x0_batch_id: Shape (N_total,) - batch assignment for each x0 node
             x1: Shape (M_total, D) - concatenated nodes from all graphs
             c1: Shape (M_total, M+1) - concatenated types from all graphs
+            edge_feats1: Shape (M_total, M_total) - concatenated edge features from all graphs
             x1_batch_id: Shape (M_total,) - batch assignment for each x1 node
             t: Shape (num_graphs,) or scalar - time parameter for each graph
 
@@ -104,7 +108,7 @@ class Interpolator:
 
         # 1. Assign targets
         assigned_targets = assign_targets_batched(
-            x0, c0, x0_batch_id, x1, c1, x1_batch_id
+            x0, c0, edge_feats0, x0_batch_id, x1, c1, edge_feats1, x1_batch_id
         )
 
         matched_x0, matched_x1 = assigned_targets["matched"]["x"]

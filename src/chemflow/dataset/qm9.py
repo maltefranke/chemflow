@@ -3,6 +3,7 @@ import torch
 
 from chemflow.utils import (
     edge_types_to_triu_entries,
+    edge_types_to_symmetric,
     z_to_atom_types,
     token_to_index,
 )
@@ -33,7 +34,7 @@ class FlowMatchingQM9Dataset(QM9):
         atom_types = [token_to_index(self.tokens, token) for token in atom_types]
         atom_types = torch.tensor(atom_types, dtype=torch.long)
 
-        edge_types = edge_types_to_triu_entries(
+        edge_types = edge_types_to_symmetric(
             data.edge_index, data.edge_attr, data.num_nodes
         )
         if self.coord_std is not None:

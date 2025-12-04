@@ -70,6 +70,26 @@ def edge_types_to_triu_entries(edge_index, edge_types_one_hot, num_atoms):
     return triu_edge_types
 
 
+def edge_types_to_symmetric(edge_index, edge_types_one_hot, num_atoms):
+    """
+    Convert edge types to a symmetric adjacency matrix.
+    edge_index: Shape (2, E) - edge indices
+    edge_types_one_hot: Shape (E, M) - one-hot encoded edge types
+    num_atoms: int - number of atoms in the graph
+    Returns:
+        adj_matrix: Shape (N, N) - symmetric adjacency matrix
+    """
+    # By default, 0 is a single bond, 1 is a double bond etc.
+    # When creating the adj_matrix we need to add a NONE-BOND at 0
+    # Therefore, we add 1 to the edge types
+    # 0: no bond, 1: single, 2: double, 3: triple, 4: aromatic
+    edge_types = edge_types_one_hot.argmax(dim=-1) + 1
+
+    adj_matrix = to_dense_adj(edge_index, edge_attr=edge_types, max_num_nodes=num_atoms)
+    adj_matrix = adj_matrix.squeeze()
+    return adj_matrix
+
+
 def z_to_atom_types(z):
     """Convert the atomic numbers to atom symbols with rdkit."""
 

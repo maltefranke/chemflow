@@ -7,7 +7,7 @@ def sample_prior_graph(
     atom_type_distribution,
     edge_type_distribution,
     n_atoms_distribution,
-    n_atoms = None,
+    n_atoms=None,
 ):
     p_atom_types = Categorical(probs=atom_type_distribution)
     p_edge_types = Categorical(probs=edge_type_distribution)
@@ -30,15 +30,17 @@ def sample_prior_graph(
     triu_edge_types = p_edge_types.sample((N_edges,))
     triu_edge_types = triu_edge_types.to(torch.long)
 
-    """# edge types to triu_matrix
+    # edge types to triu_matrix
     triu_indices = torch.triu_indices(N_atoms, N_atoms, offset=1)
     edge_types_matrix = torch.zeros(N_atoms, N_atoms, dtype=torch.long)
-    edge_types_matrix[triu_indices[0], triu_indices[1]] = edge_types"""
+    edge_types_matrix[triu_indices[0], triu_indices[1]] = triu_edge_types
+
+    edge_types_symmetric = edge_types_matrix + edge_types_matrix.T
 
     sampled_graph = {
         "atom_types": atom_types,
         "coord": coord,
-        "edge_types": triu_edge_types,
+        "edge_types": edge_types_symmetric,  # triu_edge_types,
     }
     return sampled_graph
 

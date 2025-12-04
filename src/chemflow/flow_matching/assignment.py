@@ -33,7 +33,17 @@ def distance_based_assignment(valid_x0, valid_x1):
     return row_ind, col_ind
 
 
-def assign_targets_batched(x0, c0, x0_batch_id, x1, c1, x1_batch_id, optimal_transport="equivariant"):
+def assign_targets_batched(
+    x0,
+    c0,
+    edge_types0,
+    x0_batch_id,
+    x1,
+    c1,
+    edge_types1,
+    x1_batch_id,
+    optimal_transport="equivariant",
+):
     """
     Assigns targets from x1 to x0 using the Hungarian algorithm,
     handling batches with flexible graph sizes using batch_id.
@@ -41,9 +51,11 @@ def assign_targets_batched(x0, c0, x0_batch_id, x1, c1, x1_batch_id, optimal_tra
     Args:
         x0 (torch.Tensor): Shape (N_total, D) - concatenated nodes from all graphs
         c0 (torch.Tensor): Shape (N_total, M+1) - concatenated types from all graphs
+        edge_types0 (torch.Tensor): Shape (N_total, N_total) - concatenated edge types from all graphs
         x0_batch_id (torch.Tensor): Shape (N_total,) - batch assignment for each x0 node
         x1 (torch.Tensor): Shape (M_total, D) - concatenated nodes from all graphs
         c1 (torch.Tensor): Shape (M_total, M+1) - concatenated types from all graphs
+        edge_types1 (torch.Tensor): Shape (M_total, M_total) - concatenated edge features from all graphs
         x1_batch_id (torch.Tensor): Shape (M_total,) - batch assignment for each x1 node
 
     Returns:
@@ -73,10 +85,16 @@ def assign_targets_batched(x0, c0, x0_batch_id, x1, c1, x1_batch_id, optimal_tra
     all_matched_x1 = []
     all_unmatched_x0 = []
     all_unmatched_x1 = []
+
     all_matched_c0 = []
     all_matched_c1 = []
     all_unmatched_c0 = []
     all_unmatched_c1 = []
+
+    all_matched_edge_types0 = []
+    all_matched_edge_types1 = []
+    all_unmatched_edge_types0 = []
+    all_unmatched_edge_types1 = []
 
     empty_x = torch.empty((0, D), device=x0.device, dtype=x0.dtype)
     empty_c = torch.empty((0, M + 1), device=x0.device, dtype=x0.dtype)
@@ -90,6 +108,9 @@ def assign_targets_batched(x0, c0, x0_batch_id, x1, c1, x1_batch_id, optimal_tra
         valid_x1 = x1[x1_mask_b]  # Shape (M_b, D)
         valid_c0 = c0[x0_mask_b]  # Shape (N_b, M+1)
         valid_c1 = c1[x1_mask_b]  # Shape (M_b, M+1)
+
+        valid_edge_types0 = edge_types0[x0_mask_b]  # Shape (N_b, N_b)
+        valid_edge_types1 = edge_types1[x1_mask_b]  # Shape (M_b, M_b)
 
         # Convert to numpy for assignment algorithm
         valid_x0_np = valid_x0.detach().cpu().numpy()
@@ -134,43 +155,54 @@ def assign_targets_batched(x0, c0, x0_batch_id, x1, c1, x1_batch_id, optimal_tra
         matched_x1_b = valid_x1[col_ind]
         matched_c0_b = valid_c0[row_ind]
         matched_c1_b = valid_c1[col_ind]
+        matched_edge_types0_b = valid_edge_types0[row_ind, row_ind]
+        matched_edge_types1_b = valid_edge_types1[col_ind, col_ind]
+
+        # Get the unmatched items
+        # Find indices of valid items that were *not* in the assignment
+        unmatched_i_x0 = np.setdiff1d(np.arange(N_valid), row_ind)
+        unmatched_i_x1 = np.setdiff1d(np.arange(M_valid), col_ind)
+
+        unmatched_x0_b = valid_x0[unmatched_i_x0]
+        unmatched_x1_b = valid_x1[unmatched_i_x1]
+        unmatched_c0_b = valid_c0[unmatched_i_x0]
+        unmatched_c1_b = valid_c1[unmatched_i_x1]
+        unmatched_edge_types0_b = valid_edge_types0[unmatched_i_x0, unmatched_i_x0]
+        unmatched_edge_types1_b = valid_edge_types1[unmatched_i_x1, unmatched_i_x1]
 
         if optimal_transport == "equivariant":
             # Align the matched items
             R, t = rigid_alignment(matched_x0_b, matched_x1_b)
             matched_x0_b = matched_x0_b.mm(R.T) + t
 
+            # rotate and translate the unmatched items
+            unmatched_x0_b = unmatched_x0_b.mm(R.T) + t
+
         all_matched_x0.append(matched_x0_b)
         all_matched_x1.append(matched_x1_b)
-        all_matched_c0.append(matched_c0_b)
-        all_matched_c1.append(matched_c1_b)
-
-        # Get the unmatched items
-        # Find indices of valid items that were *not* in the assignment
-        unmatched_indices_x0 = np.setdiff1d(np.arange(N_valid), row_ind)
-        unmatched_indices_x1 = np.setdiff1d(np.arange(M_valid), col_ind)
-
-        unmatched_x0_b = valid_x0[unmatched_indices_x0]
-        unmatched_x1_b = valid_x1[unmatched_indices_x1]
-        unmatched_c0_b = valid_c0[unmatched_indices_x0]
-        unmatched_c1_b = valid_c1[unmatched_indices_x1]
-
-        # Align the unmatched items
-        unmatched_x0_b = unmatched_x0_b.mm(R.T) + t
-
         all_unmatched_x0.append(unmatched_x0_b)
         all_unmatched_x1.append(unmatched_x1_b)
+
+        all_matched_c0.append(matched_c0_b)
+        all_matched_c1.append(matched_c1_b)
         all_unmatched_c0.append(unmatched_c0_b)
         all_unmatched_c1.append(unmatched_c1_b)
+
+        all_matched_edge_types0.append(matched_edge_types0_b)
+        all_matched_edge_types1.append(matched_edge_types1_b)
+        all_unmatched_edge_types0.append(unmatched_edge_types0_b)
+        all_unmatched_edge_types1.append(unmatched_edge_types1_b)
 
     assigned_targets = {
         "matched": {
             "x": (all_matched_x0, all_matched_x1),
             "c": (all_matched_c0, all_matched_c1),
+            "edge_types": (all_matched_edge_types0, all_matched_edge_types1),
         },
         "unmatched": {
             "x": (all_unmatched_x0, all_unmatched_x1),
             "c": (all_unmatched_c0, all_unmatched_c1),
+            "edge_types": (all_unmatched_edge_types0, all_unmatched_edge_types1),
         },
     }
 

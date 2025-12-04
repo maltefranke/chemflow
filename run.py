@@ -3,7 +3,7 @@ import omegaconf
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
-from lightning.pytorch.callbacks import LearningRateMonitor
+from pytorch_lightning.callbacks import LearningRateMonitor
 from omegaconf import DictConfig
 from omegaconf import OmegaConf
 

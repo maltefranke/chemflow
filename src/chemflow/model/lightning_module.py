@@ -27,8 +27,8 @@ class LightningModule(pl.LightningModule):
         K: int = 10,
         D: int = 3,
         n_atoms_strategy: str = "fixed",
-        cat_strategy: str = "uniform-sample", # "mask" or "uniform-sample"
-        type_loss_token_weights: str = "uniform", # "uniform" or "training"
+        cat_strategy: str = "uniform-sample",  # "mask" or "uniform-sample"
+        type_loss_token_weights: str = "uniform",  # "uniform" or "training"
         num_integration_steps: int = 100,
         cat_noise_level: float = 0.0,
         coord_noise_level: float = 0.0,
@@ -223,6 +223,9 @@ class LightningModule(pl.LightningModule):
         a0 = F.one_hot(a0_ind, num_classes=len(self.tokens))
         a1 = F.one_hot(a1_ind, num_classes=len(self.tokens))
 
+        edge_types0 = samples_batched["edge_types"]
+        edge_types1 = targets_batched["edge_types"]
+
         N = samples_batched["N_atoms"]
         batch_size = len(N)
 
@@ -230,13 +233,21 @@ class LightningModule(pl.LightningModule):
         targets_batch_id = targets_batched["batch_index"]
 
         # interpolate
-        #t = torch.rand(batch_size, device=self.device)
-        
+        # t = torch.rand(batch_size, device=self.device)
+
         t = self.time_dist.sample((batch_size,)).to(self.device)
         # NOTE WARNING t is not sampled
         # t = 0.65 + 0.35 * torch.rand(batch_size, device=self.device)
         xt, at, xt_batch_id, targets = self.interpolator.interpolate_different_size(
-            x0, a0, samples_batch_id, x1, a1, targets_batch_id, t
+            x0,
+            a0,
+            edge_types0,
+            samples_batch_id,
+            x1,
+            a1,
+            edge_types1,
+            targets_batch_id,
+            t,
         )
         # convert one-hot interpolated types back to indices, as input to nn.Embedding
         at_ind = torch.argmax(at, dim=-1)
@@ -409,14 +420,11 @@ class LightningModule(pl.LightningModule):
 
         # Integration loop: integrate from t=0 to t=1
         for _ in range(num_steps):
-
             # Build kNN graph
             edge_index = knn_graph(xt, k=self.k_nn_edges, batch=batch_id)
 
             # Get model predictions
-            preds = self.model(
-                at_ind, xt, edge_index, t.view(-1, 1), batch=batch_id
-            )
+            preds = self.model(at_ind, xt, edge_index, t.view(-1, 1), batch=batch_id)
             # Extract predictions
             type_pred = preds["class_head"]  # (N_total, num_classes)
             type_pred = F.softmax(type_pred, dim=-1)
