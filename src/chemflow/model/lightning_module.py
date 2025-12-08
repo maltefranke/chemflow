@@ -7,8 +7,13 @@ from chemflow.losses import typed_gmm_loss, rate_loss
 from chemflow.losses import gmm_loss as untyped_gmm_loss
 from torch_geometric.nn import knn_graph
 
+
 from chemflow.flow_matching.integration import Integrator
-from chemflow.utils import token_to_index
+from chemflow.utils import (
+    token_to_index,
+    build_fully_connected_edge_index,
+    compute_token_weights,
+)
 from external_code.egnn import unsorted_segment_mean
 from chemflow.flow_matching.interpolation import Interpolator
 from chemflow.flow_matching.gmm import compute_equivariant_gmm
@@ -96,16 +101,21 @@ class LightningModule(pl.LightningModule):
     def set_tokens_and_distribution(
         self,
         tokens: list[str],
+        edge_tokens: list[str],
         atom_type_distribution: torch.Tensor,
+        edge_type_distribution: torch.Tensor,
     ):
-        """Set tokens and atom type distribution after initialization."""
+        """Set tokens and distributions after initialization."""
         self.tokens = tokens
+        self.edge_tokens = edge_tokens
         self.mask_index = token_to_index(self.tokens, "<MASK>")
+        self.edge_mask_index = token_to_index(self.edge_tokens, "<MASK>")
         self.death_token_index = token_to_index(self.tokens, "<DEATH>")
 
         self.interpolator = Interpolator(
             self.tokens,
             atom_type_distribution.to(self.device),
+            edge_type_distribution.to(self.device),
             typed_gmm=self.typed_gmm,
             N_samples=self.N_samples,
         )
@@ -115,70 +125,30 @@ class LightningModule(pl.LightningModule):
             self.D,
             self.typed_gmm,
             device="cuda" if torch.cuda.is_available() else "cpu",
+            edge_type_distribution=edge_type_distribution.to(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            ),
+            edge_tokens=self.edge_tokens,
         )
         # Always compute token distribution weights for weighted cross-entropy loss
-        weights = self._compute_token_weights(atom_type_distribution)
+        weights = compute_token_weights(
+            token_list=self.tokens,
+            distribution=atom_type_distribution,
+            special_token_names=["<MASK>", "<DEATH>"],
+            weight_alpha=self.weight_alpha,
+            type_loss_token_weights=self.type_loss_token_weights,
+        )
         self.register_buffer("token_weights", weights)
 
-    def _compute_token_weights(
-        self, atom_type_distribution: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute token weights with special handling for special tokens.
-
-        Args:
-            atom_type_distribution: Distribution of atom types from training data
-
-        Returns:
-            Weights tensor with same shape as atom_type_distribution
-        """
-        # --- 1. Initial Weight Calculation (Inverse Frequency) ---
-        epsilon = 1e-8
-        weights = 1.0 / (atom_type_distribution + epsilon)
-        weights = weights**self.weight_alpha  # Apply alpha scaling
-
-        # --- 2. Isolate & Normalize REGULAR Tokens ---
-        special_token_indices = {self.mask_index, self.death_token_index}
-        all_indices = set(range(len(self.tokens)))
-        # Convert to list for indexing
-        regular_token_indices = list(all_indices - special_token_indices)
-
-        if not regular_token_indices:
-            # Fallback if no regular tokens (unlikely, but good to handle)
-            final_weights = torch.ones_like(weights)
-            final_weights[self.mask_index] = 0.0
-            # Death token gets a default 'high' weight of 1.0
-            final_weights[self.death_token_index] = 1.0
-            return final_weights
-
-        # Get weights for only the regular tokens
-        regular_weights = weights[regular_token_indices]
-
-        # Normalize *only* the regular weights to have a mean of 1.0
-        mean_regular_weight = regular_weights.mean()
-        if mean_regular_weight > 0:
-            regular_weights = regular_weights / mean_regular_weight
-
-        # Find the max and min weight *after* normalization
-        max_regular_weight = regular_weights.max()
-        min_regular_weight = regular_weights.min()
-
-        # --- 3. Build Final Weights Tensor ---
-        # Start with zeros
-        final_weights = torch.zeros_like(weights)
-
-        # Assign normalized regular weights to their correct positions
-        final_weights[regular_token_indices] = regular_weights
-
-        # Assign special token weights based on the normalized regular weights
-        # TODO: death token weight could be improved / set dynamically
-        # TODO: e.g. look at N_t and compare to data, then weight accordingly
-        final_weights[self.mask_index] = 0.0
-        final_weights[self.death_token_index] = min_regular_weight
-        if self.type_loss_token_weights == "uniform":
-            final_weights = torch.ones_like(final_weights)
-
-        return final_weights
+        # Compute edge token distribution weights for weighted cross-entropy loss
+        edge_weights = compute_token_weights(
+            token_list=self.edge_tokens,
+            distribution=edge_type_distribution,
+            special_token_names=["<MASK>", "<NO_BOND>"],
+            weight_alpha=self.weight_alpha,
+            type_loss_token_weights=self.type_loss_token_weights,
+        )
+        self.register_buffer("edge_token_weights", edge_weights)
 
     def forward(self, x):
         # Define the forward pass of your model here
@@ -233,12 +203,8 @@ class LightningModule(pl.LightningModule):
         targets_batch_id = targets_batched["batch_index"]
 
         # interpolate
-        # t = torch.rand(batch_size, device=self.device)
-
         t = self.time_dist.sample((batch_size,)).to(self.device)
-        # NOTE WARNING t is not sampled
-        # t = 0.65 + 0.35 * torch.rand(batch_size, device=self.device)
-        xt, at, xt_batch_id, targets = self.interpolator.interpolate_different_size(
+        xt, at, et, xt_batch_id, targets = self.interpolator.interpolate_different_size(
             x0,
             a0,
             edge_types0,
@@ -252,13 +218,26 @@ class LightningModule(pl.LightningModule):
         # convert one-hot interpolated types back to indices, as input to nn.Embedding
         at_ind = torch.argmax(at, dim=-1)
 
+        # TODO make choice flexible
         # build kNN graph
-        edge_index = knn_graph(xt, k=self.k_nn_edges, batch=xt_batch_id)
+        # edge_index = knn_graph(xt, k=self.k_nn_edges, batch=xt_batch_id)
 
-        preds = self.model(at_ind, xt, edge_index, t.view(-1, 1), batch=xt_batch_id)
+        # build a fully connected graph per batch
+        edge_index = build_fully_connected_edge_index(xt_batch_id)
+        edge_type_ids = et[edge_index[0], edge_index[1]]
+
+        preds = self.model(
+            at_ind,
+            xt,
+            edge_index,
+            t.view(-1, 1),
+            batch=xt_batch_id,
+            edge_type_ids=edge_type_ids,
+        )
 
         a_pred = preds["class_head"]
         x_pred = preds["pos_head"]
+        edge_type_pred = preds["edge_type_head"]
         gmm_pred = preds["gmm_head"]
         gmm_dict = compute_equivariant_gmm(
             gmm_pred,
@@ -297,6 +276,18 @@ class LightningModule(pl.LightningModule):
             # all tokens are correct, so no loss
             a_loss = torch.tensor(0.0, device=self.device)
 
+        if self.edge_token_weights is None:
+            raise ValueError(
+                "edge_token_weights must be set before training. "
+                "Call set_tokens_and_distribution() first."
+            )
+
+        e_loss = F.cross_entropy(
+            edge_type_pred,
+            edge_type_ids,
+            weight=self.edge_token_weights,
+        )
+
         x_loss = F.mse_loss(x_pred, targets["target_x"])
 
         if self.typed_gmm:
@@ -320,6 +311,7 @@ class LightningModule(pl.LightningModule):
         loss = (
             self.loss_weights.a_loss * a_loss
             + self.loss_weights.x_loss * x_loss
+            + self.loss_weights.e_loss * e_loss
             + self.loss_weights.gmm_loss * gmm_loss
             + self.loss_weights.death_rate_loss * death_rate_loss
             + self.loss_weights.birth_rate_loss * birth_rate_loss
@@ -327,6 +319,7 @@ class LightningModule(pl.LightningModule):
         self.log("loss", loss, prog_bar=False, logger=True, batch_size=batch_size)
         self.log("a_loss", a_loss, prog_bar=False, logger=True, batch_size=batch_size)
         self.log("x_loss", x_loss, prog_bar=False, logger=True, batch_size=batch_size)
+        self.log("e_loss", e_loss, prog_bar=False, logger=True, batch_size=batch_size)
         self.log(
             "gmm_loss", gmm_loss, prog_bar=False, logger=True, batch_size=batch_size
         )
@@ -399,6 +392,7 @@ class LightningModule(pl.LightningModule):
         xt = samples_batched["coord"]
         at_ind = samples_batched["atom_types"]
         at = F.one_hot(at_ind, num_classes=len(self.tokens))
+        et = samples_batched["edge_types"]
 
         N = samples_batched["N_atoms"]
         batch_size = len(N)
@@ -420,16 +414,29 @@ class LightningModule(pl.LightningModule):
 
         # Integration loop: integrate from t=0 to t=1
         for _ in range(num_steps):
+            # TODO make choice flexible
             # Build kNN graph
-            edge_index = knn_graph(xt, k=self.k_nn_edges, batch=batch_id)
+            # edge_index = knn_graph(xt, k=self.k_nn_edges, batch=batch_id)
+            edge_index = build_fully_connected_edge_index(batch_id)
+            edge_type_ids = et[edge_index[0], edge_index[1]]
 
             # Get model predictions
-            preds = self.model(at_ind, xt, edge_index, t.view(-1, 1), batch=batch_id)
+            preds = self.model(
+                at_ind,
+                xt,
+                edge_index,
+                t.view(-1, 1),
+                batch=batch_id,
+                edge_type_ids=edge_type_ids,
+            )
             # Extract predictions
             type_pred = preds["class_head"]  # (N_total, num_classes)
             type_pred = F.softmax(type_pred, dim=-1)
 
             x1_pred = preds["pos_head"]  # (N_total, D)
+
+            edge_type_pred = preds["edge_type_head"]
+            edge_type_pred = F.softmax(edge_type_pred, dim=-1)
 
             # (num_graphs, K + 2*K*D + K*N_types)
             gmm_pred = preds["gmm_head"]
@@ -452,19 +459,19 @@ class LightningModule(pl.LightningModule):
                 birth_rate = F.relu(net_rate_pred).squeeze(-1)  # (num_graphs,)
 
             # Integrate one step
-            xt, at, batch_id = self.integrator.integrate_step_gnn(
+            xt, at, et, batch_id = self.integrator.integrate_step_gnn(
                 x_pred=x1_pred,
                 type_pred=type_pred,
+                edge_type_pred=edge_type_pred,
                 global_death_rate=death_rate,
                 birth_rate=birth_rate,
                 birth_gmm_dict=gmm_dict,
                 xt=xt,
                 ct=at.float(),
+                et=et,
                 batch_id=batch_id,
                 t=t,
                 dt=dt,
-                mask_index=self.mask_index,
-                death_token_index=self.death_token_index,
                 cat_noise_level=cat_noise_level,
             )
 

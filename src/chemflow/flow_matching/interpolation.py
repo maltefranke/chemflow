@@ -10,7 +10,14 @@ from external_code.egnn import unsorted_segment_mean
 
 
 class Interpolator:
-    def __init__(self, tokens, atom_type_distribution, typed_gmm=True, N_samples=20):
+    def __init__(
+        self,
+        tokens,
+        atom_type_distribution,
+        edge_type_distribution,
+        typed_gmm=True,
+        N_samples=20,
+    ):
         self.tokens = tokens
         self.typed_gmm = typed_gmm
         self.N_samples = N_samples
@@ -19,6 +26,12 @@ class Interpolator:
         self.death_token = token_to_index(self.tokens, "<DEATH>")
 
         self.atom_type_distribution = atom_type_distribution
+        self.edge_type_distribution = edge_type_distribution
+
+        # TODO I'm lazy and this will always be 3
+        self.D = 3
+        self.M = len(atom_type_distribution)
+        self.E = len(edge_type_distribution)
 
     def interpolate_x(self, x0, x1, t):
         """
@@ -46,6 +59,7 @@ class Interpolator:
         """
 
         N, M = c0.shape
+
         # Convert one-hot to integer indices
         c0_idx = torch.argmax(c0, dim=-1)
         c1_idx = torch.argmax(c1, dim=-1)
@@ -62,15 +76,41 @@ class Interpolator:
 
         return ct
 
+    def interpolate_e(self, e0, e1, t):
+        """
+        Discrete interpolation for discrete variables / one-hot classes e.
+
+        Args:
+            e0: (N, N) one-hot tensor at time 0
+            e1: (N, N) one-hot tensor at time 1
+            t: float, interpolation time in [0, 1]
+        Returns:
+            et: (N, N) interpolated one-hot tensor at time t
+        """
+        et = e1.clone()
+
+        # create upper tri random mask
+        mask = torch.triu(
+            torch.rand((e0.shape[0], e0.shape[0]), device=e0.device), diagonal=1
+        )
+
+        mask = mask > t
+
+        # interpolate e0 and e1
+        et[mask] = e0[mask]
+        et[mask.T] = e0[mask.T]
+
+        return et
+
     def interpolate_different_size(
         self,
         x0,
         c0,
-        edge_feats0,
+        edge_types0,
         x0_batch_id,
         x1,
         c1,
-        edge_feats1,
+        edge_types1,
         x1_batch_id,
         t,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
@@ -81,11 +121,11 @@ class Interpolator:
         Args:
             x0: Shape (N_total, D) - concatenated nodes from all graphs
             c0: Shape (N_total, M+1) - concatenated types from all graphs
-            edge_feats0: Shape (N_total, N_total) - concatenated edge features from all graphs
+            edge_types0: Shape (N_total, N_total) - concatenated edge types from all graphs
             x0_batch_id: Shape (N_total,) - batch assignment for each x0 node
             x1: Shape (M_total, D) - concatenated nodes from all graphs
-            c1: Shape (M_total, M+1) - concatenated types from all graphs
-            edge_feats1: Shape (M_total, M_total) - concatenated edge features from all graphs
+            a1: Shape (M_total, M+1) - concatenated types from all graphs
+            edge_types1: Shape (M_total, M_total) - concatenated edge types from all graphs
             x1_batch_id: Shape (M_total,) - batch assignment for each x1 node
             t: Shape (num_graphs,) or scalar - time parameter for each graph
 
@@ -103,19 +143,18 @@ class Interpolator:
                 - birth_types: Shape (num_graphs, M) - GMM samples for types
                 - birth_locations_batch_ids: Shape (num_graphs, N_samples) - batch ids for GMM samples
         """
-        D = x0.shape[-1]  # dimension of the data
-        M = len(self.tokens)  # number of classes
-
         # 1. Assign targets
         assigned_targets = assign_targets_batched(
-            x0, c0, edge_feats0, x0_batch_id, x1, c1, edge_feats1, x1_batch_id
+            x0, c0, edge_types0, x0_batch_id, x1, c1, edge_types1, x1_batch_id
         )
 
         matched_x0, matched_x1 = assigned_targets["matched"]["x"]
         matched_c0, matched_c1 = assigned_targets["matched"]["c"]
+        matched_e0, matched_e1 = assigned_targets["matched"]["edge_types"]
 
         unmatched_x0, unmatched_x1 = assigned_targets["unmatched"]["x"]
         unmatched_c0, unmatched_c1 = assigned_targets["unmatched"]["c"]
+        unmatched_e0, unmatched_e1 = assigned_targets["unmatched"]["edge_types"]
 
         # 2.1 Interpolate the matched targets
         matched_xt = [
@@ -127,13 +166,17 @@ class Interpolator:
             for matched_c0_i, matched_c1_i, t_i in zip(matched_c0, matched_c1, t)
         ]
 
-        matched_vf = [
-            matched_x1_i - matched_x0_i
-            for matched_x0_i, matched_x1_i in zip(matched_x0, matched_x1)
-        ]
         matched_cvf = [
-            F.one_hot(torch.argmax(c1_i, dim=-1), num_classes=M) for c1_i in matched_c1
+            F.one_hot(torch.argmax(c1_i, dim=-1), num_classes=self.M)
+            for c1_i in matched_c1
         ]
+
+        matched_et = [
+            self.interpolate_e(matched_e0_i, matched_e1_i, t_i)
+            for matched_e0_i, matched_e1_i, t_i in zip(matched_e0, matched_e1, t)
+        ]
+        # matched_evf = [F.one_hot(e1_i, num_classes=self.E) for e1_i in matched_e1]
+
         # 2.2 Handle unmatched samples / targets
         death_xt = []
         death_x1 = []
@@ -151,19 +194,35 @@ class Interpolator:
         birth_locations = []
         birth_types = []
 
-        empty_x = torch.empty((0, D), device=x0.device, dtype=x0.dtype)
-        empty_c = torch.empty((0, M), device=x0.device, dtype=x0.dtype)
+        et_list = []
+        target_e_list = []
+
+        empty_x = torch.empty((0, self.D), device=x0.device, dtype=x0.dtype)
+        empty_c = torch.empty((0, self.M), device=x0.device, dtype=x0.dtype)
+        empty_e = torch.empty((0, self.E), device=x0.device, dtype=x0.dtype)
 
         # create a sink state that all unmatched x0 will move towards
-        x_sink = torch.zeros((1, D), device=x0.device)
+        x_sink = torch.zeros((1, self.D), device=x0.device)
 
         for index, (
             unmatched_x0_i,
             unmatched_c0_i,
+            unmatched_e0_i,
             unmatched_x1_i,
             unmatched_c1_i,
+            unmatched_e1_i,
             t_i,
-        ) in enumerate(zip(unmatched_x0, unmatched_c0, unmatched_x1, unmatched_c1, t)):
+        ) in enumerate(
+            zip(
+                unmatched_x0,
+                unmatched_c0,
+                unmatched_e0,
+                unmatched_x1,
+                unmatched_c1,
+                unmatched_e1,
+                t,
+            )
+        ):
             instantaneous_rate = 1 / torch.clamp(1 - t_i, min=1e-8)
 
             # 2.3 Death process
@@ -186,6 +245,12 @@ class Interpolator:
                 N_necessary_deaths = x0_alive_at_xt.shape[0]
                 death_rate_target_i = N_necessary_deaths * instantaneous_rate
 
+                # create edge type targets as null
+                e_targets_i = matched_et[index] + torch.zeros(
+                    (matched_et[index].shape[0] + N_necessary_deaths, self.E),
+                    device=x0.device,
+                )
+
                 death_xt.append(death_xt_i)
                 death_x1.append(x_sink.repeat(death_xt_i.shape[0], 1))
                 death_vf.append(x_sink.repeat(death_xt_i.shape[0], 1) - x0_alive_at_xt)
@@ -202,8 +267,6 @@ class Interpolator:
                 birth_cvf.append(empty_c)
 
                 birth_rate_target.append(torch.zeros((1, 1), device=x0.device))
-                # birth_locations.append(-1e3 * torch.ones((1, D), device=x0.device))
-                # birth_types.append(-1e3 * torch.ones((1), device=x0.device))
                 birth_locations.append(empty_x)
                 birth_types.append(torch.zeros((0), device=x0.device))
 
@@ -215,9 +278,12 @@ class Interpolator:
                     birth_xt_i,
                     birth_x1_i,
                     birth_c1_i,
+                    birth_e1_i,
                     unborn_x1_i,
                     unborn_c1_i,
-                ) = sample_births(unmatched_x1_i, unmatched_c1_i, t_i, sigma=0.5)
+                ) = sample_births(
+                    unmatched_x1_i, unmatched_c1_i, unmatched_e1_i, t_i, sigma=0.5
+                )
 
                 # check if any births are happening
                 if birth_xt_i.shape[0] > 0:
@@ -250,7 +316,7 @@ class Interpolator:
                             dtype=torch.long,
                             device=birth_xt_i.device,
                         )
-                        birth_c0_i = F.one_hot(birth_c0_i, num_classes=len(self.tokens))
+                        birth_c0_i = F.one_hot(birth_c0_i, num_classes=self.M)
 
                         birth_ct_i = self.interpolate_c(
                             birth_c0_i,
@@ -262,8 +328,23 @@ class Interpolator:
                         probs=self.atom_type_distribution
                     )
                     birth_ct_i = birth_ct_distr.sample((birth_xt_i.shape[0],))
-                    birth_ct_i = F.one_hot(birth_ct_i, num_classes=len(self.tokens))
+                    birth_ct_i = F.one_hot(birth_ct_i, num_classes=self.M)
                     birth_ct_i = birth_ct_i.to(x0.device)
+
+                    matched_e_targets_i = matched_et[index]
+                    adj_size = matched_e_targets_i.shape[0] + birth_xt_i.shape[0]
+
+                    target_e_i = torch.zeros(
+                        (adj_size, adj_size),
+                        device=x0.device,
+                    )
+                    target_e_i[
+                        : matched_e_targets_i.shape[0], : matched_e_targets_i.shape[0]
+                    ] = matched_e_targets_i
+                    # TODO this will not work
+                    target_e_i[
+                        matched_e_targets_i.shape[0] :, matched_e_targets_i.shape[0] :
+                    ] = birth_e1_i
 
                     birth_xt.append(birth_xt_i)
                     birth_x1.append(birth_x1_i)
@@ -297,7 +378,6 @@ class Interpolator:
                     # Store the GMM samples for NLL calculation during training
                     if self.typed_gmm:
                         p_c_0 = self.atom_type_distribution.unsqueeze(0).to(x0.device)
-                        # p_c_1 = F.one_hot(unborn_c1_i.argmax(dim=-1), num_classes=M)
                         p_c_1 = unborn_c1_i
                         # TODO make sigma hyperparameter
                         sampled_locations, sampled_types = interpolate_typed_gmm(
@@ -321,10 +401,6 @@ class Interpolator:
                     birth_types.append(sampled_types)
                 else:
                     # if no unborn x1, you're done, so pad with very negative numbers
-                    """birth_locations.append(
-                        -1e3 * torch.ones((1, D), device=birth_xt_i.device)
-                    )
-                    birth_types.append(-1e3 * torch.ones((1), device=birth_xt_i.device))"""
                     birth_locations.append(empty_x)
                     birth_types.append(torch.zeros((0), device=birth_xt_i.device))
 
@@ -346,10 +422,11 @@ class Interpolator:
                 birth_cvf.append(empty_c)
 
                 birth_rate_target.append(torch.zeros((1, 1), device=x0.device))
-                # birth_locations.append(-1e3 * torch.ones((1, D), device=x0.device))
-                # birth_types.append(-1e3 * torch.ones((1), device=x0.device))
                 birth_locations.append(empty_x)
                 birth_types.append(torch.zeros((0), device=x0.device))
+
+                et_list.append(matched_et[index])
+                target_e_list.append(matched_e1[index])
 
         # 3. Concatenate the matched, death, and birth processes
         xt_list = [
@@ -366,12 +443,6 @@ class Interpolator:
         ]
 
         # 4. Concatenate the matched, death, and birth targets
-        """target_vf_list = [
-            torch.cat([matched_vf_i, death_vf_i, birth_vf_i], dim=0)
-            for matched_vf_i, death_vf_i, birth_vf_i in zip(
-                matched_vf, death_vf, birth_vf
-            )
-        ]"""
         target_x_list = [
             torch.cat([matched_x1_i, death_x1_i, birth_x1_i], dim=0)
             for matched_x1_i, death_x1_i, birth_x1_i in zip(
@@ -396,10 +467,13 @@ class Interpolator:
         xt = xt - xt_mean[xt_batch_id]
 
         ct = torch.cat(ct_list, dim=0)
+        et = torch.block_diag(*et_list)
 
-        # target_vf = torch.cat(target_vf_list, dim=0)
         target_x = torch.cat(target_x_list, dim=0)
         target_cvf = torch.cat(target_cvf_list, dim=0)
+
+        target_evf = torch.block_diag(*target_e_list)
+        target_evf = F.one_hot(target_evf, num_classes=self.E)
 
         birth_rate_target = torch.cat(birth_rate_target, dim=0)
         death_rate_target = torch.cat(death_rate_target, dim=0)
@@ -421,6 +495,7 @@ class Interpolator:
         targets = {
             "target_x": target_x,
             "target_c": target_cvf,
+            "target_e": target_evf,
             "birth_rate_target": birth_rate_target,
             "death_rate_target": death_rate_target,
             # targets for gmm
@@ -429,4 +504,4 @@ class Interpolator:
             "birth_batch_ids": birth_locations_batch_ids,
         }
 
-        return (xt, ct, xt_batch_id, targets)
+        return (xt, ct, et, xt_batch_id, targets)

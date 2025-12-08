@@ -73,41 +73,74 @@ class SinusoidalEmbedding(nn.Module):
         return pe
 
 
+class EGNNWithEdgeType(EGNN):
+    def forward(self, h, x, edges, edge_attr):
+        h = self.embedding_in(h)
+        for i in range(0, self.n_layers):
+            h, x, edge_attr = self._modules["gcl_%d" % i](
+                h, edges, x, edge_attr=edge_attr
+            )
+        h = self.embedding_out(h)
+        edge_attr = self.embedding_out(edge_attr)
+        return h, x, edge_attr
+
+
 class BaseEGNN(nn.Module):
     """Base class for EGNN models. Embeds the atom feats and passes the data through the EGNN."""
 
-    def __init__(self, embedding_args: DictConfig, egnn_args: DictConfig):
+    def __init__(
+        self,
+        atom_type_embedding_args: DictConfig,
+        edge_type_embedding_args: DictConfig,
+        egnn_args: DictConfig,
+    ):
         super().__init__()
-        self.embedding = hydra.utils.instantiate(embedding_args)
+        self.atom_type_embedding = hydra.utils.instantiate(atom_type_embedding_args)
+        self.edge_type_embedding = hydra.utils.instantiate(edge_type_embedding_args)
         self.egnn = hydra.utils.instantiate(egnn_args)
 
-    def forward(self, atom_feats, coord, edge_index, edge_attr=None):
+    def forward(self, atom_feats, coord, edge_index, edge_type_ids=None):
         # first embed the atom feats
-        h = self.embedding(atom_feats)
+        h = self.atom_type_embedding(atom_feats)
+
+        if edge_type_ids is not None:
+            edge_type_embeddings = self.edge_type_embedding(edge_type_ids)
+            edge_attr = edge_type_embeddings
+        else:
+            edge_attr = None
+
         edge_index = (edge_index[0], edge_index[1])
 
         # then pass the data through the EGNN
-        h, coord = self.egnn(h, coord, edge_index, edge_attr)
+        h, coord, edge_attr = self.egnn(h, coord, edge_index, edge_attr)
 
-        return h, coord
+        return h, coord, edge_attr
 
 
 class EGNNwithHeads(BaseEGNN):
     """EGNN model with heads. Passes the data through an embedding layer, an EGNN and then through the heads."""
 
     def __init__(
-        self, embedding_args: DictConfig, egnn_args: DictConfig, heads_args: DictConfig
+        self,
+        atom_type_embedding_args: DictConfig,
+        edge_type_embedding_args: DictConfig,
+        egnn_args: DictConfig,
+        heads_args: DictConfig,
     ):
-        super().__init__(embedding_args, egnn_args)
+        super().__init__(atom_type_embedding_args, edge_type_embedding_args, egnn_args)
         self.time_embedding = nn.Sequential(
-            nn.Linear(1, embedding_args["out_nf"]),
+            nn.Linear(1, atom_type_embedding_args["out_nf"]),
             nn.SiLU(),
-            nn.Linear(embedding_args["out_nf"], embedding_args["out_nf"]),
+            nn.Linear(
+                atom_type_embedding_args["out_nf"], atom_type_embedding_args["out_nf"]
+            ),
         )
-        self.sinusoidal_embedding = SinusoidalEmbedding(embedding_args["out_nf"])
+        self.sinusoidal_embedding = SinusoidalEmbedding(
+            atom_type_embedding_args["out_nf"]
+        )
         self.heads = hydra.utils.instantiate(heads_args)
 
-    def forward(self, atom_feats, coord, edge_index, t, batch, edge_attr=None):
+    def forward(self, atom_feats, coord, edge_index, t, batch, edge_type_ids=None):
         """
         Forward pass through EGNN with heads.
 
@@ -115,7 +148,7 @@ class EGNNwithHeads(BaseEGNN):
             atom_feats: Node features
             coord: Node coordinates
             edge_index: Edge indices
-            edge_attr: Edge attributes (optional)
+            edge_type_ids: Edge type ids (optional)
             batch: Batch assignment for each node (required for graph-level heads)
 
         Returns:
@@ -123,7 +156,7 @@ class EGNNwithHeads(BaseEGNN):
         """
         N_nodes = torch.bincount(batch)
 
-        h = self.embedding(atom_feats)
+        h = self.atom_type_embedding(atom_feats)
 
         # calculate conditioning embeddings
         N_nodes_embedding = self.sinusoidal_embedding(N_nodes)[batch]
@@ -132,15 +165,20 @@ class EGNNwithHeads(BaseEGNN):
 
         edge_index = (edge_index[0], edge_index[1])
 
+        if edge_type_ids is not None:
+            edge_attr = self.edge_type_embedding(edge_type_ids)
+        else:
+            edge_attr = None
+
         # then pass the data through the EGNN
-        h, coord = self.egnn(h, coord, edge_index, edge_attr)
+        h, coord, edge_attr = self.egnn(h, coord, edge_index, edge_attr=edge_attr)
 
         # Pass through heads
         if batch is not None:
-            out_dict = self.heads(h, batch)
+            out_dict = self.heads(h, batch, edge_attr=edge_attr)
         else:
             # If no batch info provided, only node-level heads will work
-            out_dict = self.heads(h, batch=None)
+            out_dict = self.heads(h, batch=None, edge_attr=edge_attr)
 
         out_dict["pos_head"] = coord
 

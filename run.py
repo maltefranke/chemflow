@@ -11,6 +11,7 @@ from chemflow.utils import build_callbacks
 
 OmegaConf.register_new_resolver("oc.eval", eval)
 OmegaConf.register_new_resolver("len", lambda x: len(x))
+OmegaConf.register_new_resolver("if", lambda cond, t, f: t if cond else f)
 
 torch.set_float32_matmul_precision("medium")
 
@@ -24,12 +25,14 @@ def run(cfg: DictConfig):
 
     # Extract tokens and distributions from preprocessing
     tokens = preprocessing.tokens
+    edge_tokens = preprocessing.edge_tokens
     atom_type_distribution = preprocessing.atom_type_distribution
     edge_type_distribution = preprocessing.edge_type_distribution
     n_atoms_distribution = preprocessing.n_atoms_distribution
     coordinate_std = preprocessing.coordinate_std
 
     OmegaConf.update(cfg.data, "tokens", tokens)
+    OmegaConf.update(cfg.data, "edge_tokens", edge_tokens)
 
     hydra.utils.log.info(
         f"Preprocessing complete. Found {len(tokens)} tokens: {tokens}"
@@ -45,10 +48,12 @@ def run(cfg: DictConfig):
     # Set tokens and distributions after initialization
     datamodule.set_tokens_and_distributions(
         tokens=tokens,
+        edge_tokens=edge_tokens,
         atom_type_distribution=atom_type_distribution,
         edge_type_distribution=edge_type_distribution,
         n_atoms_distribution=n_atoms_distribution,
         coord_std=coordinate_std,
+        cat_strategy=cfg.data.cat_strategy,
     )
     # Call setup to create datasets with tokens and distributions
     datamodule.setup()
@@ -62,7 +67,9 @@ def run(cfg: DictConfig):
     # Set tokens and distribution after initialization
     module.set_tokens_and_distribution(
         tokens=tokens,
+        edge_tokens=edge_tokens,
         atom_type_distribution=atom_type_distribution,
+        edge_type_distribution=edge_type_distribution,
     )
 
     # Setup logging and callbacks

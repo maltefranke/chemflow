@@ -45,7 +45,7 @@ def sample_prior_graph(
     return sampled_graph
 
 
-def sample_births(unmatched_x1, unmatched_c1, t, sigma=1.0):
+def sample_births(unmatched_x1, unmatched_c1, unmatched_e1, t, sigma=1.0):
     num_unmatched_atoms = unmatched_x1.shape[0]
 
     # sample birth times
@@ -56,6 +56,9 @@ def sample_births(unmatched_x1, unmatched_c1, t, sigma=1.0):
     birth_times = birth_times[birth_times_mask]
     birth_x1 = unmatched_x1[birth_times_mask]
     birth_c1 = unmatched_c1[birth_times_mask]
+    print("CHECK E1 for birth")
+    print(unmatched_e1.shape)
+    birth_e1 = unmatched_e1[birth_times_mask]
 
     unborn_x1 = unmatched_x1[~birth_times_mask]
     unborn_c1 = unmatched_c1[~birth_times_mask]
@@ -64,7 +67,7 @@ def sample_births(unmatched_x1, unmatched_c1, t, sigma=1.0):
     # intuition: we are more certain about the birth location as time goes on
     sigma = sigma * (1 - t)
     birth_xt = birth_x1 + torch.randn_like(birth_x1, device=unmatched_x1.device) * sigma
-    return birth_times, birth_xt, birth_x1, birth_c1, unborn_x1, unborn_c1
+    return birth_times, birth_xt, birth_x1, birth_c1, birth_e1, unborn_x1, unborn_c1
 
 
 def sample_deaths(unmatched_x0, unmatched_c0, t):

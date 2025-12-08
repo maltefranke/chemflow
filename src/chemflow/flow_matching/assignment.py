@@ -109,8 +109,11 @@ def assign_targets_batched(
         valid_c0 = c0[x0_mask_b]  # Shape (N_b, M+1)
         valid_c1 = c1[x1_mask_b]  # Shape (M_b, M+1)
 
-        valid_edge_types0 = edge_types0[x0_mask_b]  # Shape (N_b, N_b)
-        valid_edge_types1 = edge_types1[x1_mask_b]  # Shape (M_b, M_b)
+        x0_idx = torch.nonzero(x0_mask_b).squeeze()
+        x1_idx = torch.nonzero(x1_mask_b).squeeze()
+
+        valid_edge_types0 = edge_types0[x0_idx[:, None], x0_idx]
+        valid_edge_types1 = edge_types1[x1_idx[:, None], x1_idx]
 
         # Convert to numpy for assignment algorithm
         valid_x0_np = valid_x0.detach().cpu().numpy()
@@ -153,10 +156,12 @@ def assign_targets_batched(
         # Get the matched items
         matched_x0_b = valid_x0[row_ind]
         matched_x1_b = valid_x1[col_ind]
+
         matched_c0_b = valid_c0[row_ind]
         matched_c1_b = valid_c1[col_ind]
-        matched_edge_types0_b = valid_edge_types0[row_ind, row_ind]
-        matched_edge_types1_b = valid_edge_types1[col_ind, col_ind]
+
+        matched_edge_types0_b = valid_edge_types0[row_ind[:, None], row_ind]
+        matched_edge_types1_b = valid_edge_types1[col_ind[:, None], col_ind]
 
         # Get the unmatched items
         # Find indices of valid items that were *not* in the assignment
@@ -165,10 +170,16 @@ def assign_targets_batched(
 
         unmatched_x0_b = valid_x0[unmatched_i_x0]
         unmatched_x1_b = valid_x1[unmatched_i_x1]
+
         unmatched_c0_b = valid_c0[unmatched_i_x0]
         unmatched_c1_b = valid_c1[unmatched_i_x1]
-        unmatched_edge_types0_b = valid_edge_types0[unmatched_i_x0, unmatched_i_x0]
-        unmatched_edge_types1_b = valid_edge_types1[unmatched_i_x1, unmatched_i_x1]
+
+        unmatched_edge_types0_b = valid_edge_types0[
+            unmatched_i_x0[:, None], unmatched_i_x0
+        ]
+        unmatched_edge_types1_b = valid_edge_types1[
+            unmatched_i_x1[:, None], unmatched_i_x1
+        ]
 
         if optimal_transport == "equivariant":
             # Align the matched items

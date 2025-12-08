@@ -37,6 +37,10 @@ class FlowMatchingQM9Dataset(QM9):
         edge_types = edge_types_to_symmetric(
             data.edge_index, data.edge_attr, data.num_nodes
         )
+        # add 1 to the edge types to make them 1-indexed
+        # 0 is no bond, 1 is single, 2 is double, 3 is triple, 4 is aromatic
+        edge_types += 1
+
         if self.coord_std is not None:
             coord = coord / self.coord_std
         target = {
