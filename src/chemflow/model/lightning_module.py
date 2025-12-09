@@ -173,6 +173,7 @@ class LightningModule(pl.LightningModule):
         return loss
 
     def shared_step(self, batch, batch_idx):
+        self.model.set_training()
         # Define the training step logic here
         if self.tokens is None:
             raise ValueError(
@@ -224,6 +225,7 @@ class LightningModule(pl.LightningModule):
 
         # build a fully connected graph per batch
         edge_index = build_fully_connected_edge_index(xt_batch_id)
+
         edge_type_ids = et[edge_index[0], edge_index[1]]
 
         preds = self.model(
@@ -269,7 +271,7 @@ class LightningModule(pl.LightningModule):
             # Always use weighted cross-entropy loss
             a_loss = F.cross_entropy(
                 a_pred[mask],
-                targets["target_c"][mask].argmax(dim=-1),
+                targets["target_a"][mask].argmax(dim=-1),
                 weight=self.token_weights,
             )
         else:
@@ -376,6 +378,7 @@ class LightningModule(pl.LightningModule):
         Returns:
             Dictionary containing final samples
         """
+        self.model.set_inference()
         if self.tokens is None or self.mask_index is None:
             raise ValueError(
                 "tokens must be set before prediction. "
@@ -389,15 +392,18 @@ class LightningModule(pl.LightningModule):
         # Get batch size from the batch (assuming it's similar to training)
         samples_batched, _ = batch
 
-        xt = samples_batched["coord"]
-        at_ind = samples_batched["atom_types"]
-        at = F.one_hot(at_ind, num_classes=len(self.tokens))
-        et = samples_batched["edge_types"]
-
         N = samples_batched["N_atoms"]
         batch_size = len(N)
 
         batch_id = samples_batched["batch_index"]
+
+        xt = samples_batched["coord"]
+        xt_mean_batch = unsorted_segment_mean(xt, batch_id, batch_size)
+        xt = xt - xt_mean_batch[batch_id]
+
+        at_ind = samples_batched["atom_types"]
+        at = F.one_hot(at_ind, num_classes=len(self.tokens))
+        et = samples_batched["edge_types"]
 
         # Time parameters
         num_steps = self.num_integration_steps
@@ -411,6 +417,9 @@ class LightningModule(pl.LightningModule):
         xt_trajectory = [xt.clone()]
         at_trajectory = [at_ind.clone()]
         batch_id_trajectory = [batch_id.clone()]
+
+        # previous outputs for self-conditioning. none at the beginning
+        preds = None
 
         # Integration loop: integrate from t=0 to t=1
         for _ in range(num_steps):
@@ -428,9 +437,13 @@ class LightningModule(pl.LightningModule):
                 t.view(-1, 1),
                 batch=batch_id,
                 edge_type_ids=edge_type_ids,
+                prev_outs=preds,
             )
             # Extract predictions
             type_pred = preds["class_head"]  # (N_total, num_classes)
+            """temperature = 0.05
+            type_pred = F.softmax(type_pred, dim=-1)
+            type_pred = torch.log(type_pred) / temperature"""
             type_pred = F.softmax(type_pred, dim=-1)
 
             x1_pred = preds["pos_head"]  # (N_total, D)
@@ -467,7 +480,7 @@ class LightningModule(pl.LightningModule):
                 birth_rate=birth_rate,
                 birth_gmm_dict=gmm_dict,
                 xt=xt,
-                ct=at.float(),
+                at=at.float(),
                 et=et,
                 batch_id=batch_id,
                 t=t,

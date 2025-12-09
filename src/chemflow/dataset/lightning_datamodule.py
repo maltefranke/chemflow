@@ -60,7 +60,7 @@ class LightningDataModule(pl.LightningDataModule):
         self.n_atoms_distribution = n_atoms_distribution
         self.mask_token_index = token_to_index(self.tokens, "<MASK>")
         self.death_token_index = token_to_index(self.tokens, "<DEATH>")
-        self.no_bond_token_index = token_to_index(self.edge_tokens, "<NO_BOND>")
+        self.edge_mask_token_index = token_to_index(self.edge_tokens, "<MASK>")
 
         if cat_strategy == "uniform-sample":
             # TODO MALTE: I believe this is not correct.
@@ -70,7 +70,7 @@ class LightningDataModule(pl.LightningDataModule):
             self.atom_type_distribution[self.mask_token_index] = 0.0
             self.atom_type_distribution[self.death_token_index] = 0.0
 
-            self.edge_type_distribution[self.mask_token_index] = 0.0
+            self.edge_type_distribution[self.edge_mask_token_index] = 0.0
 
         elif cat_strategy == "mask":
             self.atom_type_distribution = torch.zeros_like(self.atom_type_distribution)
@@ -78,7 +78,7 @@ class LightningDataModule(pl.LightningDataModule):
 
             # what about edges?
             self.edge_type_distribution = torch.zeros_like(self.edge_type_distribution)
-            self.edge_type_distribution[self.mask_token_index] = 1.0
+            self.edge_type_distribution[self.edge_mask_token_index] = 1.0
 
         self.coord_std = coord_std.item() if coord_std is not None else None
 

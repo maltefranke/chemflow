@@ -22,8 +22,9 @@ def sample_prior_graph(
     # sample atom types from train distribution
     atom_types = p_atom_types.sample(sample_shape=(N_atoms,))
 
-    # sample coordinates randomly
+    # sample coordinates randomly, and make sure to center the coordinates
     coord = torch.randn(N_atoms, 3)
+    coord = coord - coord.mean(dim=0)
 
     # sample edge types for upper triangle (excluding diagonal) of adjacency matrix
     N_edges = (N_atoms**2 - N_atoms) // 2

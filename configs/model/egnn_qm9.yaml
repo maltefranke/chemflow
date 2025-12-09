@@ -12,14 +12,14 @@ module:
 
   weight_alpha: 1.0
   k_nn_edges: 10
-  typed_gmm: False
+  typed_gmm: True
   N_samples: 30
   K: ${model.K}
   D: ${model.D}
   n_atoms_strategy: ${data.n_atoms_strategy}
   cat_strategy: ${data.cat_strategy}
   num_integration_steps: 100
-  cat_noise_level: 2.0  # Start here: ~1% masking per step. Adjust: 0.5-2.0 for balance, >2.0 for more stability
+  cat_noise_level: 0.0  # Start here: ~1% masking per step. Adjust: 0.5-2.0 for balance, >2.0 for more stability
   coord_noise_level: 0.0
   
   # Loss component weights
@@ -54,6 +54,7 @@ module:
     edge_type_embedding_args: ${model.edge_type_embedding}
     egnn_args: ${model.egnn}
     heads_args: ${model.heads}
+    self_conditioning: True
 
 atom_type_embedding:
   _target_: chemflow.model.embedding.Embedding

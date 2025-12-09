@@ -202,7 +202,8 @@ class Integrator:
         birth_rate: torch.Tensor,
         birth_gmm_dict: dict,
         xt: torch.Tensor,
-        ct: torch.Tensor,
+        at: torch.Tensor,
+        # ct: torch.Tensor,
         et: torch.Tensor,
         batch_id: torch.Tensor,
         t: torch.Tensor,
@@ -226,7 +227,8 @@ class Integrator:
             birth_rate: Shape (num_graphs,) - graph-level birth rates
             birth_gmm_dict: dict - GMM parameters per graph
             xt: Shape (N_total, D) - current positions
-            ct: Shape (N_total, num_classes) - current types (one-hot)
+            at: Shape (N_total, num_classes) - current atom types (one-hot)
+            ct: Shape (N_total, num_classes) - current charge types (one-hot)
             et: Shape (N_total, N_total) - current edge types (indices)
             batch_id: Shape (N_total,) - batch assignment for each node
             t: Shape (num_graphs,) - current time for each graph
@@ -236,6 +238,7 @@ class Integrator:
 
         Returns:
             xt_final: Shape (N_final, D) - updated positions
+            at_final: Shape (N_final, num_classes) - updated types
             ct_final: Shape (N_final, num_classes) - updated types
             et_final: Shape (N_final, N_final) - updated edge types (indices)
             batch_id_final: Shape (N_final,) - updated batch assignments
@@ -251,12 +254,12 @@ class Integrator:
         xt_new = xt + velocity * dt
 
         # 2. Update node types
-        curr = torch.argmax(ct, dim=-1)
-        pred = torch.distributions.Categorical(type_pred).sample()
+        a_curr = torch.argmax(at, dim=-1)
+        a_pred = torch.distributions.Categorical(type_pred).sample()
 
         if self.typed_gmm:
             # probability to stay in the current type
-            pred_probs_curr = torch.gather(type_pred, -1, curr.unsqueeze(-1))
+            pred_probs_curr = torch.gather(type_pred, -1, a_curr.unsqueeze(-1))
 
             # Setup batched time tensor and noise tensor
             ones = [1] * (len(type_pred.shape) - 1)
@@ -265,17 +268,22 @@ class Integrator:
             noise[times + dt < 1.0] = cat_noise_level
 
             # Off-diagonal step probs
-            mult = (1 + ((2 * noise) * (ct.shape[-1] - 1) * times)) / (1 - times)
+            mult = (1 + ((2 * noise) * (type_pred.shape[-1] - 1) * times)) / (1 - times)
             first_term = dt * mult * type_pred
             second_term = dt * noise * pred_probs_curr
             step_probs = (first_term + second_term).clamp(max=1.0)
 
             # On-diagonal step probs
-            step_probs.scatter_(-1, curr.unsqueeze(-1), 0.0)
+            step_probs.scatter_(-1, a_curr.unsqueeze(-1), 0.0)
             diags = (1.0 - step_probs.sum(dim=-1, keepdim=True)).clamp(min=0.0)
-            step_probs.scatter_(-1, curr.unsqueeze(-1), diags)
+            step_probs.scatter_(-1, a_curr.unsqueeze(-1), diags)
+
+            # set mask and death probability to 0 for the nodes that are not valid
+            step_probs[:, self.mask_index] = 0.0
+            step_probs[:, self.death_token_index] = 0.0
+
             pred = torch.distributions.Categorical(step_probs).sample()
-            ct_new = F.one_hot(pred, num_classes=ct.shape[-1]).float()
+            at_new = F.one_hot(a_pred, num_classes=type_pred.shape[-1]).float()
 
         else:
             # Get time for each node (expand t to match nodes)
@@ -287,21 +295,21 @@ class Integrator:
 
             # Choose elements to unmask
             limit = dt * (1 + (cat_noise_level * node_times)) / (1 - node_times + 1e-8)
-            unmask = torch.rand_like(pred.float()) < limit
-            unmask = unmask & (curr == self.mask_index) & xt_mask
+            unmask = torch.rand_like(a_pred.float()) < limit
+            unmask = unmask & (a_curr == self.mask_index) & xt_mask
 
             # Choose elements to mask
             mask_prob = dt * cat_noise_level
-            mask = torch.rand_like(pred.float()) < mask_prob
-            mask = mask & (curr != self.mask_index) & xt_mask
+            mask = torch.rand_like(a_pred.float()) < mask_prob
+            mask = mask & (a_curr != self.mask_index) & xt_mask
             # Do not mask at the end
             end_mask = (node_times + dt) >= 1.0
             mask = mask & (~end_mask)
 
             # Apply unmasking and re-masking
-            curr[unmask] = pred[unmask]
-            curr[mask] = self.mask_index
-            ct_new = F.one_hot(curr, num_classes=ct.shape[-1]).float()
+            a_curr[unmask] = a_pred[unmask]
+            a_curr[mask] = self.mask_index
+            at_new = F.one_hot(a_curr, num_classes=type_pred.shape[-1]).float()
 
         # 2.5. Update edge types
         edge_index = build_fully_connected_edge_index(batch_id)
@@ -345,6 +353,9 @@ class Integrator:
             step_probs.scatter_(1, et_curr_valid.unsqueeze(-1), 0.0)
             diags = (1.0 - step_probs.sum(dim=-1, keepdim=True)).clamp(min=0.0)
             step_probs.scatter_(1, et_curr_valid.unsqueeze(-1), diags)
+
+            # set mask probability to 0 for the edges that are not valid
+            step_probs[:, self.edge_mask_index] = 0.0
 
             # Sample new edge types for valid edges
             et_new_valid = torch.distributions.Categorical(step_probs).sample()
@@ -398,14 +409,14 @@ class Integrator:
             birth_gmm_dict,
             batch_id,
             dt,
-            ct.shape[-1],
+            at.shape[-1],
         )
 
         # 5. Remove dead nodes and combine with new particles
         # Keep only alive nodes from existing particles
         alive_mask = xt_mask_new
         xt_alive = xt_new[alive_mask]
-        ct_alive = ct_new[alive_mask]
+        at_alive = at_new[alive_mask]
         batch_id_alive = batch_id[alive_mask]
 
         # Update edge matrix: remove rows/columns for dead nodes
@@ -418,7 +429,7 @@ class Integrator:
         if new_particles.shape[0] > 0:
             N_new = new_particles.shape[0]
             xt_final = torch.cat([xt_alive, new_particles], dim=0)
-            ct_final = torch.cat([ct_alive, new_types], dim=0)
+            at_final = torch.cat([at_alive, new_types], dim=0)
             batch_id_final = torch.cat([batch_id_alive, new_batch_ids], dim=0)
 
             # Update edge matrix: add new nodes
@@ -447,8 +458,8 @@ class Integrator:
 
         else:
             xt_final = xt_alive
-            ct_final = ct_alive
+            at_final = at_alive
             batch_id_final = batch_id_alive
             et_final = et_alive
 
-        return xt_final, ct_final, et_final, batch_id_final
+        return xt_final, at_final, et_final, batch_id_final

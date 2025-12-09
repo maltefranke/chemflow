@@ -35,11 +35,13 @@ def distance_based_assignment(valid_x0, valid_x1):
 
 def assign_targets_batched(
     x0,
-    c0,
+    a0,
+    # c0,
     edge_types0,
     x0_batch_id,
     x1,
-    c1,
+    a1,
+    # c1,
     edge_types1,
     x1_batch_id,
     optimal_transport="equivariant",
@@ -70,7 +72,8 @@ def assign_targets_batched(
         and U1_b is the number of unmatched x1 items for graph b.
     """
     D = x0.shape[-1]  # dimension of the data
-    M = c0.shape[-1] - 1  # number of classes
+    M = a0.shape[-1] - 1  # number of classes
+    # C = c0.shape[-1] - 1  # number of charge classes
 
     # Get number of unique graphs in the batch
     if len(x0_batch_id) > 0 or len(x1_batch_id) > 0:
@@ -86,10 +89,15 @@ def assign_targets_batched(
     all_unmatched_x0 = []
     all_unmatched_x1 = []
 
-    all_matched_c0 = []
-    all_matched_c1 = []
-    all_unmatched_c0 = []
-    all_unmatched_c1 = []
+    all_matched_a0 = []
+    all_matched_a1 = []
+    all_unmatched_a0 = []
+    all_unmatched_a1 = []
+
+    # all_matched_c0 = []
+    # all_matched_c1 = []
+    # all_unmatched_c0 = []
+    # all_unmatched_c1 = []
 
     all_matched_edge_types0 = []
     all_matched_edge_types1 = []
@@ -97,7 +105,8 @@ def assign_targets_batched(
     all_unmatched_edge_types1 = []
 
     empty_x = torch.empty((0, D), device=x0.device, dtype=x0.dtype)
-    empty_c = torch.empty((0, M + 1), device=x0.device, dtype=x0.dtype)
+    # empty_c = torch.empty((0, C + 1), device=x0.device, dtype=x0.dtype)
+    empty_a = torch.empty((0, M + 1), device=x0.device, dtype=x0.dtype)
 
     for b in range(num_graphs):
         # Filter nodes belonging to this graph
@@ -106,8 +115,10 @@ def assign_targets_batched(
 
         valid_x0 = x0[x0_mask_b]  # Shape (N_b, D)
         valid_x1 = x1[x1_mask_b]  # Shape (M_b, D)
-        valid_c0 = c0[x0_mask_b]  # Shape (N_b, M+1)
-        valid_c1 = c1[x1_mask_b]  # Shape (M_b, M+1)
+        valid_a0 = a0[x0_mask_b]  # Shape (N_b, M+1)
+        valid_a1 = a1[x1_mask_b]  # Shape (M_b, M+1)
+        # valid_c0 = c0[x0_mask_b]  # Shape (N_b, C+1)
+        # valid_c1 = c1[x1_mask_b]  # Shape (M_b, C+1)
 
         x0_idx = torch.nonzero(x0_mask_b).squeeze()
         x1_idx = torch.nonzero(x1_mask_b).squeeze()
@@ -133,8 +144,10 @@ def assign_targets_batched(
             all_unmatched_x0.append(empty_x)
             all_unmatched_x1.append(valid_x1)
 
-            all_unmatched_c0.append(empty_c)
-            all_unmatched_c1.append(valid_c1)
+            all_unmatched_a0.append(empty_a)
+            all_unmatched_a1.append(valid_a1)
+            # all_unmatched_c0.append(empty_c)
+            # all_unmatched_c1.append(valid_c1)
             continue
 
         if M_valid == 0:
@@ -146,8 +159,10 @@ def assign_targets_batched(
             all_unmatched_x0.append(valid_x0)
             all_unmatched_x1.append(empty_x)
 
-            all_unmatched_c0.append(valid_c0)
-            all_unmatched_c1.append(empty_c)
+            all_unmatched_a0.append(valid_a0)
+            all_unmatched_a1.append(empty_a)
+            # all_unmatched_c0.append(valid_c0)
+            # all_unmatched_c1.append(empty_c)
             continue
 
         # Assign targets using distance-based assignment
@@ -157,8 +172,10 @@ def assign_targets_batched(
         matched_x0_b = valid_x0[row_ind]
         matched_x1_b = valid_x1[col_ind]
 
-        matched_c0_b = valid_c0[row_ind]
-        matched_c1_b = valid_c1[col_ind]
+        matched_a0_b = valid_a0[row_ind]
+        matched_a1_b = valid_a1[col_ind]
+        # matched_c0_b = valid_c0[row_ind]
+        # matched_c1_b = valid_c1[col_ind]
 
         matched_edge_types0_b = valid_edge_types0[row_ind[:, None], row_ind]
         matched_edge_types1_b = valid_edge_types1[col_ind[:, None], col_ind]
@@ -171,8 +188,10 @@ def assign_targets_batched(
         unmatched_x0_b = valid_x0[unmatched_i_x0]
         unmatched_x1_b = valid_x1[unmatched_i_x1]
 
-        unmatched_c0_b = valid_c0[unmatched_i_x0]
-        unmatched_c1_b = valid_c1[unmatched_i_x1]
+        unmatched_a0_b = valid_a0[unmatched_i_x0]
+        unmatched_a1_b = valid_a1[unmatched_i_x1]
+        # unmatched_c0_b = valid_c0[unmatched_i_x0]
+        # unmatched_c1_b = valid_c1[unmatched_i_x1]
 
         unmatched_edge_types0_b = valid_edge_types0[
             unmatched_i_x0[:, None], unmatched_i_x0
@@ -194,10 +213,15 @@ def assign_targets_batched(
         all_unmatched_x0.append(unmatched_x0_b)
         all_unmatched_x1.append(unmatched_x1_b)
 
-        all_matched_c0.append(matched_c0_b)
-        all_matched_c1.append(matched_c1_b)
-        all_unmatched_c0.append(unmatched_c0_b)
-        all_unmatched_c1.append(unmatched_c1_b)
+        all_matched_a0.append(matched_a0_b)
+        all_matched_a1.append(matched_a1_b)
+        all_unmatched_a0.append(unmatched_a0_b)
+        all_unmatched_a1.append(unmatched_a1_b)
+
+        # all_matched_c0.append(matched_c0_b)
+        # all_matched_c1.append(matched_c1_b)
+        # all_unmatched_c0.append(unmatched_c0_b)
+        # all_unmatched_c1.append(unmatched_c1_b)
 
         all_matched_edge_types0.append(matched_edge_types0_b)
         all_matched_edge_types1.append(matched_edge_types1_b)
@@ -207,12 +231,14 @@ def assign_targets_batched(
     assigned_targets = {
         "matched": {
             "x": (all_matched_x0, all_matched_x1),
-            "c": (all_matched_c0, all_matched_c1),
+            "a": (all_matched_a0, all_matched_a1),
+            # "c": (all_matched_c0, all_matched_c1),
             "edge_types": (all_matched_edge_types0, all_matched_edge_types1),
         },
         "unmatched": {
             "x": (all_unmatched_x0, all_unmatched_x1),
-            "c": (all_unmatched_c0, all_unmatched_c1),
+            "a": (all_unmatched_a0, all_unmatched_a1),
+            # "c": (all_unmatched_c0, all_unmatched_c1),
             "edge_types": (all_unmatched_edge_types0, all_unmatched_edge_types1),
         },
     }
