@@ -6,14 +6,16 @@ from chemflow.utils import token_to_index
 
 
 class Integrator:
-    def __init__(self, tokens, K, D, typed_gmm=True, device="cpu"):
+    def __init__(self, tokens, K, D, typed_gmm=True, cat_strategy="uniform-sample", device="cpu"):
         self.tokens = tokens
         self.mask_index = token_to_index(tokens, "<MASK>")
         self.death_token_index = token_to_index(tokens, "<DEATH>")
         self.K = K
         self.D = D
         self.typed_gmm = typed_gmm
+        self.cat_strategy = cat_strategy
         self.device = device
+        self.eps = 1e-6
 
     def sample_death_process_gnn(
         self,
@@ -236,13 +238,13 @@ class Integrator:
         curr = torch.argmax(ct, dim=-1)
         pred = torch.distributions.Categorical(type_pred).sample()
 
-        if self.typed_gmm:
+        if self.cat_strategy == "uniform-sample":
             # probability to stay in the current type
             pred_probs_curr = torch.gather(type_pred, -1, curr.unsqueeze(-1))
 
             # Setup batched time tensor and noise tensor
             ones = [1] * (len(type_pred.shape) - 1)
-            times = t[batch_id].view(-1, *ones).clamp(min=1e-3, max=1.0 - 1e-3)
+            times = t[batch_id].view(-1, *ones).clamp(min=eps, max=1.0 - eps)
             noise = torch.zeros_like(times)
             noise[times + dt < 1.0] = cat_noise_level
 
@@ -254,12 +256,12 @@ class Integrator:
 
             # On-diagonal step probs
             step_probs.scatter_(-1, curr.unsqueeze(-1), 0.0)
-            diags = (1.0 - step_probs.sum(dim=-1, keepdim=True)).clamp(min=0.0)
+            diags = (1.0 - step_probs.sum(dim=-1, keepdim=True)).clamp(min=eps)
             step_probs.scatter_(-1, curr.unsqueeze(-1), diags)
             pred = torch.distributions.Categorical(step_probs).sample()
             ct_new = F.one_hot(pred, num_classes=ct.shape[-1]).float()
 
-        else:
+        if self.cat_strategy == "mask":
             # Get time for each node (expand t to match nodes)
             num_graphs = t.shape[0]
             node_times = torch.zeros_like(batch_id, dtype=t.dtype, device=self.device)
@@ -268,7 +270,7 @@ class Integrator:
                 node_times[graph_mask] = t[graph_id]
 
             # Choose elements to unmask
-            limit = dt * (1 + (cat_noise_level * node_times)) / (1 - node_times + 1e-8)
+            limit = dt * (1 + (cat_noise_level * node_times)) / (1 - node_times).clamp(min=eps, max=1-eps)
             unmask = torch.rand_like(pred.float()) < limit
             unmask = unmask & (curr == mask_index) & xt_mask
 

@@ -24,6 +24,7 @@ def sample_prior_graph(
 
     # sample coordinates randomly
     coord = torch.randn(N_atoms, 3)
+    coord = coord - coord.mean(dim=0)
 
     # sample edge types for upper triangle (excluding diagonal) of adjacency matrix
     N_edges = (N_atoms**2 - N_atoms) // 2

@@ -30,7 +30,7 @@ class LightningModule(pl.LightningModule):
         cat_strategy: str = "uniform-sample", # "mask" or "uniform-sample"
         type_loss_token_weights: str = "uniform", # "uniform" or "training"
         num_integration_steps: int = 100,
-        cat_noise_level: float = 0.0,
+        cat_noise_level: float = 1.0,
         coord_noise_level: float = 0.0,
     ):
         super().__init__()
@@ -114,6 +114,7 @@ class LightningModule(pl.LightningModule):
             self.K,
             self.D,
             self.typed_gmm,
+            self.cat_strategy,
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
         # Always compute token distribution weights for weighted cross-entropy loss
@@ -406,6 +407,8 @@ class LightningModule(pl.LightningModule):
         xt_trajectory = [xt.clone()]
         at_trajectory = [at_ind.clone()]
         batch_id_trajectory = [batch_id.clone()]
+        x_pred_trajectory = []
+        a_pred_trajectory = []
 
         # Integration loop: integrate from t=0 to t=1
         for _ in range(num_steps):
@@ -473,6 +476,8 @@ class LightningModule(pl.LightningModule):
             xt_trajectory.append(xt.clone())
             at_trajectory.append(at_ind.clone())
             batch_id_trajectory.append(batch_id.clone())
+            x_pred_trajectory.append(x1_pred.clone())
+            a_pred_trajectory.append(type_pred.clone())
 
         # Return results
         return {
@@ -482,6 +487,8 @@ class LightningModule(pl.LightningModule):
             "xt_trajectory": xt_trajectory,
             "at_trajectory": at_trajectory,
             "batch_id_trajectory": batch_id_trajectory,
+            "x_pred_trajectory": x_pred_trajectory,
+            "a_pred_trajectory": a_pred_trajectory,
         }
 
     def configure_optimizers(self):

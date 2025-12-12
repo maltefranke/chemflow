@@ -98,8 +98,8 @@ def rigid_alignment(x_0, x_1, pre_centered=False):
 
     # remove COM from data and record initial COM
     if pre_centered:
-        x_0_mean = torch.zeros(1, d)
-        x_1_mean = torch.zeros(1, d)
+        x_0_mean = torch.zeros(1, d, device=x_0.device)
+        x_1_mean = torch.zeros(1, d, device=x_1.device)
         x_0_c = x_0
         x_1_c = x_1
     else:
@@ -115,7 +115,7 @@ def rigid_alignment(x_0, x_1, pre_centered=False):
     R = V.mm(U.T)
     # Translation vector
     if pre_centered:
-        t = torch.zeros(1, d)
+        t = torch.zeros(1, d, device=x_0.device)
     else:
         t = x_1_mean - R.mm(x_0_mean.T).T  # has shape (1, D)
 
