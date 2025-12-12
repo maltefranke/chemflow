@@ -7,7 +7,7 @@ def sample_prior_graph(
     atom_type_distribution,
     edge_type_distribution,
     n_atoms_distribution,
-    n_atoms = None,
+    n_atoms=None,
 ):
     p_atom_types = Categorical(probs=atom_type_distribution)
     p_edge_types = Categorical(probs=edge_type_distribution)
@@ -22,7 +22,7 @@ def sample_prior_graph(
     # sample atom types from train distribution
     atom_types = p_atom_types.sample(sample_shape=(N_atoms,))
 
-    # sample coordinates randomly
+    # sample coordinates randomly, and make sure to center the coordinates
     coord = torch.randn(N_atoms, 3)
     coord = coord - coord.mean(dim=0)
 
@@ -31,20 +31,22 @@ def sample_prior_graph(
     triu_edge_types = p_edge_types.sample((N_edges,))
     triu_edge_types = triu_edge_types.to(torch.long)
 
-    """# edge types to triu_matrix
+    # edge types to triu_matrix
     triu_indices = torch.triu_indices(N_atoms, N_atoms, offset=1)
     edge_types_matrix = torch.zeros(N_atoms, N_atoms, dtype=torch.long)
-    edge_types_matrix[triu_indices[0], triu_indices[1]] = edge_types"""
+    edge_types_matrix[triu_indices[0], triu_indices[1]] = triu_edge_types
+
+    edge_types_symmetric = edge_types_matrix + edge_types_matrix.T
 
     sampled_graph = {
         "atom_types": atom_types,
         "coord": coord,
-        "edge_types": triu_edge_types,
+        "edge_types": edge_types_symmetric,  # triu_edge_types,
     }
     return sampled_graph
 
 
-def sample_births(unmatched_x1, unmatched_c1, t, sigma=1.0):
+def sample_births(unmatched_x1, unmatched_c1, unmatched_e1, t, sigma=1.0):
     num_unmatched_atoms = unmatched_x1.shape[0]
 
     # sample birth times
@@ -55,6 +57,9 @@ def sample_births(unmatched_x1, unmatched_c1, t, sigma=1.0):
     birth_times = birth_times[birth_times_mask]
     birth_x1 = unmatched_x1[birth_times_mask]
     birth_c1 = unmatched_c1[birth_times_mask]
+    print("CHECK E1 for birth")
+    print(unmatched_e1.shape)
+    birth_e1 = unmatched_e1[birth_times_mask]
 
     unborn_x1 = unmatched_x1[~birth_times_mask]
     unborn_c1 = unmatched_c1[~birth_times_mask]
@@ -63,7 +68,7 @@ def sample_births(unmatched_x1, unmatched_c1, t, sigma=1.0):
     # intuition: we are more certain about the birth location as time goes on
     sigma = sigma * (1 - t)
     birth_xt = birth_x1 + torch.randn_like(birth_x1, device=unmatched_x1.device) * sigma
-    return birth_times, birth_xt, birth_x1, birth_c1, unborn_x1, unborn_c1
+    return birth_times, birth_xt, birth_x1, birth_c1, birth_e1, unborn_x1, unborn_c1
 
 
 def sample_deaths(unmatched_x0, unmatched_c0, t):

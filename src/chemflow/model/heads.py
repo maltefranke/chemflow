@@ -5,8 +5,8 @@ from omegaconf import DictConfig
 from src.external_code.egnn import unsorted_segment_sum, unsorted_segment_mean
 
 
-class NodeHead(nn.Module):
-    """Head that operates on individual node features."""
+class OutputHead(nn.Module):
+    """A generic head that operates on individual features."""
 
     def __init__(
         self, input_dim: int, output_dim: int, hidden_dim: Optional[int] = None
@@ -24,9 +24,9 @@ class NodeHead(nn.Module):
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            h: Node features of shape (num_nodes, input_dim)
+            h: Features of shape (num_nodes, input_dim)
         Returns:
-            Node-level predictions of shape (num_nodes, output_dim)
+            Predictions of shape (num_nodes, output_dim)
         """
         return self.mlp(h)
 
@@ -98,7 +98,7 @@ class MultiHeadModule(nn.Module):
         # Create node heads
         if "node_heads" in heads_configs:
             for name, config in heads_configs.node_heads.items():
-                self.heads[name] = NodeHead(
+                self.heads[name] = OutputHead(
                     input_dim=config.input_dim,
                     output_dim=config.output_dim,
                     hidden_dim=config.get("hidden_dim", None),
@@ -116,13 +116,28 @@ class MultiHeadModule(nn.Module):
                 )
                 self.head_types[name] = "graph"
 
+        # Create edge heads
+        if "edge_heads" in heads_configs:
+            for name, config in heads_configs.edge_heads.items():
+                self.heads[name] = OutputHead(
+                    input_dim=config.input_dim,
+                    output_dim=config.output_dim,
+                    hidden_dim=config.get("hidden_dim", None),
+                )
+                self.head_types[name] = "edge"
+
     def forward(
-        self, h: torch.Tensor, batch: Optional[torch.Tensor] = None
+        self,
+        h: torch.Tensor,
+        batch: Optional[torch.Tensor] = None,
+        edge_attr: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
             h: Node features of shape (num_nodes, input_dim)
             batch: Batch assignment for each node (required for graph heads)
+            edge_attr: Edge features of shape (num_edges, input_dim)
+                (required for edge heads)
         Returns:
             Dictionary mapping head names to their outputs
         """
@@ -137,5 +152,11 @@ class MultiHeadModule(nn.Module):
                     raise ValueError(f"Graph head '{name}' requires batch information")
 
                 outputs[name] = head(h, batch)
+
+            elif self.head_types[name] == "edge":
+                if edge_attr is None:
+                    raise ValueError(f"Edge head '{name}' requires edge_attr")
+
+                outputs[name] = head(edge_attr)
 
         return outputs

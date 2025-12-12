@@ -2,6 +2,9 @@
 K: 10
 D: 3
 
+output_dim_typed: ${oc.eval:"${model.K} + ${model.K} + ${model.K}*${len:${data.tokens}}"}
+output_dim_untyped: ${oc.eval:"${model.K} + ${model.K}"}
+
 module:
   _target_: chemflow.model.lightning_module.LightningModule
   # args and kwargs 
@@ -9,20 +12,21 @@ module:
 
   weight_alpha: 1.0
   k_nn_edges: 10
-  typed_gmm: False
+  typed_gmm: True
   N_samples: 30
   K: ${model.K}
   D: ${model.D}
   n_atoms_strategy: ${data.n_atoms_strategy}
   cat_strategy: ${data.cat_strategy}
   num_integration_steps: 100
-  cat_noise_level: 5.0
+  cat_noise_level: 0.0  # Start here: ~1% masking per step. Adjust: 0.5-2.0 for balance, >2.0 for more stability
   coord_noise_level: 0.0
   
   # Loss component weights
   loss_weights:
     a_loss: 1.0
     x_loss: 2.0
+    e_loss: 1.0
     gmm_loss: 0.0
     death_rate_loss: 0.0
     birth_rate_loss: 0.0
@@ -46,21 +50,28 @@ module:
     _target_: chemflow.model.gnn.EGNNwithHeads
     _recursive_: false
 
-    embedding_args: ${model.embedding}
+    atom_type_embedding_args: ${model.atom_type_embedding}
+    edge_type_embedding_args: ${model.edge_type_embedding}
     egnn_args: ${model.egnn}
     heads_args: ${model.heads}
+    self_conditioning: True
 
-embedding:
+atom_type_embedding:
   _target_: chemflow.model.embedding.Embedding
   in_nf: ${len:${data.tokens}}
   out_nf: 256
 
+edge_type_embedding:
+  _target_: chemflow.model.embedding.Embedding
+  in_nf: ${len:${data.edge_tokens}}
+  out_nf: 256
+
 egnn:
-  _target_: src.external_code.egnn.EGNN
-  in_node_nf: ${model.embedding.out_nf}
+  _target_: chemflow.model.gnn.EGNNWithEdgeType
+  in_node_nf: ${model.atom_type_embedding.out_nf}
   hidden_nf: 256
   out_node_nf: 128
-  in_edge_nf: 0
+  in_edge_nf: 256 # set to zeo when not predicting edge types
   n_layers: 6
   residual: True
   attention: True
@@ -88,7 +99,7 @@ heads:
         # 2. Position Attention Logits (K) -> Replaces K*D
         # 3. Variances (K * 1)
         # 4. Type Logits (K * T)
-        output_dim: ${oc.eval:"${model.K} + ${model.K}"} #+ ${model.K}*${len:${data.tokens}}"}
+        output_dim: ${if:${model.module.typed_gmm}, ${model.output_dim_typed}, ${model.output_dim_untyped}}
 
     graph_heads:
       net_rate_head:
@@ -101,4 +112,10 @@ heads:
       #  input_dim: ${model.egnn.out_node_nf}
       #  output_dim: ${oc.eval:"${model.K} + 2*${model.K}*${model.D} + ${model.K}*${len:${data.tokens}}"}
       #  aggregation: mean
+
+    edge_heads:
+      edge_type_head:
+        input_dim: ${model.egnn.out_node_nf}
+        output_dim: ${len:${data.edge_tokens}}
+        hidden_dim: 32
       

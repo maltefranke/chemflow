@@ -8,6 +8,7 @@ from pytorch_lightning.callbacks import (
 import torch
 from torch_geometric.utils import to_dense_adj
 from rdkit import Chem
+from torch_geometric.utils import remove_self_loops
 
 
 def build_callbacks(cfg: DictConfig) -> list[Callback]:
@@ -68,6 +69,26 @@ def edge_types_to_triu_entries(edge_index, edge_types_one_hot, num_atoms):
     triu_edge_types = adj_matrix[triu_indices[0], triu_indices[1]]
 
     return triu_edge_types
+
+
+def edge_types_to_symmetric(edge_index, edge_types_one_hot, num_atoms):
+    """
+    Convert edge types to a symmetric adjacency matrix.
+    edge_index: Shape (2, E) - edge indices
+    edge_types_one_hot: Shape (E, M) - one-hot encoded edge types
+    num_atoms: int - number of atoms in the graph
+    Returns:
+        adj_matrix: Shape (N, N) - symmetric adjacency matrix
+    """
+    # By default, 0 is a single bond, 1 is a double bond etc.
+    # When creating the adj_matrix we need to add a NONE-BOND at 0
+    # Therefore, we add 1 to the edge types
+    # 0: no bond, 1: single, 2: double, 3: triple, 4: aromatic
+    edge_types = edge_types_one_hot.argmax(dim=-1) + 1
+
+    adj_matrix = to_dense_adj(edge_index, edge_attr=edge_types, max_num_nodes=num_atoms)
+    adj_matrix = adj_matrix.squeeze()
+    return adj_matrix
 
 
 def z_to_atom_types(z):
@@ -160,3 +181,115 @@ def segment_softmax(logits, segment_ids, num_segments):
     # shape: (N, K)
     probs = exp_logits / (exp_sum[segment_ids] + 1e-6)
     return probs
+
+
+def build_fully_connected_edge_index(batch_index):
+    # Count nodes in each graph
+    counts = torch.bincount(batch_index)
+
+    edge_indices = []
+    offset = 0
+
+    for count in counts:
+        if count > 0:
+            # Generate a grid of all pairs (0..k-1, 0..k-1)
+            # This creates k*k edges
+            row = torch.arange(count, device=batch_index.device).repeat_interleave(
+                count
+            )
+            col = torch.arange(count, device=batch_index.device).repeat(count)
+
+            # Shift by the current offset to match global node indices
+            edge_indices.append(torch.stack([row + offset, col + offset]))
+
+            offset += count
+
+    # Concatenate all graph edges
+    edges = torch.cat(edge_indices, dim=1)
+    edges = remove_self_loops(edges)[0]
+    return edges
+
+
+def compute_token_weights(
+    token_list: list[str],
+    distribution: torch.Tensor,
+    special_token_names: list[str],
+    weight_alpha: float = 1.0,
+    type_loss_token_weights: str = "training",
+) -> torch.Tensor:
+    """
+    Compute token weights with special handling for special tokens.
+
+    This function can be used for both node tokens (atom types) and edge tokens.
+    It computes inverse frequency weights, normalizes regular tokens, and assigns
+    appropriate weights to special tokens.
+
+    Args:
+        token_list: List of all tokens (e.g., atom types or edge types)
+        distribution: Distribution of token types from training data
+        special_token_names: List of special token names to handle specially
+            (e.g., ["<MASK>", "<DEATH>"] for nodes or ["<MASK>", "<NO_BOND>"] for edges)
+        weight_alpha: Alpha parameter for weight scaling (default: 1.0)
+        type_loss_token_weights: "uniform" or "training" - if "uniform", returns
+            uniform weights (all 1.0)
+
+    Returns:
+        Weights tensor with same shape as distribution
+    """
+    # Get indices for special tokens
+    special_token_indices = {
+        token_to_index(token_list, token_name) for token_name in special_token_names
+    }
+
+    # --- 1. Initial Weight Calculation (Inverse Frequency) ---
+    epsilon = 1e-8
+    weights = 1.0 / (distribution + epsilon)
+    weights = weights**weight_alpha  # Apply alpha scaling
+
+    # --- 2. Isolate & Normalize REGULAR Tokens ---
+    all_indices = set(range(len(token_list)))
+    # Convert to list for indexing
+    regular_token_indices = list(all_indices - special_token_indices)
+
+    if not regular_token_indices:
+        # Fallback if no regular tokens (unlikely, but good to handle)
+        final_weights = torch.ones_like(weights)
+        for token_name in special_token_names:
+            token_idx = token_to_index(token_list, token_name)
+            if token_name == "<MASK>":
+                final_weights[token_idx] = 0.0
+            else:
+                final_weights[token_idx] = 1.0
+        return final_weights
+
+    # Get weights for only the regular tokens
+    regular_weights = weights[regular_token_indices]
+
+    # Normalize *only* the regular weights to have a mean of 1.0
+    mean_regular_weight = regular_weights.mean()
+    if mean_regular_weight > 0:
+        regular_weights = regular_weights / mean_regular_weight
+
+    # Find the min weight *after* normalization
+    min_regular_weight = regular_weights.min()
+
+    # --- 3. Build Final Weights Tensor ---
+    # Start with zeros
+    final_weights = torch.zeros_like(weights)
+
+    # Assign normalized regular weights to their correct positions
+    final_weights[regular_token_indices] = regular_weights
+
+    # Assign special token weights based on the normalized regular weights
+    for token_name in special_token_names:
+        token_idx = token_to_index(token_list, token_name)
+        if token_name == "<MASK>":
+            final_weights[token_idx] = 0.0
+        else:
+            # For other special tokens (e.g., DEATH, NO_BOND), use min weight
+            final_weights[token_idx] = min_regular_weight
+
+    if type_loss_token_weights == "uniform":
+        final_weights = torch.ones_like(final_weights)
+
+    return final_weights
