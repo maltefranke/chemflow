@@ -27,6 +27,7 @@ module:
     a_loss: 1.0
     x_loss: 2.0
     e_loss: 1.0
+    c_loss: 1.0
     gmm_loss: 0.0
     death_rate_loss: 0.0
     birth_rate_loss: 0.0
@@ -34,8 +35,10 @@ module:
   # Optimizer configuration
   optimizer_config:
     optimizer:
-      _target_: torch.optim.Adam
+      _target_: torch.optim.AdamW
       lr: 1e-4
+      weight_decay: 1e-4
+      fused: true
 
     scheduler:
       _target_: chemflow.schedulers.LinearOneCycleLR
@@ -82,15 +85,19 @@ heads:
   _target_: chemflow.model.heads.MultiHeadModule
 
   heads_configs:
+    # Aggregation method for all graph heads
+    graph_aggregation: mean  # Options: mean, sum, max
+    
     node_heads:
-      class_head:
+      atom_type_head:
         input_dim: ${model.egnn.out_node_nf}
         output_dim: ${len:${data.tokens}}
         hidden_dim: 32
 
-      # pos_head:
-      #  input_dim: ${model.egnn.out_node_nf}
-      #  output_dim: ${model.D}
+      charge_head:
+        input_dim: ${model.egnn.out_node_nf}
+        output_dim: ${len:${data.charge_tokens}}
+        hidden_dim: 32
 
       gmm_head:
         input_dim: ${model.egnn.out_node_nf}
@@ -106,7 +113,6 @@ heads:
         input_dim: ${model.egnn.out_node_nf}
         output_dim: 1
         hidden_dim: 32
-        aggregation: mean
 
       #gmm_head:
       #  input_dim: ${model.egnn.out_node_nf}

@@ -106,12 +106,12 @@ class Interpolator:
         self,
         x0,
         a0,
-        # c0,
+        c0,
         edge_types0,
         x0_batch_id,
         x1,
         a1,
-        # c1,
+        c1,
         edge_types1,
         x1_batch_id,
         t,
@@ -122,11 +122,13 @@ class Interpolator:
 
         Args:
             x0: Shape (N_total, D) - concatenated nodes from all graphs
-            c0: Shape (N_total, M+1) - concatenated types from all graphs
+            a0: Shape (N_total, M+1) - concatenated atom types from all graphs
+            c0: Shape (N_total, M+1) - concatenated charge types from all graphs
             edge_types0: Shape (N_total, N_total) - concatenated edge types from all graphs
             x0_batch_id: Shape (N_total,) - batch assignment for each x0 node
             x1: Shape (M_total, D) - concatenated nodes from all graphs
             a1: Shape (M_total, M+1) - concatenated types from all graphs
+            c1: Shape (M_total, M+1) - concatenated charge types from all graphs
             edge_types1: Shape (M_total, M_total) - concatenated edge types from all graphs
             x1_batch_id: Shape (M_total,) - batch assignment for each x1 node
             t: Shape (num_graphs,) or scalar - time parameter for each graph
@@ -134,7 +136,8 @@ class Interpolator:
         Returns:
             tuple: A tuple of:
             - xt: Shape (K_total, D) - interpolated positions, concatenated
-            - ct: Shape (K_total, M+1) - interpolated types, concatenated
+            - at: Shape (K_total, M+1) - interpolated atom types, concatenated
+            - ct: Shape (K_total, M+1) - interpolated charge types, concatenated
             - xt_batch_id: Shape (K_total,) - batch assignment for each interpolated node
             - targets: Dictionary containing the following keys:
                 - target_vf: Shape (K_total, D) - velocity field targets
@@ -147,17 +150,17 @@ class Interpolator:
         """
         # 1. Assign targets
         assigned_targets = assign_targets_batched(
-            x0, a0, edge_types0, x0_batch_id, x1, a1, edge_types1, x1_batch_id
+            x0, a0, c0, edge_types0, x0_batch_id, x1, a1, c1, edge_types1, x1_batch_id
         )
 
         matched_x0, matched_x1 = assigned_targets["matched"]["x"]
         matched_a0, matched_a1 = assigned_targets["matched"]["a"]
-        # matched_c0, matched_c1 = assigned_targets["matched"]["c"]
+        _, matched_c1 = assigned_targets["matched"]["c"]
         matched_e0, matched_e1 = assigned_targets["matched"]["edge_types"]
 
         unmatched_x0, unmatched_x1 = assigned_targets["unmatched"]["x"]
         unmatched_a0, unmatched_a1 = assigned_targets["unmatched"]["a"]
-        # unmatched_c0, unmatched_c1 = assigned_targets["unmatched"]["c"]
+        _, unmatched_c1 = assigned_targets["unmatched"]["c"]
         unmatched_e0, unmatched_e1 = assigned_targets["unmatched"]["edge_types"]
 
         # 2.1 Interpolate the matched targets
@@ -178,12 +181,12 @@ class Interpolator:
         """matched_ct = [
             self.interpolate_c(matched_c0_i, matched_c1_i, t_i)
             for matched_c0_i, matched_c1_i, t_i in zip(matched_c0, matched_c1, t)
-        ]
+        ]"""
 
         matched_cvf = [
             F.one_hot(torch.argmax(c1_i, dim=-1), num_classes=self.M)
             for c1_i in matched_c1
-        ]"""
+        ]
 
         matched_et = [
             self.interpolate_e(matched_e0_i, matched_e1_i, t_i)
@@ -484,6 +487,9 @@ class Interpolator:
             )
         ]
 
+        # TODO placeholder for same number of atoms experiment
+        target_cvf = torch.cat(matched_cvf, dim=0)
+
         """target_cvf_list = [
             torch.cat([matched_cvf_i, death_cvf_i, birth_cvf_i], dim=0)
             for matched_cvf_i, death_cvf_i, birth_cvf_i in zip(
@@ -533,6 +539,7 @@ class Interpolator:
         targets = {
             "target_x": target_x,
             "target_a": target_avf,
+            "target_c": target_cvf,
             "target_e": target_evf,
             "birth_rate_target": birth_rate_target,
             "death_rate_target": death_rate_target,

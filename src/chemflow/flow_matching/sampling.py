@@ -6,11 +6,13 @@ import torch.nn.functional as F
 def sample_prior_graph(
     atom_type_distribution,
     edge_type_distribution,
+    charge_type_distribution,
     n_atoms_distribution,
     n_atoms=None,
 ):
     p_atom_types = Categorical(probs=atom_type_distribution)
     p_edge_types = Categorical(probs=edge_type_distribution)
+    p_charge_types = Categorical(probs=charge_type_distribution)
     p_n_atoms = Categorical(probs=n_atoms_distribution)
 
     # sample number of atoms from train distribution
@@ -21,6 +23,9 @@ def sample_prior_graph(
 
     # sample atom types from train distribution
     atom_types = p_atom_types.sample(sample_shape=(N_atoms,))
+
+    # sample charge types from train distribution
+    charge_types = p_charge_types.sample(sample_shape=(N_atoms,))
 
     # sample coordinates randomly, and make sure to center the coordinates
     coord = torch.randn(N_atoms, 3)
@@ -40,6 +45,7 @@ def sample_prior_graph(
 
     sampled_graph = {
         "atom_types": atom_types,
+        "charges": charge_types,  # TODO Not used in interpolation yet!
         "coord": coord,
         "edge_types": edge_types_symmetric,  # triu_edge_types,
     }

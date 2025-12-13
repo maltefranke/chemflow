@@ -172,21 +172,21 @@ class SelfConditioningResidualLayer(nn.Module):
         x_pred = prev_outs.get("pos_head", coord)  # Predicted final positions
 
         # Get predicted atom types (convert from logits if needed)
-        a_pred = prev_outs.get("class_head")
+        a_pred = prev_outs.get("atom_type_head")
         if a_pred is not None:
             if a_pred.dim() > 1:
                 # If it's logits, convert to one-hot
                 a_pred_onehot = torch.softmax(a_pred, dim=-1)
             else:
                 # If it's indices, convert to one-hot
-                n_atom_types = a_pred.max().item() + 1
+                n_atom_types = a_pred.max() + 1
                 a_pred_onehot = torch.nn.functional.one_hot(
                     a_pred, num_classes=n_atom_types
                 )
         else:
             # Fallback: use current atom types if available
             if atom_types is not None:
-                n_atom_types = atom_types.max().item() + 1
+                n_atom_types = atom_types.max() + 1
                 a_pred_onehot = torch.nn.functional.one_hot(
                     atom_types, num_classes=n_atom_types
                 )

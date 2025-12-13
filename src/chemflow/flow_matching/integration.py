@@ -283,7 +283,7 @@ class Integrator:
             step_probs[:, self.death_token_index] = 0.0
 
             pred = torch.distributions.Categorical(step_probs).sample()
-            at_new = F.one_hot(a_pred, num_classes=type_pred.shape[-1]).float()
+            at_new = F.one_hot(pred, num_classes=type_pred.shape[-1]).float()
 
         else:
             # Get time for each node (expand t to match nodes)

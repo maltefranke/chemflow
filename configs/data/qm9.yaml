@@ -3,18 +3,22 @@
 root_path: ${oc.env:PROJECT_ROOT}/data
 preprocess_workers: 0
 tokens: None 
+edge_tokens: None
+charge_tokens: None
 atom_type_distribution: None
 edge_type_distribution: None
 n_atoms_distribution: None
 n_atoms_strategy: "fixed"
-cat_strategy: "uniform-sample"
+cat_strategy: "uniform-sample" #"mask" # "uniform-sample"
 
 # Preprocessing configuration - computes tokens from data and distributions from training dataset only
 preprocessing:
   _target_: chemflow.dataset.preprocessing.Preprocessing
   root: ${data.root_path}/qm9
-  tokens_path: ${data.root_path}/qm9/processed/tokens.txt
-  distributions_path: ${data.root_path}/qm9/processed/distributions.pt
+  tokens_path: ${data.preprocessing.root}/processed/tokens.txt
+  edge_tokens_path: ${data.preprocessing.root}/processed/edge_tokens.txt
+  charge_tokens_path: ${data.preprocessing.root}/processed/charge_tokens.txt
+  distributions_path: ${data.preprocessing.root}/processed/distributions.pt
   # Tokens and distributions will be discovered from data and saved to files
   # On subsequent runs, they will be loaded from the files
 
@@ -28,17 +32,20 @@ datamodule:
       _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
       root: ${data.root_path}/qm9
       tokens: ${data.tokens}
+      charge_tokens: ${data.charge_tokens}
       
 
     val:
       - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
         root: ${data.root_path}/qm9_testing
         tokens: ${data.tokens}
+        charge_tokens: ${data.charge_tokens}
 
     test:
       - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
         root: ${data.root_path}/qm9_testing
         tokens: ${data.tokens}
+        charge_tokens: ${data.charge_tokens}
 
   num_workers:
     train: 4
@@ -47,8 +54,8 @@ datamodule:
     predict: 4
 
   batch_size:
-    train: 256
-    val: 256
-    test: 256
+    train: 384
+    val: 384
+    test: 16
   
   typed_gmm: ${model.module.typed_gmm}

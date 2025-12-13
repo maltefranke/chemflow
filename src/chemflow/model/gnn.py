@@ -3,6 +3,7 @@ from omegaconf import DictConfig
 import torch.nn as nn
 import torch
 import hydra
+import random
 
 from src.chemflow.model.embedding import SinusoidalEmbedding
 from src.chemflow.model.self_conditioning import SelfConditioningResidualLayer
@@ -147,6 +148,7 @@ class EGNNwithHeads(BaseEGNN):
         batch,
         edge_type_ids=None,
         prev_outs=None,
+        is_random_self_conditioning: bool = False,
     ):
         """
         Forward pass through EGNN with heads.
@@ -158,6 +160,7 @@ class EGNNwithHeads(BaseEGNN):
             edge_type_ids: Edge type ids (optional)
             batch: Batch assignment for each node (required for graph-level heads)
             prev_outs: Previous outputs from the model for self-conditioning (optional)
+            is_random_self_conditioning: Coin
 
         Returns:
             Dictionary mapping head names to their outputs
@@ -176,7 +179,7 @@ class EGNNwithHeads(BaseEGNN):
         # if in the first timestep of inference, we need to first generate the endpoint
 
         if self.self_conditioning and prev_outs is None:
-            train_self_condition = self.training and (torch.rand(1) > 0.5).item()
+            train_self_condition = self.training and is_random_self_conditioning
             inference_first_step = not self.training and (t == 0).all().item()
 
             if train_self_condition or inference_first_step:

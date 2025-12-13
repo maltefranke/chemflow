@@ -42,6 +42,8 @@ class LightningModule(pl.LightningModule):
 
         # Will be set via setter method
         self.tokens = None
+        self.edge_tokens = None
+        self.charge_tokens = None
         self.mask_index = None
         self.death_token_index = None
         self.interpolator = None
@@ -96,18 +98,30 @@ class LightningModule(pl.LightningModule):
 
         self.save_hyperparameters()
         self.model = hydra.utils.instantiate(model)
-        # Lightning will handle device placement automatically
+
+        self.is_compiled = False
+
+    def compile(self):
+        """Compile the model using torch.compile."""
+        if self.is_compiled:
+            return
+        print("Compiling model...")
+        self.model = torch.compile(self.model, dynamic=True)
+        self.is_compiled = True
 
     def set_tokens_and_distribution(
         self,
         tokens: list[str],
         edge_tokens: list[str],
+        charge_tokens: list[str],
         atom_type_distribution: torch.Tensor,
         edge_type_distribution: torch.Tensor,
+        charge_type_distribution: torch.Tensor,
     ):
         """Set tokens and distributions after initialization."""
         self.tokens = tokens
         self.edge_tokens = edge_tokens
+        self.charge_tokens = charge_tokens
         self.mask_index = token_to_index(self.tokens, "<MASK>")
         self.edge_mask_index = token_to_index(self.edge_tokens, "<MASK>")
         self.death_token_index = token_to_index(self.tokens, "<DEATH>")
@@ -131,14 +145,14 @@ class LightningModule(pl.LightningModule):
             edge_tokens=self.edge_tokens,
         )
         # Always compute token distribution weights for weighted cross-entropy loss
-        weights = compute_token_weights(
+        atom_type_weights = compute_token_weights(
             token_list=self.tokens,
             distribution=atom_type_distribution,
             special_token_names=["<MASK>", "<DEATH>"],
             weight_alpha=self.weight_alpha,
             type_loss_token_weights=self.type_loss_token_weights,
         )
-        self.register_buffer("token_weights", weights)
+        self.register_buffer("atom_type_weights", atom_type_weights)
 
         # Compute edge token distribution weights for weighted cross-entropy loss
         edge_weights = compute_token_weights(
@@ -149,6 +163,15 @@ class LightningModule(pl.LightningModule):
             type_loss_token_weights=self.type_loss_token_weights,
         )
         self.register_buffer("edge_token_weights", edge_weights)
+
+        charge_weights = compute_token_weights(
+            token_list=self.charge_tokens,
+            distribution=charge_type_distribution,
+            special_token_names=[],  # no special tokens for charges
+            weight_alpha=self.weight_alpha,
+            type_loss_token_weights=self.type_loss_token_weights,
+        )
+        self.register_buffer("charge_token_weights", charge_weights)
 
     def forward(self, x):
         # Define the forward pass of your model here
@@ -194,6 +217,11 @@ class LightningModule(pl.LightningModule):
         a0 = F.one_hot(a0_ind, num_classes=len(self.tokens))
         a1 = F.one_hot(a1_ind, num_classes=len(self.tokens))
 
+        c0_ind = samples_batched["charges"]
+        c1_ind = targets_batched["charges"]
+        c0 = F.one_hot(c0_ind, num_classes=len(self.charge_tokens))
+        c1 = F.one_hot(c1_ind, num_classes=len(self.charge_tokens))
+
         edge_types0 = samples_batched["edge_types"]
         edge_types1 = targets_batched["edge_types"]
 
@@ -208,10 +236,12 @@ class LightningModule(pl.LightningModule):
         xt, at, et, xt_batch_id, targets = self.interpolator.interpolate_different_size(
             x0,
             a0,
+            c0,
             edge_types0,
             samples_batch_id,
             x1,
             a1,
+            c1,
             edge_types1,
             targets_batch_id,
             t,
@@ -228,6 +258,9 @@ class LightningModule(pl.LightningModule):
 
         edge_type_ids = et[edge_index[0], edge_index[1]]
 
+        # random self-conditioning
+        is_random_self_conditioning = (torch.rand(1) > 0.5).item()
+
         preds = self.model(
             at_ind,
             xt,
@@ -235,12 +268,15 @@ class LightningModule(pl.LightningModule):
             t.view(-1, 1),
             batch=xt_batch_id,
             edge_type_ids=edge_type_ids,
+            is_random_self_conditioning=is_random_self_conditioning,
         )
 
-        a_pred = preds["class_head"]
+        a_pred = preds["atom_type_head"]
         x_pred = preds["pos_head"]
         edge_type_pred = preds["edge_type_head"]
         gmm_pred = preds["gmm_head"]
+        charge_pred = preds["charge_head"]
+
         gmm_dict = compute_equivariant_gmm(
             gmm_pred,
             xt,
@@ -254,9 +290,9 @@ class LightningModule(pl.LightningModule):
         birth_rate_pred = F.relu(net_rate_pred)
         # Calculate losses
         # only do class prediction on non-mask tokens
-        if self.token_weights is None:
+        if self.atom_type_weights is None:
             raise ValueError(
-                "token_weights must be set before training. "
+                "atom_type_weights must be set before training. "
                 "Call set_tokens_and_distribution() first."
             )
 
@@ -272,7 +308,7 @@ class LightningModule(pl.LightningModule):
             a_loss = F.cross_entropy(
                 a_pred[mask],
                 targets["target_a"][mask].argmax(dim=-1),
-                weight=self.token_weights,
+                weight=self.atom_type_weights,
             )
         else:
             # all tokens are correct, so no loss
@@ -284,10 +320,17 @@ class LightningModule(pl.LightningModule):
                 "Call set_tokens_and_distribution() first."
             )
 
+        # TODO add triangular mask
         e_loss = F.cross_entropy(
             edge_type_pred,
             edge_type_ids,
             weight=self.edge_token_weights,
+        )
+
+        c_loss = F.cross_entropy(
+            charge_pred,
+            targets["target_c"].argmax(dim=-1),
+            weight=self.charge_token_weights,
         )
 
         x_loss = F.mse_loss(x_pred, targets["target_x"])
@@ -314,6 +357,7 @@ class LightningModule(pl.LightningModule):
             self.loss_weights.a_loss * a_loss
             + self.loss_weights.x_loss * x_loss
             + self.loss_weights.e_loss * e_loss
+            + self.loss_weights.c_loss * c_loss
             + self.loss_weights.gmm_loss * gmm_loss
             + self.loss_weights.death_rate_loss * death_rate_loss
             + self.loss_weights.birth_rate_loss * birth_rate_loss
@@ -440,7 +484,7 @@ class LightningModule(pl.LightningModule):
                 prev_outs=preds,
             )
             # Extract predictions
-            type_pred = preds["class_head"]  # (N_total, num_classes)
+            type_pred = preds["atom_type_head"]  # (N_total, num_classes)
             """temperature = 0.05
             type_pred = F.softmax(type_pred, dim=-1)
             type_pred = torch.log(type_pred) / temperature"""
@@ -580,7 +624,7 @@ class LightningModule(pl.LightningModule):
             # We must manually zero the gradients again
             # because the new gradients from the next batch
             # will be *added* to the existing NaN gradients.
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
         else:
             # No NaN gradients found, proceed with the optimizer step
             optimizer.step()

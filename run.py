@@ -26,13 +26,16 @@ def run(cfg: DictConfig):
     # Extract tokens and distributions from preprocessing
     tokens = preprocessing.tokens
     edge_tokens = preprocessing.edge_tokens
+    charge_tokens = preprocessing.charge_tokens
     atom_type_distribution = preprocessing.atom_type_distribution
     edge_type_distribution = preprocessing.edge_type_distribution
+    charge_type_distribution = preprocessing.charge_type_distribution
     n_atoms_distribution = preprocessing.n_atoms_distribution
     coordinate_std = preprocessing.coordinate_std
 
     OmegaConf.update(cfg.data, "tokens", tokens)
     OmegaConf.update(cfg.data, "edge_tokens", edge_tokens)
+    OmegaConf.update(cfg.data, "charge_tokens", charge_tokens)
 
     hydra.utils.log.info(
         f"Preprocessing complete. Found {len(tokens)} tokens: {tokens}"
@@ -49,8 +52,10 @@ def run(cfg: DictConfig):
     datamodule.set_tokens_and_distributions(
         tokens=tokens,
         edge_tokens=edge_tokens,
+        charge_tokens=charge_tokens,
         atom_type_distribution=atom_type_distribution,
         edge_type_distribution=edge_type_distribution,
+        charge_type_distribution=charge_type_distribution,
         n_atoms_distribution=n_atoms_distribution,
         coord_std=coordinate_std,
         cat_strategy=cfg.data.cat_strategy,
@@ -68,9 +73,12 @@ def run(cfg: DictConfig):
     module.set_tokens_and_distribution(
         tokens=tokens,
         edge_tokens=edge_tokens,
+        charge_tokens=charge_tokens,
         atom_type_distribution=atom_type_distribution,
         edge_type_distribution=edge_type_distribution,
+        charge_type_distribution=charge_type_distribution,
     )
+    module.compile()
 
     # Setup logging and callbacks
     wandb_logger = WandbLogger(**cfg.logging)

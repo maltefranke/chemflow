@@ -32,7 +32,9 @@ class LightningDataModule(pl.LightningDataModule):
         self.edge_tokens = None
         self.atom_type_distribution = None
         self.edge_type_distribution = None
+        self.charge_type_distribution = None
         self.n_atoms_distribution = None
+        self.charge_tokens = None
         self.mask_token = None
 
         # will be set later
@@ -46,8 +48,10 @@ class LightningDataModule(pl.LightningDataModule):
         self,
         tokens: list[str],
         edge_tokens: list[str],
+        charge_tokens: list[str],
         atom_type_distribution: torch.Tensor,
         edge_type_distribution: torch.Tensor,
+        charge_type_distribution: torch.Tensor,
         n_atoms_distribution: torch.Tensor,
         cat_strategy: str = "uniform-sample",
         coord_std: torch.Tensor = None,
@@ -55,8 +59,10 @@ class LightningDataModule(pl.LightningDataModule):
         """Set tokens and distributions after initialization."""
         self.tokens = tokens
         self.edge_tokens = edge_tokens
+        self.charge_tokens = charge_tokens
         self.atom_type_distribution = atom_type_distribution
         self.edge_type_distribution = edge_type_distribution
+        self.charge_type_distribution = charge_type_distribution
         self.n_atoms_distribution = n_atoms_distribution
         self.mask_token_index = token_to_index(self.tokens, "<MASK>")
         self.death_token_index = token_to_index(self.tokens, "<DEATH>")
@@ -80,7 +86,7 @@ class LightningDataModule(pl.LightningDataModule):
             self.edge_type_distribution = torch.zeros_like(self.edge_type_distribution)
             self.edge_type_distribution[self.edge_mask_token_index] = 1.0
 
-        self.coord_std = coord_std.item() if coord_std is not None else None
+        self.coord_std = coord_std if coord_std is not None else None
 
     def setup(self, stage=None):
         """Construct datasets and assign data scalers."""
@@ -117,6 +123,7 @@ class LightningDataModule(pl.LightningDataModule):
         """
         # Extract required components
         atom_types_list = [item["atom_types"] for item in graph_dicts]
+        charges_list = [item["charges"] for item in graph_dicts]
         coord_list = [item["coord"] for item in graph_dicts]
         edge_types_list = [item["edge_types"] for item in graph_dicts]
 
@@ -141,6 +148,7 @@ class LightningDataModule(pl.LightningDataModule):
 
         # Concatenate node features, coordinates, and edge types
         batched_atom_types = torch.cat(atom_types_list, dim=0)
+        batched_charges = torch.cat(charges_list, dim=0)
         batched_coord = torch.cat(coord_list, dim=0)
         # batched_edge_types = torch.cat(edge_types_list, dim=0)
         batched_edge_types = torch.block_diag(*edge_types_list)
@@ -183,6 +191,7 @@ class LightningDataModule(pl.LightningDataModule):
         # Build result dictionary with only present attributes
         result = {
             "atom_types": batched_atom_types,
+            "charges": batched_charges,
             "coord": batched_coord,
             "edge_types": batched_edge_types,
             "batch_index": batch_index,
@@ -209,6 +218,7 @@ class LightningDataModule(pl.LightningDataModule):
             sample_prior_graph(
                 self.atom_type_distribution,
                 self.edge_type_distribution,
+                self.charge_type_distribution,
                 self.n_atoms_distribution,
                 n_atoms=n_atoms_i,
             )

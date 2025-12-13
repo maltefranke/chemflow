@@ -3,9 +3,9 @@
 import os
 
 import torch
-from torch_geometric.datasets import QM9
 from torch_geometric.utils import to_dense_adj
 
+from chemflow.dataset.qm9 import QM9Charges
 from chemflow.utils import (
     token_to_index,
     z_to_atom_types,
@@ -36,6 +36,7 @@ class Preprocessing:
         root: str,
         tokens_path: str = None,
         edge_tokens_path: str = None,
+        charge_tokens_path: str = None,
         distributions_path: str = None,
     ):
         """
@@ -46,6 +47,8 @@ class Preprocessing:
             tokens_path: Path to save/load tokens. If None, uses root/tokens.txt
             edge_tokens_path: Path to save/load edge tokens.
                 If None, uses root/edge_tokens.txt
+            charge_tokens_path: Path to save/load charge tokens.
+                If None, uses root/charge_tokens.txt
             distributions_path: Path to save/load distributions.
                 If None, uses root/distributions.pt
         """
@@ -59,22 +62,29 @@ class Preprocessing:
         if edge_tokens_path is None:
             edge_tokens_path = os.path.join(self.root, "edge_tokens.txt")
 
+        # Set default charge tokens path if not provided
+        if charge_tokens_path is None:
+            charge_tokens_path = os.path.join(self.root, "charge_tokens.txt")
+
         # Set default distributions path if not provided
         if distributions_path is None:
             distributions_path = os.path.join(self.root, "distributions.pt")
 
         self.tokens_path = tokens_path
         self.edge_tokens_path = edge_tokens_path
+        self.charge_tokens_path = charge_tokens_path
         self.distributions_path = distributions_path
 
         # Load or compute tokens (both computed together if either is missing)
-        tokens, edge_tokens = self._load_or_compute_tokens_and_edge_tokens()
+        tokens, edge_tokens, charge_tokens = self._load_or_compute_tokens()
         self.tokens = tokens
         self.edge_tokens = edge_tokens
+        self.charge_tokens = charge_tokens
 
         # Will be computed in compute_distributions
         self.atom_type_distribution = None
         self.edge_type_distribution = None
+        self.charge_type_distribution = None
         self.n_atoms_distribution = None
         self.coordinate_std = None
         self.distributions = None
@@ -82,50 +92,54 @@ class Preprocessing:
         # Load or compute distributions
         self._load_or_compute_distributions()
 
-    def _load_or_compute_tokens_and_edge_tokens(self) -> tuple[list[str], list[str]]:
+    def _load_or_compute_tokens(self) -> tuple[list[str], list[str]]:
         """
-        Load tokens and edge tokens from files if they exist,
+        Load tokens from files if they exist,
         otherwise compute both from data in a single loop and save.
 
         Returns:
-            Tuple of (tokens, edge_tokens)
+            Tuple of (tokens)
         """
         # Try to load both from files
         tokens_exist = os.path.exists(self.tokens_path)
         edge_tokens_exist = os.path.exists(self.edge_tokens_path)
+        charge_tokens_exist = os.path.exists(self.charge_tokens_path)
 
-        if tokens_exist and edge_tokens_exist:
-            tokens = self._load_tokens()
-            edge_tokens = self._load_edge_tokens()
-            return tokens, edge_tokens
+        if tokens_exist and edge_tokens_exist and charge_tokens_exist:
+            tokens = self._load_tokens(self.tokens_path)
+            edge_tokens = self._load_tokens(self.edge_tokens_path)
+            charge_tokens = self._load_tokens(self.charge_tokens_path)
+            return tokens, edge_tokens, charge_tokens
 
         # Compute both from data in a single loop
-        tokens, edge_tokens = self._compute_tokens_and_edge_tokens_from_data()
+        tokens, edge_tokens, charge_tokens = self._compute_tokens_from_data()
 
         # Save both to files
         if not tokens_exist:
-            self._save_tokens(tokens)
+            self._save_tokens(self.tokens_path, tokens)
         if not edge_tokens_exist:
-            self._save_edge_tokens(edge_tokens)
+            self._save_tokens(self.edge_tokens_path, edge_tokens)
+        if not charge_tokens_exist:
+            self._save_tokens(self.charge_tokens_path, charge_tokens)
+        return tokens, edge_tokens, charge_tokens
 
-        return tokens, edge_tokens
-
-    def _compute_tokens_and_edge_tokens_from_data(
+    def _compute_tokens_from_data(
         self,
-    ) -> tuple[list[str], list[str]]:
+    ) -> tuple[list[str], list[str], list[str]]:
         """
         Compute both tokens and edge tokens by extracting unique types
         from training data in a single loop.
 
         Returns:
-            Tuple of (tokens, edge_tokens)
+            Tuple of (tokens, edge_tokens, charge_tokens)
         """
         # Load QM9 dataset to extract unique atom and edge types
-        dataset = QM9(root=self.root)
+        dataset = QM9Charges(root=self.root)
 
         # Extract all atom types and edge types from the dataset in one loop
         all_atom_types = set()
         all_edge_type_indices = set()
+        all_charge_tokens = set()
 
         for i in range(len(dataset)):
             data = dataset[i]
@@ -143,9 +157,13 @@ class Preprocessing:
                 edge_type_indices = data.edge_attr.argmax(dim=-1) + 1
                 all_edge_type_indices.update(edge_type_indices.tolist())
 
+            if hasattr(data, "charges") and data.charges is not None:
+                all_charge_tokens.update(data.charges.tolist())
+
         # Convert to sorted lists for deterministic ordering
         atom_types_sorted = sorted(all_atom_types)
         edge_type_indices_sorted = sorted(all_edge_type_indices)
+        charge_tokens_sorted = sorted(all_charge_tokens)
 
         # Combine special tokens (always first) with discovered atom types
         tokens = self.SPECIAL_TOKENS + atom_types_sorted
@@ -158,33 +176,34 @@ class Preprocessing:
         # MASK is last
         edge_tokens = [self.NO_BOND_TOKEN, *bond_type_tokens, self.MASK_TOKEN]
 
-        return tokens, edge_tokens
+        charge_tokens = [str(int(idx)) for idx in charge_tokens_sorted]
 
-    def _save_tokens(self, tokens: list[str]):
-        """Save tokens to file."""
-        os.makedirs(os.path.dirname(self.tokens_path), exist_ok=True)
-        with open(self.tokens_path, "w") as f:
+        return tokens, edge_tokens, charge_tokens
+
+    def _save_tokens(self, path: str, tokens: list[str]):
+        """Save tokens to file.
+
+        Args:
+            path: Path to the tokens file
+            tokens: List of tokens to save
+        """
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
             for token in tokens:
                 f.write(f"{token}\n")
 
-    def _load_tokens(self) -> list[str]:
-        """Load tokens from file."""
-        with open(self.tokens_path, "r") as f:
+    def _load_tokens(self, path: str) -> list[str]:
+        """Load tokens from file.
+
+        Args:
+            path: Path to the tokens file
+
+        Returns:
+            List of tokens loaded from file
+        """
+        with open(path, "r") as f:
             tokens = [line.strip() for line in f.readlines()]
         return tokens
-
-    def _save_edge_tokens(self, edge_tokens: list[str]):
-        """Save edge tokens to file."""
-        os.makedirs(os.path.dirname(self.edge_tokens_path), exist_ok=True)
-        with open(self.edge_tokens_path, "w") as f:
-            for token in edge_tokens:
-                f.write(f"{token}\n")
-
-    def _load_edge_tokens(self) -> list[str]:
-        """Load edge tokens from file."""
-        with open(self.edge_tokens_path, "r") as f:
-            edge_tokens = [line.strip() for line in f.readlines()]
-        return edge_tokens
 
     def _load_or_compute_distributions(self):
         """
@@ -198,6 +217,7 @@ class Preprocessing:
             distributions = self._load_distributions()
             self.atom_type_distribution = distributions["atom_type_distribution"]
             self.edge_type_distribution = distributions["edge_type_distribution"]
+            self.charge_type_distribution = distributions["charge_type_distribution"]
             self.n_atoms_distribution = distributions["n_atoms_distribution"]
             self.coordinate_std = distributions.get("coordinate_std", None)
             self.distributions = distributions
@@ -219,7 +239,7 @@ class Preprocessing:
     def _compute_distributions(self) -> dict[str, torch.Tensor]:
         """Compute distributions from the training dataset."""
         # Load QM9 dataset to compute distributions
-        dataset = QM9(root=self.root)
+        dataset = QM9Charges(root=self.root)
 
         # Compute atom type distribution
         atom_types = z_to_atom_types(dataset.z.tolist())
@@ -238,6 +258,7 @@ class Preprocessing:
         all_num_atoms = []
         all_edge_type_indices = []
         all_coords = []
+        all_charges = []
 
         for i in range(len(dataset)):
             data = dataset[i]
@@ -268,6 +289,16 @@ class Preprocessing:
             coord = data.pos - data.pos.mean(dim=0)
             all_coords.append(coord)
 
+            if hasattr(data, "charges") and data.charges is not None:
+                charges = data.charges.tolist()
+                charge_type_indices = [
+                    token_to_index(self.charge_tokens, str(token)) for token in charges
+                ]
+                charge_type_indices = torch.tensor(
+                    charge_type_indices, dtype=torch.long
+                )
+                all_charges.append(charge_type_indices)
+
             all_num_atoms.append(num_atoms)
             all_edge_type_indices.append(edge_token_indices)
 
@@ -293,17 +324,28 @@ class Preprocessing:
         else:
             edge_type_distribution = torch.ones(num_edge_tokens) / num_edge_tokens
 
+        # Compute charge type distribution
+        all_charges = torch.cat(all_charges, dim=0)
+        charge_type_indices = all_charges.long()
+        charge_type_distribution = charge_type_indices.bincount(
+            minlength=len(self.charge_tokens)
+        )
+        charge_type_distribution = (
+            charge_type_distribution / charge_type_distribution.sum()
+        )
+
         # Compute coordinate std across all coordinates in the dataset
         all_coords = torch.cat(all_coords, dim=0)  # Shape: (total_atoms, 3)
-        coordinate_std = all_coords.std(dim=0)  # Shape: (3,) - std for each dimension
+
         # Use overall std (mean of per-dimension stds) or keep per-dimension
         # Using overall std as a scalar for simplicity
-        coordinate_std = coordinate_std.mean().item()
-        coordinate_std = torch.tensor(coordinate_std, dtype=torch.float32)
+        coordinate_std = all_coords.std()  # Shape: (1)
+        coordinate_std = torch.tensor(coordinate_std, dtype=torch.float32).item()
 
         return {
             "atom_type_distribution": atom_type_distribution,
             "edge_type_distribution": edge_type_distribution,
+            "charge_type_distribution": charge_type_distribution,
             "n_atoms_distribution": n_atoms_distribution,
             "coordinate_std": coordinate_std,
         }
