@@ -42,7 +42,7 @@ def sample_prior_graph(
 
     # sample edge types for upper triangle (excluding diagonal) of adjacency matrix
     N_edges = (N_atoms**2 - N_atoms) // 2
-    triu_edge_types = p_edge_types.sample((N_edges,))
+    triu_edge_types = p_edge_types.sample(sample_shape=(N_edges,))
     triu_edge_types = triu_edge_types.to(torch.long)
 
     # edge types to triu_matrix

@@ -192,12 +192,12 @@ class FlowMatchingQM9Dataset(QM9Charges):
         atom_types = [token_to_index(self.atom_tokens, token) for token in atom_types]
         atom_types = torch.tensor(atom_types, dtype=torch.long)
 
-        edge_types = edge_types_to_symmetric(
-            data.edge_index, data.edge_attr, data.num_nodes
-        )
         # add 1 to the edge types to make them 1-indexed
         # 0 is no bond, 1 is single, 2 is double, 3 is triple, 4 is aromatic
-        edge_types += 1
+        edge_types = data.edge_attr.argmax(dim=-1) + 1
+        edge_types = edge_types_to_symmetric(
+            data.edge_index, edge_types, data.num_nodes
+        )
 
         edge_types = edge_types[data.edge_index[0], data.edge_index[1]]
         edge_types = edge_types.to(torch.long)

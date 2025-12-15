@@ -36,10 +36,10 @@ class Interpolator:
         self.charge_tokens = charge_tokens
         self.cat_strategy = cat_strategy
         self.N_samples = N_samples
-
-        self.atom_mask_token = token_to_index(self.atom_tokens, "<MASK>")
         self.atom_death_token = token_to_index(self.atom_tokens, "<DEATH>")
-        self.edge_mask_token = token_to_index(self.edge_tokens, "<MASK>")
+        if self.cat_strategy == "mask":
+            self.atom_mask_token = token_to_index(self.atom_tokens, "<MASK>")
+            self.edge_mask_token = token_to_index(self.edge_tokens, "<MASK>")
 
         self.atom_type_distribution = atom_type_distribution
         self.edge_type_distribution = edge_type_distribution
@@ -268,6 +268,7 @@ class Interpolator:
 
                 # check if any births are happening
                 if born_atoms_1_i.num_nodes > 0:
+                    raise ValueError("Not implemented")
                     # sample prior graph for born nodes randomly
                     born_atoms_0_i = sample_prior_graph(
                         self.atom_type_distribution,

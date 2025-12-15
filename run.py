@@ -7,7 +7,7 @@ from pytorch_lightning.callbacks import LearningRateMonitor
 from omegaconf import DictConfig
 from omegaconf import OmegaConf
 
-from chemflow.utils import build_callbacks
+from chemflow.utils import build_callbacks, remove_token_from_distribution
 
 OmegaConf.register_new_resolver("oc.eval", eval)
 OmegaConf.register_new_resolver("len", lambda x: len(x))
@@ -34,13 +34,25 @@ def run(cfg: DictConfig):
     n_atoms_distribution = preprocessing.n_atoms_distribution
     coordinate_std = preprocessing.coordinate_std
 
+    if cfg.data.cat_strategy != "mask":
+        # remove <MASK> token from the atom_type_distribution and edge_type_distribution
+        atom_tokens, atom_type_distribution = remove_token_from_distribution(
+            atom_tokens, atom_type_distribution
+        )
+        edge_tokens, edge_type_distribution = remove_token_from_distribution(
+            edge_tokens, edge_type_distribution
+        )
+
     OmegaConf.update(cfg.data, "atom_tokens", atom_tokens)
     OmegaConf.update(cfg.data, "edge_tokens", edge_tokens)
     OmegaConf.update(cfg.data, "charge_tokens", charge_tokens)
 
     hydra.utils.log.info(
-        f"Preprocessing complete. Found {len(atom_tokens)} tokens: {atom_tokens}"
+        f"Preprocessing complete. Found {len(atom_tokens)} atom tokens: {atom_tokens}\n"
+        f"{len(edge_tokens)} edge tokens: {edge_tokens}\n"
+        f"{len(charge_tokens)} charge tokens: {charge_tokens}"
     )
+
     hydra.utils.log.info("Distributions computed from training dataset.")
 
     # Instantiate datamodule

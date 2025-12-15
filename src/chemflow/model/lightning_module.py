@@ -35,7 +35,7 @@ class LightningModule(pl.LightningModule):
         D: int = 3,
         n_atoms_strategy: str = "fixed",
         cat_strategy: str = "uniform-sample",  # "mask" or "uniform-sample"
-        type_loss_token_weights: str = "uniform",  # "uniform" or "training"
+        type_loss_token_weights: str = "training",  # "uniform" or "training"
         num_integration_steps: int = 100,
         cat_noise_level: float = 0.0,
         coord_noise_level: float = 0.0,
@@ -124,9 +124,10 @@ class LightningModule(pl.LightningModule):
         self.atom_tokens = atom_tokens
         self.edge_tokens = edge_tokens
         self.charge_tokens = charge_tokens
-        self.atom_mask_index = token_to_index(self.atom_tokens, "<MASK>")
-        self.edge_mask_index = token_to_index(self.edge_tokens, "<MASK>")
         self.atom_death_token_index = token_to_index(self.atom_tokens, "<DEATH>")
+        if self.cat_strategy == "mask":
+            self.atom_mask_index = token_to_index(self.atom_tokens, "<MASK>")
+            self.edge_mask_index = token_to_index(self.edge_tokens, "<MASK>")
 
         self.interpolator = Interpolator(
             self.atom_tokens,
@@ -139,20 +140,22 @@ class LightningModule(pl.LightningModule):
         )
         self.integrator = Integrator(
             self.atom_tokens,
-            self.K,
-            self.D,
-            self.cat_strategy,
-            device="cuda" if torch.cuda.is_available() else "cpu",
+            edge_tokens=self.edge_tokens,
             edge_type_distribution=edge_type_distribution.to(
                 "cuda" if torch.cuda.is_available() else "cpu"
             ),
-            edge_tokens=self.edge_tokens,
+            K=self.K,
+            D=self.D,
+            cat_strategy=self.cat_strategy,
+            device="cuda" if torch.cuda.is_available() else "cpu",
         )
         # Always compute token distribution weights for weighted cross-entropy loss
         atom_type_weights = compute_token_weights(
             token_list=self.atom_tokens,
             distribution=atom_type_distribution,
-            special_token_names=["<MASK>", "<DEATH>"],
+            special_token_names=["<MASK>", "<DEATH>"]
+            if self.cat_strategy == "mask"
+            else ["<DEATH>"],
             weight_alpha=self.weight_alpha,
             type_loss_token_weights=self.type_loss_token_weights,
         )
@@ -162,7 +165,9 @@ class LightningModule(pl.LightningModule):
         edge_weights = compute_token_weights(
             token_list=self.edge_tokens,
             distribution=edge_type_distribution,
-            special_token_names=["<MASK>", "<NO_BOND>"],
+            special_token_names=["<MASK>", "<NO_BOND>"]
+            if self.cat_strategy == "mask"
+            else ["<NO_BOND>"],
             weight_alpha=self.weight_alpha,
             type_loss_token_weights=self.type_loss_token_weights,
         )
@@ -288,12 +293,15 @@ class LightningModule(pl.LightningModule):
                 "Call set_tokens_and_distribution() first."
             )
 
-        # TODO add triangular mask
-        _, e_pred_triu = get_canonical_upper_triangle_with_index(
+        edge_index_pred, e_pred_triu = get_canonical_upper_triangle_with_index(
             mols_t.edge_index, edge_type_pred
         )
-        _, e_target_triu = get_canonical_upper_triangle_with_index(
+        edge_index_target, e_target_triu = get_canonical_upper_triangle_with_index(
             targets["mols_1"].edge_index, targets["mols_1"].e
+        )
+
+        assert torch.all(edge_index_pred == edge_index_target), (
+            "The edge indices must be the same."
         )
 
         e_loss = F.cross_entropy(
@@ -400,7 +408,7 @@ class LightningModule(pl.LightningModule):
             Dictionary containing final samples
         """
         self.model.set_inference()
-        if self.atom_tokens is None or self.atom_mask_index is None:
+        if self.atom_tokens is None:
             raise ValueError(
                 "tokens must be set before prediction. "
                 "Call set_tokens_and_distribution() first."

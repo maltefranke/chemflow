@@ -19,25 +19,24 @@ class Integrator:
     def __init__(
         self,
         atom_tokens,
+        edge_tokens,
+        edge_type_distribution,
         K,
         D,
         cat_strategy="uniform-sample",
         device="cpu",
-        edge_type_distribution=None,
-        edge_tokens=None,
     ):
         self.atom_tokens = atom_tokens
-        self.atom_mask_index = token_to_index(atom_tokens, "<MASK>")
-        self.death_token_index = token_to_index(atom_tokens, "<DEATH>")
         self.K = K
         self.D = D
         self.cat_strategy = cat_strategy
         self.device = device
         self.edge_type_distribution = edge_type_distribution
-        if edge_tokens is not None:
+        self.death_token_index = token_to_index(atom_tokens, "<DEATH>")
+
+        if self.cat_strategy == "mask":
             self.edge_mask_index = token_to_index(edge_tokens, "<MASK>")
-        else:
-            self.edge_mask_index = None
+            self.atom_mask_index = token_to_index(atom_tokens, "<MASK>")
 
     def sample_death_process_gnn(
         self,
@@ -275,10 +274,6 @@ class Integrator:
             diags = (1.0 - a_step_probs.sum(dim=-1, keepdim=True)).clamp(min=0.0)
             a_step_probs.scatter_(-1, a.unsqueeze(-1), diags)
 
-            # set mask and death probability to 0 for the nodes that are not valid
-            a_step_probs[:, self.atom_mask_index] = 0.0
-            a_step_probs[:, self.death_token_index] = 0.0
-
             a_pred = torch.distributions.Categorical(a_step_probs).sample()
             a = a_pred
 
@@ -352,9 +347,6 @@ class Integrator:
             step_probs.scatter_(1, e_curr_triu.unsqueeze(-1), 0.0)
             diags = (1.0 - step_probs.sum(dim=-1, keepdim=True)).clamp(min=0.0)
             step_probs.scatter_(1, e_curr_triu.unsqueeze(-1), diags)
-
-            # set mask probability to 0 for the edges that are not valid
-            step_probs[:, self.edge_mask_index] = 0.0
 
             # Sample new edge types for valid edges
             et_new_triu = torch.distributions.Categorical(step_probs).sample()
