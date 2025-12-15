@@ -1,27 +1,37 @@
 import torch
 import torch.nn.functional as F
+from torch_geometric.utils import subgraph
 
 from chemflow.flow_matching.gmm import sample_from_typed_gmm, sample_from_gmm
-from chemflow.utils import token_to_index, build_fully_connected_edge_index
+from chemflow.utils import (
+    token_to_index,
+    build_fully_connected_edge_index,
+    get_canonical_upper_triangle_with_index,
+    symmetrize_upper_triangle,
+)
+
+
+from chemflow.dataset.molecule_data import MoleculeData, PointCloud, MoleculeBatch
+from chemflow.dataset.molecule_data import join_molecule_with_atoms
 
 
 class Integrator:
     def __init__(
         self,
-        tokens,
+        atom_tokens,
         K,
         D,
-        typed_gmm=True,
+        cat_strategy="uniform-sample",
         device="cpu",
         edge_type_distribution=None,
         edge_tokens=None,
     ):
-        self.tokens = tokens
-        self.mask_index = token_to_index(tokens, "<MASK>")
-        self.death_token_index = token_to_index(tokens, "<DEATH>")
+        self.atom_tokens = atom_tokens
+        self.atom_mask_index = token_to_index(atom_tokens, "<MASK>")
+        self.death_token_index = token_to_index(atom_tokens, "<DEATH>")
         self.K = K
         self.D = D
-        self.typed_gmm = typed_gmm
+        self.cat_strategy = cat_strategy
         self.device = device
         self.edge_type_distribution = edge_type_distribution
         if edge_tokens is not None:
@@ -123,13 +133,12 @@ class Integrator:
             new_batch_ids: Shape (N_new,) - batch assignments for new particles
         """
         num_graphs = birth_rate.shape[0]
-        new_particles_list = []
-        new_types_list = []
-        new_batch_ids_list = []
+        new_atoms = []
         for graph_id in range(num_graphs):
             # Sample number of births for this graph
             # Expected number of births = birth_rate * dt
             expected_births = birth_rate[graph_id] * dt
+
             # Use Poisson sampling (approximate with normal for large values)
             if expected_births > 0:
                 num_births = torch.poisson(expected_births.unsqueeze(0)).item()
@@ -147,65 +156,60 @@ class Integrator:
                 "sigma": birth_gmm_dict["sigma"][graph_id].unsqueeze(0),
                 "pi": birth_gmm_dict["pi"][graph_id].unsqueeze(0),
             }
-            if self.typed_gmm:
-                sampled_locations, sampled_types = sample_from_typed_gmm(
+            if self.cat_strategy == "uniform-sample":
+                sampled_x, sampled_a, sampled_c = sample_from_typed_gmm(
                     gmm_params, num_births, self.K, self.D, N_types
                 )
             else:
-                sampled_locations = sample_from_gmm(
-                    gmm_params, num_births, self.K, self.D
+                sampled_x = sample_from_gmm(gmm_params, num_births, self.K, self.D)
+                sampled_a = self.atom_mask_index * torch.ones(
+                    (num_births,),
+                    dtype=torch.long,
+                    device=self.device,
                 )
-                sampled_types = self.mask_index * torch.ones(
+                sampled_c = self.charge_mask_index * torch.ones(
                     (num_births,),
                     dtype=torch.long,
                     device=self.device,
                 )
 
             # Convert to one-hot for types
-            sampled_types_onehot = F.one_hot(sampled_types, num_classes=N_types).float()
+            # sampled_types_onehot = F.one_hot(sampled_types, num_classes=N_types).float()
 
             # Squeeze batch dimension if needed
-            if sampled_locations.dim() == 3:
-                sampled_locations = sampled_locations.squeeze(0)
-            if sampled_types_onehot.dim() == 3:
-                sampled_types_onehot = sampled_types_onehot.squeeze(0)
+            if sampled_x.dim() == 3:
+                sampled_x = sampled_x.squeeze(0)
+            # if sampled_types_onehot.dim() == 3:
+            #    sampled_types_onehot = sampled_types_onehot.squeeze(0)
 
-            new_particles_list.append(sampled_locations)
-            new_types_list.append(sampled_types_onehot)
-            new_batch_ids_list.append(
-                torch.full(
-                    (num_births,), graph_id, device=self.device, dtype=batch_id.dtype
-                )
+            new_atoms_i = PointCloud(
+                x=sampled_x,
+                a=sampled_a,
+                c=sampled_c,
             )
+            new_atoms.append(new_atoms_i)
 
-        if len(new_particles_list) == 0:
+        if len(new_atoms) == 0:
             # No births, return empty tensors
-            empty_particles = torch.empty((0, self.D), device=self.device)
-            empty_types = torch.empty((0, N_types), device=self.device)
-            empty_batch_ids = torch.empty(
-                (0,), device=self.device, dtype=batch_id.dtype
+            new_atoms = PointCloud(
+                x=torch.empty((0, self.D), device=self.device),
+                a=torch.empty((0, N_types), device=self.device),
+                batch=torch.empty((0,), device=self.device, dtype=batch_id.dtype),
             )
-            return empty_particles, empty_types, empty_batch_ids
 
-        new_particles = torch.cat(new_particles_list, dim=0)
-        new_types = torch.cat(new_types_list, dim=0)
-        new_batch_ids = torch.cat(new_batch_ids_list, dim=0)
+            return new_atoms
 
-        return new_particles, new_types, new_batch_ids
+        new_atoms = MoleculeBatch.from_data_list(new_atoms)
+
+        return new_atoms
 
     def integrate_step_gnn(
         self,
-        x_pred: torch.Tensor,
-        type_pred: torch.Tensor,
-        edge_type_pred: torch.Tensor,
+        mol_t: MoleculeData,
+        mol_1_pred: MoleculeData,
         global_death_rate: torch.Tensor,
         birth_rate: torch.Tensor,
         birth_gmm_dict: dict,
-        xt: torch.Tensor,
-        at: torch.Tensor,
-        # ct: torch.Tensor,
-        et: torch.Tensor,
-        batch_id: torch.Tensor,
         t: torch.Tensor,
         dt: float,
         cat_noise_level: float = 0.0,
@@ -218,72 +222,65 @@ class Integrator:
         All tensors are flat (no padding).
 
         Args:
-            x_pred: Shape (N_total, D) - predicted positions for each node
-            type_pred: Shape (N_total, num_classes) - type predictions for each
-                node (softmaxed)
-            edge_type_pred: Shape (num_edges, num_edge_classes) - edge type
-                predictions (softmaxed)
+            mol_t: MoleculeData - current molecule
+            mol_1_pred: MoleculeData - predicted molecule
             global_death_rate: Shape (num_graphs,) - graph-level death rates
             birth_rate: Shape (num_graphs,) - graph-level birth rates
             birth_gmm_dict: dict - GMM parameters per graph
-            xt: Shape (N_total, D) - current positions
-            at: Shape (N_total, num_classes) - current atom types (one-hot)
-            ct: Shape (N_total, num_classes) - current charge types (one-hot)
-            et: Shape (N_total, N_total) - current edge types (indices)
-            batch_id: Shape (N_total,) - batch assignment for each node
             t: Shape (num_graphs,) - current time for each graph
             dt: Time step
             cat_noise_level: Categorical noise level for type updates
             eps: Small epsilon value for numerical stability
 
         Returns:
-            xt_final: Shape (N_final, D) - updated positions
-            at_final: Shape (N_final, num_classes) - updated types
-            ct_final: Shape (N_final, num_classes) - updated types
-            et_final: Shape (N_final, N_final) - updated edge types (indices)
-            batch_id_final: Shape (N_final,) - updated batch assignments
+            mol_t_final: MoleculeData - updated molecule
         """
+        # setup the input molecules
+        mol_t_out = mol_t.clone()
+        mol_1_pred = mol_1_pred.clone()
+
+        x, a, c, e, edge_index, batch_id = mol_t_out.unpack()
+        x_1, a_1, c_1, e_1, edge_index_1, _ = mol_1_pred.unpack()
 
         # keeps track of which nodes are alive
         xt_mask = torch.ones_like(batch_id, dtype=torch.bool, device=self.device)
 
         # 1. Update positions (Euler-Maruyama scheme)
-        velocity = (x_pred - xt) / (1 - t[batch_id].unsqueeze(-1)).clamp(
+        velocity = (x_1 - x) / (1 - t[batch_id].unsqueeze(-1)).clamp(
             min=eps, max=1.0 - eps
         )
-        xt_new = xt + velocity * dt
+        x = x + velocity * dt
 
         # 2. Update node types
-        a_curr = torch.argmax(at, dim=-1)
-        a_pred = torch.distributions.Categorical(type_pred).sample()
+        # a_pred = torch.distributions.Categorical(mol_1_pred.a).sample()
 
-        if self.typed_gmm:
+        if self.cat_strategy == "uniform-sample":
             # probability to stay in the current type
-            pred_probs_curr = torch.gather(type_pred, -1, a_curr.unsqueeze(-1))
+            p_a_stay_curr = torch.gather(a_1, -1, a.unsqueeze(-1))
 
             # Setup batched time tensor and noise tensor
-            ones = [1] * (len(type_pred.shape) - 1)
+            ones = [1] * (len(a_1.shape) - 1)
             times = t[batch_id].view(-1, *ones).clamp(min=1e-3, max=1.0 - 1e-3)
             noise = torch.zeros_like(times)
             noise[times + dt < 1.0] = cat_noise_level
 
             # Off-diagonal step probs
-            mult = (1 + ((2 * noise) * (type_pred.shape[-1] - 1) * times)) / (1 - times)
-            first_term = dt * mult * type_pred
-            second_term = dt * noise * pred_probs_curr
-            step_probs = (first_term + second_term).clamp(max=1.0)
+            mult = (1 + ((2 * noise) * (a_1.shape[-1] - 1) * times)) / (1 - times)
+            first_term = dt * mult * a_1
+            second_term = dt * noise * p_a_stay_curr
+            a_step_probs = (first_term + second_term).clamp(max=1.0)
 
             # On-diagonal step probs
-            step_probs.scatter_(-1, a_curr.unsqueeze(-1), 0.0)
-            diags = (1.0 - step_probs.sum(dim=-1, keepdim=True)).clamp(min=0.0)
-            step_probs.scatter_(-1, a_curr.unsqueeze(-1), diags)
+            a_step_probs.scatter_(-1, a.unsqueeze(-1), 0.0)
+            diags = (1.0 - a_step_probs.sum(dim=-1, keepdim=True)).clamp(min=0.0)
+            a_step_probs.scatter_(-1, a.unsqueeze(-1), diags)
 
             # set mask and death probability to 0 for the nodes that are not valid
-            step_probs[:, self.mask_index] = 0.0
-            step_probs[:, self.death_token_index] = 0.0
+            a_step_probs[:, self.atom_mask_index] = 0.0
+            a_step_probs[:, self.death_token_index] = 0.0
 
-            pred = torch.distributions.Categorical(step_probs).sample()
-            at_new = F.one_hot(pred, num_classes=type_pred.shape[-1]).float()
+            a_pred = torch.distributions.Categorical(a_step_probs).sample()
+            a = a_pred
 
         else:
             # Get time for each node (expand t to match nodes)
@@ -295,48 +292,50 @@ class Integrator:
 
             # Choose elements to unmask
             limit = dt * (1 + (cat_noise_level * node_times)) / (1 - node_times + 1e-8)
-            unmask = torch.rand_like(a_pred.float()) < limit
-            unmask = unmask & (a_curr == self.mask_index) & xt_mask
+            unmask = torch.rand_like(a_1.float()) < limit
+            unmask = unmask & (a == self.atom_mask_index) & xt_mask
 
             # Choose elements to mask
             mask_prob = dt * cat_noise_level
-            mask = torch.rand_like(a_pred.float()) < mask_prob
-            mask = mask & (a_curr != self.mask_index) & xt_mask
+            mask = torch.rand_like(a_1.float()) < mask_prob
+            mask = mask & (a != self.atom_mask_index) & xt_mask
             # Do not mask at the end
             end_mask = (node_times + dt) >= 1.0
             mask = mask & (~end_mask)
 
             # Apply unmasking and re-masking
-            a_curr[unmask] = a_pred[unmask]
-            a_curr[mask] = self.mask_index
-            at_new = F.one_hot(a_curr, num_classes=type_pred.shape[-1]).float()
+            a[unmask] = a_1[unmask]
+            a[mask] = self.atom_mask_index
 
         # 2.5. Update edge types
-        edge_index = build_fully_connected_edge_index(batch_id)
-        N_total = batch_id.shape[0]
-        num_edge_classes = edge_type_pred.shape[-1]
+        num_edge_classes = e_1.shape[-1]
 
         # Get current edge types (already indices)
-        et_new = et.long().clone()
+        e_curr = e.long().clone()
+        e_pred = e_1.long().clone()
 
-        # Create mask for valid edges (edges that exist in edge_index)
-        valid_edge_mask = torch.zeros(
-            (N_total, N_total), dtype=torch.bool, device=self.device
+        # we will deal with only the upper triangle of the edge types and symmetrize them later
+        _, e_curr_triu = get_canonical_upper_triangle_with_index(edge_index, e_curr)
+        edge_index_triu, e_pred_triu = get_canonical_upper_triangle_with_index(
+            edge_index_1, e_pred
         )
-        valid_edge_mask[edge_index[0], edge_index[1]] = True
-        valid_edge_mask[edge_index[1], edge_index[0]] = True
 
         # Only update edges that exist in edge_index
-        if self.typed_gmm:
+        if self.cat_strategy == "uniform-sample":
             # Get probability of current edge type for valid edges
-            et_curr_valid = et_new[edge_index[0], edge_index[1]]
-            pred_probs_curr = edge_type_pred.gather(
-                1, et_curr_valid.unsqueeze(-1)
+            # et_curr_valid = et_new[edge_index[0], edge_index[1]]
+            # print(et_curr_valid)
+
+            # p_e_stay_curr = mol_1_pred.e.gather(1, et_new.unsqueeze(-1)).squeeze(-1)
+            p_e_stay_curr = torch.gather(
+                e_pred_triu, -1, e_curr_triu.unsqueeze(-1)
             ).squeeze(-1)
 
             # Compute edge times (average of connected nodes)
             node_times = t[batch_id]
-            edge_times = (node_times[edge_index[0]] + node_times[edge_index[1]]) / 2.0
+            edge_times = (
+                node_times[edge_index_triu[0]] + node_times[edge_index_triu[1]]
+            ) / 2.0
             edge_times = edge_times.clamp(min=1e-3, max=1.0 - 1e-3)
             noise = torch.zeros_like(edge_times)
             noise[edge_times + dt < 1.0] = cat_noise_level
@@ -345,22 +344,21 @@ class Integrator:
             mult = (1 + ((2 * noise) * (num_edge_classes - 1) * edge_times)) / (
                 1 - edge_times
             )
-            first_term = dt * mult.unsqueeze(-1) * edge_type_pred
-            second_term = dt * noise.unsqueeze(-1) * pred_probs_curr.unsqueeze(-1)
+            first_term = dt * mult.unsqueeze(-1) * e_pred_triu
+            second_term = dt * noise.unsqueeze(-1) * p_e_stay_curr.unsqueeze(-1)
             step_probs = (first_term + second_term).clamp(max=1.0)
 
             # Set diagonal probabilities
-            step_probs.scatter_(1, et_curr_valid.unsqueeze(-1), 0.0)
+            step_probs.scatter_(1, e_curr_triu.unsqueeze(-1), 0.0)
             diags = (1.0 - step_probs.sum(dim=-1, keepdim=True)).clamp(min=0.0)
-            step_probs.scatter_(1, et_curr_valid.unsqueeze(-1), diags)
+            step_probs.scatter_(1, e_curr_triu.unsqueeze(-1), diags)
 
             # set mask probability to 0 for the edges that are not valid
             step_probs[:, self.edge_mask_index] = 0.0
 
             # Sample new edge types for valid edges
-            et_new_valid = torch.distributions.Categorical(step_probs).sample()
-            et_new[edge_index[0], edge_index[1]] = et_new_valid
-            et_new[edge_index[1], edge_index[0]] = et_new_valid
+            et_new_triu = torch.distributions.Categorical(step_probs).sample()
+
         else:
             # Get edge times for valid edges
             num_graphs = t.shape[0]
@@ -369,97 +367,98 @@ class Integrator:
                 node_times[batch_id == graph_id] = t[graph_id]
             edge_times = (node_times[edge_index[0]] + node_times[edge_index[1]]) / 2.0
 
-            # Get current edge types for valid edges
-            et_curr_valid = et_new[edge_index[0], edge_index[1]]
-
             # Sample predictions for valid edges
-            et_pred_valid = torch.distributions.Categorical(edge_type_pred).sample()
+            e_pred_triu = torch.distributions.Categorical(e_pred_triu).sample()
 
             # Unmask and mask logic for valid edges
             limit = dt * (1 + (cat_noise_level * edge_times)) / (1 - edge_times + 1e-8)
             node_alive_mask = xt_mask[edge_index[0]] & xt_mask[edge_index[1]]
             unmask = (
-                (torch.rand_like(et_curr_valid.float()) < limit)
-                & (et_curr_valid == self.edge_mask_index)
+                (torch.rand_like(e_pred_triu.float()) < limit)
+                & (e_curr_triu == self.edge_mask_index)
                 & node_alive_mask
             )
             mask = (
-                (torch.rand_like(et_curr_valid.float()) < dt * cat_noise_level)
-                & (et_curr_valid != self.edge_mask_index)
+                (torch.rand_like(e_curr_triu.float()) < dt * cat_noise_level)
+                & (e_curr_triu != self.edge_mask_index)
                 & node_alive_mask
                 & ((edge_times + dt) < 1.0)
             )
 
-            et_new_valid = et_curr_valid.clone()
-            et_new_valid[unmask] = et_pred_valid[unmask]
+            et_new_valid = e_curr_triu.clone()
+            et_new_valid[unmask] = e_pred_triu[unmask]
             et_new_valid[mask] = self.edge_mask_index
-            et_new[edge_index[0], edge_index[1]] = et_new_valid
-            et_new[edge_index[1], edge_index[0]] = et_new_valid
 
-        # 3. Sample death process
-        # TODO ct should be logits?
+            et_new_triu[edge_index[0], edge_index[1]] = et_new_valid
+            et_new_triu[edge_index[1], edge_index[0]] = et_new_valid
+
+        # finally, symmetrize the edge types
+        edge_index, e_pred = symmetrize_upper_triangle(edge_index_triu, et_new_triu)
+        e = e_pred
+
+        # 3.1 Sample death process
         death_mask = self.sample_death_process_gnn(
-            global_death_rate, type_pred, xt_mask, batch_id, self.death_token_index, dt
+            global_death_rate,
+            a_1,
+            xt_mask,
+            batch_id,
+            self.death_token_index,
+            dt,
         )
-        xt_mask_new = xt_mask & (~death_mask)
+        alive_mask = xt_mask & (~death_mask)
+
+        # 3.2. Remove dead nodes and combine with new particles
+        # Keep only alive nodes from existing particles
+        x_alive = x[alive_mask]
+        a_alive = a[alive_mask]
+        c_alive = c[alive_mask]
+        batch_id_alive = batch_id[alive_mask]
+
+        edge_index_alive, e_alive = subgraph(
+            subset=alive_mask,
+            edge_index=edge_index,
+            edge_attr=e,
+            relabel_nodes=True,
+            num_nodes=x.shape[0],
+        )
+
+        mol_t_alive = MoleculeBatch(
+            x=x_alive,
+            a=a_alive,
+            c=c_alive,
+            e=e_alive,
+            edge_index=edge_index_alive,
+            batch=batch_id_alive,
+        )
 
         # 4. Sample birth process
-        new_particles, new_types, new_batch_ids = self.sample_birth_process_gnn(
+        new_atoms = self.sample_birth_process_gnn(
             birth_rate,
             birth_gmm_dict,
             batch_id,
             dt,
-            at.shape[-1],
+            N_types=a_1.shape[-1],
         )
 
-        # 5. Remove dead nodes and combine with new particles
-        # Keep only alive nodes from existing particles
-        alive_mask = xt_mask_new
-        xt_alive = xt_new[alive_mask]
-        at_alive = at_new[alive_mask]
-        batch_id_alive = batch_id[alive_mask]
-
-        # Update edge matrix: remove rows/columns for dead nodes
-        # Extract submatrix for alive nodes
-        alive_indices = torch.where(alive_mask)[0]
-        et_alive = et_new[alive_indices][:, alive_indices]  # (N_alive, N_alive)
-        N_alive = et_alive.shape[0]
-
         # Combine alive nodes with new particles
-        if new_particles.shape[0] > 0:
-            N_new = new_particles.shape[0]
-            xt_final = torch.cat([xt_alive, new_particles], dim=0)
-            at_final = torch.cat([at_alive, new_types], dim=0)
-            batch_id_final = torch.cat([batch_id_alive, new_batch_ids], dim=0)
-
-            # Update edge matrix: add new nodes
-            N_final = N_alive + N_new
-            et_final = torch.zeros(
-                (N_final, N_final), dtype=et.dtype, device=self.device
-            )
-            et_final[:N_alive, :N_alive] = et_alive
-
-            # Sample new edges
-            if self.typed_gmm and self.edge_type_distribution is not None:
+        if new_atoms.num_nodes > 0:
+            # adjust which edge distribution to sample from
+            if (
+                self.cat_strategy == "uniform-sample"
+                and self.edge_type_distribution is not None
+            ):
                 # Sample from edge_type_distribution
                 edge_dist = torch.distributions.Categorical(
                     self.edge_type_distribution.to(self.device)
                 )
-                # Sample for all pairs involving new nodes (symmetric)
-                new_edges = edge_dist.sample((N_new, N_final))
-                et_final[N_alive:, :] = new_edges
-                et_final[:, N_alive:] = new_edges.T
             else:
-                # Use edge_mask_index for new edges
-                et_final[N_alive:, :] = self.edge_mask_index
-                et_final[:, N_alive:] = self.edge_mask_index
+                edge_dist = torch.zeros(len(self.edge_tokens))
+                edge_dist[self.edge_mask_index] = 1.0
 
-            et_final.fill_diagonal_(0)  # No self-loops
+            # add the new atoms to the existing molecules
+            mol_t_final = join_molecule_with_atoms(mol_t_alive, new_atoms, edge_dist)
 
         else:
-            xt_final = xt_alive
-            at_final = at_alive
-            batch_id_final = batch_id_alive
-            et_final = et_alive
+            mol_t_final = mol_t_alive
 
-        return xt_final, at_final, et_final, batch_id_final
+        return mol_t_final

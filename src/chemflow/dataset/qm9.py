@@ -16,6 +16,8 @@ from torch_geometric.data import Data
 from torch_geometric.io import fs
 from torch_geometric.utils import one_hot, scatter
 
+from chemflow.dataset.molecule_data import MoleculeData
+
 
 class QM9Charges(QM9):
     """
@@ -101,7 +103,6 @@ class QM9Charges(QM9):
                 sp2.append(1 if hybridization == HybridizationType.SP2 else 0)
                 sp3.append(1 if hybridization == HybridizationType.SP3 else 0)
                 charges.append(atom.GetFormalCharge())
-                print(atom.GetFormalCharge())
 
             z = torch.tensor(atomic_number, dtype=torch.long)
 
@@ -168,7 +169,7 @@ class FlowMatchingQM9Dataset(QM9Charges):
     def __init__(
         self,
         root,
-        tokens: list[str],
+        atom_tokens: list[str],
         charge_tokens: list[str],
         coord_std: float = None,
         transform=None,
@@ -176,7 +177,7 @@ class FlowMatchingQM9Dataset(QM9Charges):
     ):
         super().__init__(root, transform, pre_transform)
 
-        self.tokens = tokens
+        self.atom_tokens = atom_tokens
         self.charge_tokens = charge_tokens
         self.coord_std = coord_std
 
@@ -188,7 +189,7 @@ class FlowMatchingQM9Dataset(QM9Charges):
 
         atom_types = data.z
         atom_types = z_to_atom_types(atom_types.tolist())
-        atom_types = [token_to_index(self.tokens, token) for token in atom_types]
+        atom_types = [token_to_index(self.atom_tokens, token) for token in atom_types]
         atom_types = torch.tensor(atom_types, dtype=torch.long)
 
         edge_types = edge_types_to_symmetric(
@@ -197,6 +198,9 @@ class FlowMatchingQM9Dataset(QM9Charges):
         # add 1 to the edge types to make them 1-indexed
         # 0 is no bond, 1 is single, 2 is double, 3 is triple, 4 is aromatic
         edge_types += 1
+
+        edge_types = edge_types[data.edge_index[0], data.edge_index[1]]
+        edge_types = edge_types.to(torch.long)
 
         if self.coord_std is not None:
             coord = coord / self.coord_std
@@ -207,13 +211,10 @@ class FlowMatchingQM9Dataset(QM9Charges):
         ]
         charges = torch.tensor(charges, dtype=torch.long)
 
-        target = {
-            "coord": coord,
-            "atom_types": atom_types,
-            "edge_types": edge_types,
-            "charges": charges,
-        }
-        return target
+        data = MoleculeData(
+            x=coord, a=atom_types, e=edge_types, c=charges, edge_index=data.edge_index
+        )
+        return data
 
 
 if __name__ == "__main__":

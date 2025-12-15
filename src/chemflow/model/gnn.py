@@ -8,6 +8,8 @@ import random
 from src.chemflow.model.embedding import SinusoidalEmbedding
 from src.chemflow.model.self_conditioning import SelfConditioningResidualLayer
 
+from chemflow.dataset.molecule_data import MoleculeBatch
+
 
 class EGNNWithEdgeType(EGNN):
     def forward(self, h, x, edges, edge_attr):
@@ -141,12 +143,8 @@ class EGNNwithHeads(BaseEGNN):
 
     def forward(
         self,
-        atom_feats,
-        coord,
-        edge_index,
-        t,
-        batch,
-        edge_type_ids=None,
+        mols_t: MoleculeBatch,
+        t: torch.Tensor,
         prev_outs=None,
         is_random_self_conditioning: bool = False,
     ):
@@ -165,9 +163,8 @@ class EGNNwithHeads(BaseEGNN):
         Returns:
             Dictionary mapping head names to their outputs
         """
-        h, edge_index, edge_attr = self.embed(
-            atom_feats, edge_index, t, batch, edge_type_ids
-        )
+        x, a, c, e, edge_index, batch = mols_t.unpack()
+        h, edge_index, e = self.embed(a, edge_index, t, batch, e)
 
         # NOTE using FlowMol3 self-conditioning logic here. Their description:
         # if we are using self-conditoning, and prev_outs is None, then
@@ -184,31 +181,30 @@ class EGNNwithHeads(BaseEGNN):
 
             if train_self_condition or inference_first_step:
                 with torch.no_grad():
-                    prev_outs = self.denoise_graph(
-                        h, coord, edge_index, edge_attr, batch
-                    )
+                    prev_outs = self.denoise_graph(h, x, edge_index, e, batch)
 
         if self.self_conditioning and prev_outs is not None:
             # if prev_outs is not none, we need to pass through the self-conditioning residual block
 
             # Handle case where edge_attr might be None
             # Create dummy edge attributes if not provided (shouldn't happen in practice)
-            if edge_attr is None:
-                edge_attr = torch.zeros(
+            if e is None:
+                print("No edge attr provided, creating dummy edge attr")
+                e = torch.zeros(
                     edge_index[0].shape[0],
                     self.edge_type_embedding.embedding_dim,
                     device=h.device,
                     dtype=h.dtype,
                 )
 
-            h, coord, edge_attr = self.self_conditioning_residual_layer(
+            h, x, e = self.self_conditioning_residual_layer(
                 h=h,
-                coord=coord,
+                coord=x,
                 edge_index=edge_index,
-                edge_attr=edge_attr,
+                edge_attr=e,
                 prev_outs=prev_outs,
-                atom_types=atom_feats,  # Pass atom type indices
+                atom_types=a,  # Pass atom type indices
             )
 
-        outs = self.denoise_graph(h, coord, edge_index, edge_attr, batch)
+        outs = self.denoise_graph(h, x, edge_index, e, batch)
         return outs

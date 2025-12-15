@@ -34,7 +34,7 @@ class Preprocessing:
     def __init__(
         self,
         root: str,
-        tokens_path: str = None,
+        atom_tokens_path: str = None,
         edge_tokens_path: str = None,
         charge_tokens_path: str = None,
         distributions_path: str = None,
@@ -55,8 +55,8 @@ class Preprocessing:
         self.root = root
 
         # Set default tokens path if not provided
-        if tokens_path is None:
-            tokens_path = os.path.join(self.root, "tokens.txt")
+        if atom_tokens_path is None:
+            atom_tokens_path = os.path.join(self.root, "atom_tokens.txt")
 
         # Set default edge tokens path if not provided
         if edge_tokens_path is None:
@@ -70,14 +70,14 @@ class Preprocessing:
         if distributions_path is None:
             distributions_path = os.path.join(self.root, "distributions.pt")
 
-        self.tokens_path = tokens_path
+        self.atom_tokens_path = atom_tokens_path
         self.edge_tokens_path = edge_tokens_path
         self.charge_tokens_path = charge_tokens_path
         self.distributions_path = distributions_path
 
         # Load or compute tokens (both computed together if either is missing)
-        tokens, edge_tokens, charge_tokens = self._load_or_compute_tokens()
-        self.tokens = tokens
+        atom_tokens, edge_tokens, charge_tokens = self._load_or_compute_tokens()
+        self.atom_tokens = atom_tokens
         self.edge_tokens = edge_tokens
         self.charge_tokens = charge_tokens
 
@@ -101,27 +101,27 @@ class Preprocessing:
             Tuple of (tokens)
         """
         # Try to load both from files
-        tokens_exist = os.path.exists(self.tokens_path)
+        atom_tokens_exist = os.path.exists(self.atom_tokens_path)
         edge_tokens_exist = os.path.exists(self.edge_tokens_path)
         charge_tokens_exist = os.path.exists(self.charge_tokens_path)
 
-        if tokens_exist and edge_tokens_exist and charge_tokens_exist:
-            tokens = self._load_tokens(self.tokens_path)
+        if atom_tokens_exist and edge_tokens_exist and charge_tokens_exist:
+            atom_tokens = self._load_tokens(self.atom_tokens_path)
             edge_tokens = self._load_tokens(self.edge_tokens_path)
             charge_tokens = self._load_tokens(self.charge_tokens_path)
-            return tokens, edge_tokens, charge_tokens
+            return atom_tokens, edge_tokens, charge_tokens
 
         # Compute both from data in a single loop
-        tokens, edge_tokens, charge_tokens = self._compute_tokens_from_data()
+        atom_tokens, edge_tokens, charge_tokens = self._compute_tokens_from_data()
 
         # Save both to files
-        if not tokens_exist:
-            self._save_tokens(self.tokens_path, tokens)
+        if not atom_tokens_exist:
+            self._save_tokens(self.atom_tokens_path, atom_tokens)
         if not edge_tokens_exist:
             self._save_tokens(self.edge_tokens_path, edge_tokens)
         if not charge_tokens_exist:
             self._save_tokens(self.charge_tokens_path, charge_tokens)
-        return tokens, edge_tokens, charge_tokens
+        return atom_tokens, edge_tokens, charge_tokens
 
     def _compute_tokens_from_data(
         self,
@@ -243,11 +243,13 @@ class Preprocessing:
 
         # Compute atom type distribution
         atom_types = z_to_atom_types(dataset.z.tolist())
-        atom_type_indices = [token_to_index(self.tokens, token) for token in atom_types]
+        atom_type_indices = [
+            token_to_index(self.atom_tokens, token) for token in atom_types
+        ]
         atom_type_indices = torch.tensor(atom_type_indices, dtype=torch.long)
 
         # Create distribution over all tokens
-        all_token_indices = torch.arange(len(self.tokens), dtype=torch.long)
+        all_token_indices = torch.arange(len(self.atom_tokens), dtype=torch.long)
         atom_type_distribution = (
             atom_type_indices.unsqueeze(1) == all_token_indices
         ).sum(dim=0)

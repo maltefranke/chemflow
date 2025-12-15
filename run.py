@@ -12,6 +12,7 @@ from chemflow.utils import build_callbacks
 OmegaConf.register_new_resolver("oc.eval", eval)
 OmegaConf.register_new_resolver("len", lambda x: len(x))
 OmegaConf.register_new_resolver("if", lambda cond, t, f: t if cond else f)
+OmegaConf.register_new_resolver("eq", lambda x, y: x == y)
 
 torch.set_float32_matmul_precision("medium")
 
@@ -24,7 +25,7 @@ def run(cfg: DictConfig):
     preprocessing = hydra.utils.instantiate(cfg.data.preprocessing)
 
     # Extract tokens and distributions from preprocessing
-    tokens = preprocessing.tokens
+    atom_tokens = preprocessing.atom_tokens
     edge_tokens = preprocessing.edge_tokens
     charge_tokens = preprocessing.charge_tokens
     atom_type_distribution = preprocessing.atom_type_distribution
@@ -33,12 +34,12 @@ def run(cfg: DictConfig):
     n_atoms_distribution = preprocessing.n_atoms_distribution
     coordinate_std = preprocessing.coordinate_std
 
-    OmegaConf.update(cfg.data, "tokens", tokens)
+    OmegaConf.update(cfg.data, "atom_tokens", atom_tokens)
     OmegaConf.update(cfg.data, "edge_tokens", edge_tokens)
     OmegaConf.update(cfg.data, "charge_tokens", charge_tokens)
 
     hydra.utils.log.info(
-        f"Preprocessing complete. Found {len(tokens)} tokens: {tokens}"
+        f"Preprocessing complete. Found {len(atom_tokens)} tokens: {atom_tokens}"
     )
     hydra.utils.log.info("Distributions computed from training dataset.")
 
@@ -50,7 +51,7 @@ def run(cfg: DictConfig):
     )
     # Set tokens and distributions after initialization
     datamodule.set_tokens_and_distributions(
-        tokens=tokens,
+        atom_tokens=atom_tokens,
         edge_tokens=edge_tokens,
         charge_tokens=charge_tokens,
         atom_type_distribution=atom_type_distribution,
@@ -71,19 +72,20 @@ def run(cfg: DictConfig):
     )
     # Set tokens and distribution after initialization
     module.set_tokens_and_distribution(
-        tokens=tokens,
+        atom_tokens=atom_tokens,
         edge_tokens=edge_tokens,
         charge_tokens=charge_tokens,
         atom_type_distribution=atom_type_distribution,
         edge_type_distribution=edge_type_distribution,
         charge_type_distribution=charge_type_distribution,
     )
-    module.compile()
+    # module.compile()
 
     # Setup logging and callbacks
     wandb_logger = WandbLogger(**cfg.logging)
     callbacks = build_callbacks(cfg)
     lr_monitor = LearningRateMonitor(logging_interval="step")
+
     callbacks.append(lr_monitor)
     # Instantiate trainer
     trainer = pl.Trainer(

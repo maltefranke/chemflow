@@ -8,7 +8,7 @@ from pytorch_lightning.callbacks import (
 import torch
 from torch_geometric.utils import to_dense_adj
 from rdkit import Chem
-from torch_geometric.utils import remove_self_loops
+from torch_geometric.utils import remove_self_loops, sort_edge_index
 
 
 def build_callbacks(cfg: DictConfig) -> list[Callback]:
@@ -183,31 +183,14 @@ def segment_softmax(logits, segment_ids, num_segments):
     return probs
 
 
-def build_fully_connected_edge_index(batch_index):
-    # Count nodes in each graph
-    counts = torch.bincount(batch_index)
-
-    edge_indices = []
-    offset = 0
-
-    for count in counts:
-        if count > 0:
-            # Generate a grid of all pairs (0..k-1, 0..k-1)
-            # This creates k*k edges
-            row = torch.arange(count, device=batch_index.device).repeat_interleave(
-                count
-            )
-            col = torch.arange(count, device=batch_index.device).repeat(count)
-
-            # Shift by the current offset to match global node indices
-            edge_indices.append(torch.stack([row + offset, col + offset]))
-
-            offset += count
-
-    # Concatenate all graph edges
-    edges = torch.cat(edge_indices, dim=1)
-    edges = remove_self_loops(edges)[0]
-    return edges
+def build_fully_connected_edge_index(N_atoms, device="cpu"):
+    edge_index = torch.cartesian_prod(
+        torch.arange(N_atoms, device=device),
+        torch.arange(N_atoms, device=device),
+    )
+    edge_index = edge_index.T
+    edge_index = remove_self_loops(edge_index)[0]
+    return edge_index
 
 
 def compute_token_weights(
@@ -293,3 +276,49 @@ def compute_token_weights(
         final_weights = torch.ones_like(final_weights)
 
     return final_weights
+
+
+def get_canonical_upper_triangle_with_index(edge_index, edge_attr, include_diag=False):
+    """
+    Returns (edge_index, edge_attr) for the upper triangle.
+    """
+    # 1. Sort first to ensure canonical order
+    edge_index, edge_attr = sort_edge_index(edge_index, edge_attr)
+    row, col = edge_index
+
+    # 2. Filter
+    if include_diag:
+        mask = row <= col
+    else:
+        mask = row < col
+
+    # Return BOTH the filtered index and attributes
+    return edge_index[:, mask], edge_attr[mask]
+
+
+def symmetrize_upper_triangle(edge_index, edge_attr):
+    """
+    Reconstructs the full symmetric edge_index and edge_attr from an
+    upper triangular representation (row <= col).
+
+    Mirroring Logic:
+    - Off-diagonal edges (row < col) are duplicated and swapped (col, row).
+    - Diagonal edges (row == col) are kept as-is (appearing once).
+    """
+    row, col = edge_index
+
+    # 1. Identify strictly off-diagonal edges to mirror
+    #    (Self-loops should not be duplicated)
+    mask = row < col
+
+    # 2. Create the mirrored part (Lower Triangle)
+    #    Flip row/col and select attributes
+    mirror_index = torch.stack([col[mask], row[mask]], dim=0)
+    mirror_attr = edge_attr[mask]
+
+    # 3. Concatenate Original (Triu + Diag) with Mirrored (Tril)
+    full_edge_index = torch.cat([edge_index, mirror_index], dim=1)
+    full_edge_attr = torch.cat([edge_attr, mirror_attr], dim=0)
+
+    # 4. Sort to ensure canonical PyG order (row-major)
+    return sort_edge_index(full_edge_index, full_edge_attr)
