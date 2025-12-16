@@ -29,14 +29,18 @@ class Interpolator:
         atom_type_distribution,
         edge_type_distribution,
         cat_strategy="uniform-sample",
+        n_atoms_strategy="flexible",
         N_samples=20,
     ):
         self.atom_tokens = atom_tokens
         self.edge_tokens = edge_tokens
         self.charge_tokens = charge_tokens
         self.cat_strategy = cat_strategy
+        self.n_atoms_strategy = n_atoms_strategy
         self.N_samples = N_samples
-        self.atom_death_token = token_to_index(self.atom_tokens, "<DEATH>")
+
+        if self.n_atoms_strategy != "fixed":
+            self.atom_death_token = token_to_index(self.atom_tokens, "<DEATH>")
         if self.cat_strategy == "mask":
             self.atom_mask_token = token_to_index(self.atom_tokens, "<MASK>")
             self.edge_mask_token = token_to_index(self.edge_tokens, "<MASK>")

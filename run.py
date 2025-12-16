@@ -37,20 +37,27 @@ def run(cfg: DictConfig):
     if cfg.data.cat_strategy != "mask":
         # remove <MASK> token from the atom_type_distribution and edge_type_distribution
         atom_tokens, atom_type_distribution = remove_token_from_distribution(
-            atom_tokens, atom_type_distribution
+            atom_tokens, atom_type_distribution, "<MASK>"
         )
         edge_tokens, edge_type_distribution = remove_token_from_distribution(
-            edge_tokens, edge_type_distribution
+            edge_tokens, edge_type_distribution, "<MASK>"
+        )
+    if cfg.data.n_atoms_strategy == "fixed":
+        # remove <DEATH> token from the n_atoms_distribution
+        atom_tokens, atom_type_distribution = remove_token_from_distribution(
+            atom_tokens, atom_type_distribution, "<DEATH>"
         )
 
+    # update the configs such that model parameters are updated correctly
     OmegaConf.update(cfg.data, "atom_tokens", atom_tokens)
     OmegaConf.update(cfg.data, "edge_tokens", edge_tokens)
     OmegaConf.update(cfg.data, "charge_tokens", charge_tokens)
 
     hydra.utils.log.info(
-        f"Preprocessing complete. Found {len(atom_tokens)} atom tokens: {atom_tokens}\n"
-        f"{len(edge_tokens)} edge tokens: {edge_tokens}\n"
-        f"{len(charge_tokens)} charge tokens: {charge_tokens}"
+        f"Preprocessing complete.\n"
+        f"Found {len(atom_tokens)} atom tokens: {atom_tokens}\n"
+        f"Found {len(edge_tokens)} edge tokens: {edge_tokens}\n"
+        f"Found {len(charge_tokens)} charge tokens: {charge_tokens}"
     )
 
     hydra.utils.log.info("Distributions computed from training dataset.")
@@ -71,7 +78,6 @@ def run(cfg: DictConfig):
         charge_type_distribution=charge_type_distribution,
         n_atoms_distribution=n_atoms_distribution,
         coord_std=coordinate_std,
-        cat_strategy=cfg.data.cat_strategy,
     )
     # Call setup to create datasets with tokens and distributions
     datamodule.setup()

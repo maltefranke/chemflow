@@ -124,7 +124,9 @@ class LightningModule(pl.LightningModule):
         self.atom_tokens = atom_tokens
         self.edge_tokens = edge_tokens
         self.charge_tokens = charge_tokens
-        self.atom_death_token_index = token_to_index(self.atom_tokens, "<DEATH>")
+
+        if self.n_atoms_strategy != "fixed":
+            self.atom_death_token_index = token_to_index(self.atom_tokens, "<DEATH>")
         if self.cat_strategy == "mask":
             self.atom_mask_index = token_to_index(self.atom_tokens, "<MASK>")
             self.edge_mask_index = token_to_index(self.edge_tokens, "<MASK>")
@@ -136,6 +138,7 @@ class LightningModule(pl.LightningModule):
             atom_type_distribution.to(self.device),
             edge_type_distribution.to(self.device),
             cat_strategy=self.cat_strategy,
+            n_atoms_strategy=self.n_atoms_strategy,
             N_samples=self.N_samples,
         )
         self.integrator = Integrator(
@@ -147,27 +150,34 @@ class LightningModule(pl.LightningModule):
             K=self.K,
             D=self.D,
             cat_strategy=self.cat_strategy,
+            n_atoms_strategy=self.n_atoms_strategy,
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
         # Always compute token distribution weights for weighted cross-entropy loss
+        atom_special_tokens = []
+        if self.cat_strategy == "mask":
+            atom_special_tokens.append("<MASK>")
+        if self.n_atoms_strategy != "fixed":
+            atom_special_tokens.append("<DEATH>")
+
         atom_type_weights = compute_token_weights(
             token_list=self.atom_tokens,
             distribution=atom_type_distribution,
-            special_token_names=["<MASK>", "<DEATH>"]
-            if self.cat_strategy == "mask"
-            else ["<DEATH>"],
+            special_token_names=atom_special_tokens,
             weight_alpha=self.weight_alpha,
             type_loss_token_weights=self.type_loss_token_weights,
         )
         self.register_buffer("atom_type_weights", atom_type_weights)
 
         # Compute edge token distribution weights for weighted cross-entropy loss
+        edge_special_tokens = ["<NO_BOND>"]
+        if self.cat_strategy == "mask":
+            edge_special_tokens.append("<MASK>")
+
         edge_weights = compute_token_weights(
             token_list=self.edge_tokens,
             distribution=edge_type_distribution,
-            special_token_names=["<MASK>", "<NO_BOND>"]
-            if self.cat_strategy == "mask"
-            else ["<NO_BOND>"],
+            special_token_names=edge_special_tokens,
             weight_alpha=self.weight_alpha,
             type_loss_token_weights=self.type_loss_token_weights,
         )

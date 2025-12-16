@@ -24,15 +24,19 @@ class Integrator:
         K,
         D,
         cat_strategy="uniform-sample",
+        n_atoms_strategy="flexible",
         device="cpu",
     ):
         self.atom_tokens = atom_tokens
         self.K = K
         self.D = D
         self.cat_strategy = cat_strategy
+        self.n_atoms_strategy = n_atoms_strategy
         self.device = device
         self.edge_type_distribution = edge_type_distribution
-        self.death_token_index = token_to_index(atom_tokens, "<DEATH>")
+
+        if self.n_atoms_strategy != "fixed":
+            self.death_token_index = token_to_index(atom_tokens, "<DEATH>")
 
         if self.cat_strategy == "mask":
             self.edge_mask_index = token_to_index(edge_tokens, "<MASK>")
@@ -385,72 +389,86 @@ class Integrator:
             et_new_triu[edge_index[1], edge_index[0]] = et_new_valid
 
         # finally, symmetrize the edge types
-        edge_index, e_pred = symmetrize_upper_triangle(edge_index_triu, et_new_triu)
-        e = e_pred
+        edge_index, e = symmetrize_upper_triangle(edge_index_triu, et_new_triu)
 
-        # 3.1 Sample death process
-        death_mask = self.sample_death_process_gnn(
-            global_death_rate,
-            a_1,
-            xt_mask,
-            batch_id,
-            self.death_token_index,
-            dt,
-        )
-        alive_mask = xt_mask & (~death_mask)
+        if self.n_atoms_strategy != "fixed":
+            # 3.1. Sample death process
+            death_mask = self.sample_death_process_gnn(
+                global_death_rate,
+                a_1,
+                xt_mask,
+                batch_id,
+                self.death_token_index,
+                dt,
+            )
 
-        # 3.2. Remove dead nodes and combine with new particles
-        # Keep only alive nodes from existing particles
-        x_alive = x[alive_mask]
-        a_alive = a[alive_mask]
-        c_alive = c[alive_mask]
-        batch_id_alive = batch_id[alive_mask]
+            alive_mask = xt_mask & (~death_mask)
 
-        edge_index_alive, e_alive = subgraph(
-            subset=alive_mask,
-            edge_index=edge_index,
-            edge_attr=e,
-            relabel_nodes=True,
-            num_nodes=x.shape[0],
-        )
+            # 3.2. Remove dead nodes and combine with new particles
+            # Keep only alive nodes from existing particles
+            x_alive = x[alive_mask]
+            a_alive = a[alive_mask]
+            c_alive = c[alive_mask]
+            batch_id_alive = batch_id[alive_mask]
 
-        mol_t_alive = MoleculeBatch(
-            x=x_alive,
-            a=a_alive,
-            c=c_alive,
-            e=e_alive,
-            edge_index=edge_index_alive,
-            batch=batch_id_alive,
-        )
+            edge_index_alive, e_alive = subgraph(
+                subset=alive_mask,
+                edge_index=edge_index,
+                edge_attr=e,
+                relabel_nodes=True,
+                num_nodes=x.shape[0],
+            )
 
-        # 4. Sample birth process
-        new_atoms = self.sample_birth_process_gnn(
-            birth_rate,
-            birth_gmm_dict,
-            batch_id,
-            dt,
-            N_types=a_1.shape[-1],
-        )
+            mol_t_alive = MoleculeBatch(
+                x=x_alive,
+                a=a_alive,
+                c=c_alive,
+                e=e_alive,
+                edge_index=edge_index_alive,
+                batch=batch_id_alive,
+            )
 
-        # Combine alive nodes with new particles
-        if new_atoms.num_nodes > 0:
-            # adjust which edge distribution to sample from
-            if (
-                self.cat_strategy == "uniform-sample"
-                and self.edge_type_distribution is not None
-            ):
-                # Sample from edge_type_distribution
-                edge_dist = torch.distributions.Categorical(
-                    self.edge_type_distribution.to(self.device)
+            # 4. Sample birth process
+            new_atoms = self.sample_birth_process_gnn(
+                birth_rate,
+                birth_gmm_dict,
+                batch_id,
+                dt,
+                N_types=a_1.shape[-1],
+            )
+
+            # Combine alive nodes with new particles
+            if new_atoms.num_nodes > 0:
+                # adjust which edge distribution to sample from
+                if (
+                    self.cat_strategy == "uniform-sample"
+                    and self.edge_type_distribution is not None
+                ):
+                    # Sample from edge_type_distribution
+                    edge_dist = torch.distributions.Categorical(
+                        self.edge_type_distribution.to(self.device)
+                    )
+                else:
+                    edge_dist = torch.zeros(len(self.edge_tokens))
+                    edge_dist[self.edge_mask_index] = 1.0
+
+                # add the new atoms to the existing molecules
+                mol_t_final = join_molecule_with_atoms(
+                    mol_t_alive, new_atoms, edge_dist
                 )
-            else:
-                edge_dist = torch.zeros(len(self.edge_tokens))
-                edge_dist[self.edge_mask_index] = 1.0
 
-            # add the new atoms to the existing molecules
-            mol_t_final = join_molecule_with_atoms(mol_t_alive, new_atoms, edge_dist)
+            else:
+                mol_t_final = mol_t_alive
 
         else:
-            mol_t_final = mol_t_alive
+            # No death or birth process, just movement
+            mol_t_final = MoleculeBatch(
+                x=x,
+                a=a,
+                c=c,
+                e=e,
+                edge_index=edge_index,
+                batch=batch_id,
+            )
 
         return mol_t_final
