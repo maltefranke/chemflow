@@ -2,7 +2,8 @@
 K: 10
 D: 3
 
-output_dim_typed: ${oc.eval:"${model.K} + ${model.K} + ${model.K}*${len:${data.tokens}}"}
+is_typed: ${if:${eq:${data.cat_strategy},uniform-sample},true,false}
+output_dim_typed: ${oc.eval:"${model.K} + ${model.K} + ${model.K}*${len:${data.atom_tokens}}"}
 output_dim_untyped: ${oc.eval:"${model.K} + ${model.K}"}
 
 module:
@@ -12,7 +13,7 @@ module:
 
   weight_alpha: 1.0
   k_nn_edges: 10
-  typed_gmm: True
+  #typed_gmm: True
   N_samples: 30
   K: ${model.K}
   D: ${model.D}
@@ -27,6 +28,7 @@ module:
     a_loss: 1.0
     x_loss: 2.0
     e_loss: 1.0
+    c_loss: 1.0
     gmm_loss: 0.0
     death_rate_loss: 0.0
     birth_rate_loss: 0.0
@@ -34,8 +36,10 @@ module:
   # Optimizer configuration
   optimizer_config:
     optimizer:
-      _target_: torch.optim.Adam
-      lr: 1e-4
+      _target_: torch.optim.AdamW
+      lr: 5e-4
+      weight_decay: 1e-5
+      fused: true
 
     scheduler:
       _target_: chemflow.schedulers.LinearOneCycleLR
@@ -58,20 +62,20 @@ module:
 
 atom_type_embedding:
   _target_: chemflow.model.embedding.Embedding
-  in_nf: ${len:${data.tokens}}
-  out_nf: 256
+  in_nf: ${len:${data.atom_tokens}}
+  out_nf: 64
 
 edge_type_embedding:
   _target_: chemflow.model.embedding.Embedding
   in_nf: ${len:${data.edge_tokens}}
-  out_nf: 256
+  out_nf: 64
 
 egnn:
   _target_: chemflow.model.gnn.EGNNWithEdgeType
   in_node_nf: ${model.atom_type_embedding.out_nf}
-  hidden_nf: 256
-  out_node_nf: 128
-  in_edge_nf: 256 # set to zeo when not predicting edge types
+  hidden_nf: 64
+  out_node_nf: 64
+  in_edge_nf: ${model.edge_type_embedding.out_nf} # set to zeo when not predicting edge types
   n_layers: 6
   residual: True
   attention: True
@@ -82,15 +86,19 @@ heads:
   _target_: chemflow.model.heads.MultiHeadModule
 
   heads_configs:
+    # Aggregation method for all graph heads
+    graph_aggregation: mean  # Options: mean, sum, max
+    
     node_heads:
-      class_head:
+      atom_type_head:
         input_dim: ${model.egnn.out_node_nf}
-        output_dim: ${len:${data.tokens}}
+        output_dim: ${len:${data.atom_tokens}}
         hidden_dim: 32
 
-      # pos_head:
-      #  input_dim: ${model.egnn.out_node_nf}
-      #  output_dim: ${model.D}
+      charge_head:
+        input_dim: ${model.egnn.out_node_nf}
+        output_dim: ${len:${data.charge_tokens}}
+        hidden_dim: 32
 
       gmm_head:
         input_dim: ${model.egnn.out_node_nf}
@@ -99,14 +107,13 @@ heads:
         # 2. Position Attention Logits (K) -> Replaces K*D
         # 3. Variances (K * 1)
         # 4. Type Logits (K * T)
-        output_dim: ${if:${model.module.typed_gmm}, ${model.output_dim_typed}, ${model.output_dim_untyped}}
+        output_dim: ${if:${model.is_typed}, ${model.output_dim_typed}, ${model.output_dim_untyped}}
 
     graph_heads:
       net_rate_head:
         input_dim: ${model.egnn.out_node_nf}
         output_dim: 1
         hidden_dim: 32
-        aggregation: mean
 
       #gmm_head:
       #  input_dim: ${model.egnn.out_node_nf}
