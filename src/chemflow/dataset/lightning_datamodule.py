@@ -4,6 +4,7 @@ from omegaconf import DictConfig
 import hydra
 import torch
 
+from chemflow.dataset.molecule_data import MoleculeBatch
 from chemflow.flow_matching.sampling import sample_prior_graph
 from chemflow.utils import token_to_index
 
@@ -14,23 +15,27 @@ class LightningDataModule(pl.LightningDataModule):
         datasets: DictConfig,
         num_workers: DictConfig,
         batch_size: DictConfig,
-        typed_gmm: bool = True,
-        cat_prior: str = "train_distribution-sample",
-        n_atoms_strategy: str = "flexible"
+        cat_strategy: str = "uniform-sample",
+        n_atoms_strategy: str = "flexible",
+        optimal_transport: str = "equivariant",
     ):
         self.datasets = datasets
         self.num_workers = num_workers
         self.batch_size = batch_size
-        self.typed_gmm = typed_gmm
-        self.cat_prior = cat_prior
+        self.cat_strategy = cat_strategy
         self.n_atoms_strategy = n_atoms_strategy
+        self.optimal_transport = optimal_transport
 
         # Will be set via setter methods
-        self.tokens = None
+        self.atom_tokens = None
+        self.edge_tokens = None
         self.atom_type_distribution = None
         self.edge_type_distribution = None
+        self.charge_type_distribution = None
         self.n_atoms_distribution = None
-        self.mask_token = None
+        self.charge_tokens = None
+        self.atom_mask_token_index = None
+        self.edge_mask_token_index = None
 
         # will be set later
         self.train_dataset = None
@@ -41,163 +46,90 @@ class LightningDataModule(pl.LightningDataModule):
 
     def set_tokens_and_distributions(
         self,
-        tokens: list[str],
+        atom_tokens: list[str],
+        edge_tokens: list[str],
+        charge_tokens: list[str],
         atom_type_distribution: torch.Tensor,
         edge_type_distribution: torch.Tensor,
+        charge_type_distribution: torch.Tensor,
         n_atoms_distribution: torch.Tensor,
-        cat_strategy: str = "train_dataset-sample",
+        coord_std: torch.Tensor = None,
     ):
         """Set tokens and distributions after initialization."""
-        self.tokens = tokens
+        self.atom_tokens = atom_tokens
+        self.edge_tokens = edge_tokens
+        self.charge_tokens = charge_tokens
         self.atom_type_distribution = atom_type_distribution
         self.edge_type_distribution = edge_type_distribution
+        self.charge_type_distribution = charge_type_distribution
         self.n_atoms_distribution = n_atoms_distribution
-        self.mask_token = token_to_index(self.tokens, "<MASK>")
-        if cat_strategy == "uniform-sample":
-            self.atom_type_distribution = torch.ones_like(self.atom_type_distribution)
-            self.atom_type_distribution[self.mask_token] = 0.0
-            self.atom_type_distribution[token_to_index(self.tokens), "<DEATH>"] = 0.0
-            self.edge_type_distribution = torch.ones_like(self.edge_type_distribution)
-        elif cat_strategy == "mask":
-            self.atom_type_distribution = torch.zeros_like(self.atom_type_distribution)
-            self.atom_type_distribution[self.mask_token] = 1.0
-            # what about edges?
 
+        if self.n_atoms_strategy != "fixed":
+            self.death_token_index = token_to_index(self.atom_tokens, "<DEATH>")
+
+            if self.cat_strategy == "uniform-sample":
+                # We never want to sample a death token
+                self.atom_type_distribution[self.death_token_index] = 0.0
+
+        elif self.cat_strategy == "mask":
+            self.atom_mask_token_index = token_to_index(self.atom_tokens, "<MASK>")
+            self.edge_mask_token_index = token_to_index(self.edge_tokens, "<MASK>")
+
+            self.atom_type_distribution = torch.zeros_like(self.atom_type_distribution)
+            # always sample a mask token
+            self.atom_type_distribution[self.atom_mask_token_index] = 1.0
+
+            self.edge_type_distribution = torch.zeros_like(self.edge_type_distribution)
+            # always sample a mask token
+            self.edge_type_distribution[self.edge_mask_token_index] = 1.0
+
+        self.coord_std = coord_std if coord_std is not None else None
 
     def setup(self, stage=None):
         """Construct datasets and assign data scalers."""
         # Check that tokens and distributions are set
-        if self.tokens is None:
+        if self.atom_tokens is None:
             raise ValueError(
-                "tokens and distributions must be set before calling setup(). "
+                "atom_tokens and distributions must be set before calling setup(). "
                 "Call set_tokens_and_distributions() first."
             )
 
         # Inject tokens and distributions into dataset configs
         train_cfg = self.datasets.train.copy()
+        train_cfg.coord_std = self.coord_std
         self.train_dataset = hydra.utils.instantiate(train_cfg)
 
         self.val_datasets = []
         for dataset_cfg in self.datasets.val:
             val_cfg = dataset_cfg.copy()
+            val_cfg.coord_std = self.coord_std
             self.val_datasets.append(hydra.utils.instantiate(val_cfg))
 
         self.test_datasets = []
         for dataset_cfg in self.datasets.test:
             test_cfg = dataset_cfg.copy()
+            test_cfg.coord_std = self.coord_std
             self.test_datasets.append(hydra.utils.instantiate(test_cfg))
-
-    def collate_graphs(self, graph_dicts: list[dict]):
-        """
-        Collate function for graph datasets.
-        Each item in batch is a dictionary with keys: atom_feats, coord, edge_index,
-        and optionally edge_attr and graph_attr.
-        Returns a batched graph with proper node and edge indexing.
-        """
-        # Extract required components
-        atom_types_list = [item["atom_types"] for item in graph_dicts]
-        coord_list = [item["coord"] for item in graph_dicts]
-        edge_types_list = [item["edge_types"] for item in graph_dicts]
-
-        # Check if optional components exist in the first item
-        has_edge_attr = (
-            "edge_attr" in graph_dicts[0] and graph_dicts[0]["edge_attr"] is not None
-        )
-        has_graph_attr = (
-            "graph_attr" in graph_dicts[0] and graph_dicts[0]["graph_attr"] is not None
-        )
-
-        # Extract optional components if they exist
-        edge_attr_list = (
-            [item.get("edge_attr") for item in graph_dicts] if has_edge_attr else None
-        )
-        graph_attr_list = (
-            [item.get("graph_attr") for item in graph_dicts] if has_graph_attr else None
-        )
-
-        # Calculate node counts for batch indexing
-        N_atoms = torch.tensor([feats.size(0) for feats in atom_types_list])
-
-        # Concatenate node features, coordinates, and edge types
-        batched_atom_types = torch.cat(atom_types_list, dim=0)
-        batched_coord = torch.cat(coord_list, dim=0)
-        batched_edge_types = torch.cat(edge_types_list, dim=0)
-
-        # Handle optional edge attributes
-        if has_edge_attr and edge_attr_list[0] is not None:
-            batched_edge_attr = torch.cat(edge_attr_list, dim=0)
-        else:
-            batched_edge_attr = None
-
-        # Handle optional graph attributes
-        if has_graph_attr and graph_attr_list[0] is not None:
-            batched_graph_attr = torch.stack(graph_attr_list, dim=0)
-        else:
-            batched_graph_attr = None
-
-        # Create batch index tensor to track which nodes belong to which graph
-        batch_index = torch.cat(
-            [
-                torch.full(
-                    (N_atoms[i],), i, dtype=torch.long, device=batched_atom_types.device
-                )
-                for i in range(len(graph_dicts))
-            ]
-        )
-
-        N_triu_edges = (N_atoms**2 - N_atoms) // 2
-        edge_type_batch_index = torch.cat(
-            [
-                torch.full(
-                    (N_triu_edges[i],),
-                    i,
-                    dtype=torch.long,
-                    device=batched_edge_types.device,
-                )
-                for i in range(len(graph_dicts))
-            ]
-        )
-
-        # Build result dictionary with only present attributes
-        result = {
-            "atom_types": batched_atom_types,
-            "coord": batched_coord,
-            "edge_types": batched_edge_types,
-            "batch_index": batch_index,
-            "edge_type_batch_index": edge_type_batch_index,
-            "N_atoms": N_atoms,
-            "N_triu_edges": N_triu_edges,
-        }
-
-        # Add optional attributes if they exist
-        if batched_edge_attr is not None:
-            result["edge_attr"] = batched_edge_attr
-        if batched_graph_attr is not None:
-            result["graph_attr"] = batched_graph_attr
-
-        return result
 
     def collate_fn(self, batch):
         targets = batch
         if self.n_atoms_strategy == "fixed":
-            n_atoms = [target["atom_types"].shape[-1] for target in targets]
+            n_atoms = [target.num_nodes for target in targets]
         else:
             n_atoms = [None for target in targets]
-        
+
         samples = [
             sample_prior_graph(
                 self.atom_type_distribution,
                 self.edge_type_distribution,
+                self.charge_type_distribution,
                 self.n_atoms_distribution,
-                self.typed_gmm,
-                self.mask_token,
-                n_atoms=n_atoms_i
+                n_atoms=n_atoms_i,
             )
             for n_atoms_i in n_atoms
         ]
-
-        samples_batched = self.collate_graphs(samples)
-        targets_batched = self.collate_graphs(targets)
+        samples_batched = MoleculeBatch.from_data_list(samples)
+        targets_batched = MoleculeBatch.from_data_list(targets)
         return samples_batched, targets_batched
 
     def train_dataloader(self):
@@ -207,6 +139,7 @@ class LightningDataModule(pl.LightningDataModule):
             shuffle=True,
             batch_size=self.batch_size.train,
             num_workers=self.num_workers.train,
+            persistent_workers=True,
             pin_memory=True,
             drop_last=True,
             collate_fn=self.collate_fn,
@@ -220,6 +153,7 @@ class LightningDataModule(pl.LightningDataModule):
                 shuffle=False,
                 batch_size=self.batch_size.val,
                 num_workers=self.num_workers.val,
+                persistent_workers=True,
                 pin_memory=True,
                 drop_last=True,
                 collate_fn=self.collate_fn,
@@ -235,6 +169,7 @@ class LightningDataModule(pl.LightningDataModule):
                 shuffle=False,
                 batch_size=self.batch_size.test,
                 num_workers=self.num_workers.test,
+                persistent_workers=True,
                 pin_memory=True,
                 collate_fn=self.collate_fn,
             )
