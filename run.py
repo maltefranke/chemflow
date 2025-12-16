@@ -3,16 +3,13 @@ import omegaconf
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.callbacks import LearningRateMonitor
 from omegaconf import DictConfig
 from omegaconf import OmegaConf
 
-from chemflow.utils import build_callbacks, remove_token_from_distribution
+from chemflow.utils import build_callbacks
 
 OmegaConf.register_new_resolver("oc.eval", eval)
 OmegaConf.register_new_resolver("len", lambda x: len(x))
-OmegaConf.register_new_resolver("if", lambda cond, t, f: t if cond else f)
-OmegaConf.register_new_resolver("eq", lambda x, y: x == y)
 
 torch.set_float32_matmul_precision("medium")
 
@@ -25,41 +22,17 @@ def run(cfg: DictConfig):
     preprocessing = hydra.utils.instantiate(cfg.data.preprocessing)
 
     # Extract tokens and distributions from preprocessing
-    atom_tokens = preprocessing.atom_tokens
-    edge_tokens = preprocessing.edge_tokens
-    charge_tokens = preprocessing.charge_tokens
+    tokens = preprocessing.tokens
     atom_type_distribution = preprocessing.atom_type_distribution
     edge_type_distribution = preprocessing.edge_type_distribution
-    charge_type_distribution = preprocessing.charge_type_distribution
     n_atoms_distribution = preprocessing.n_atoms_distribution
     coordinate_std = preprocessing.coordinate_std
 
-    if cfg.data.cat_strategy != "mask":
-        # remove <MASK> token from the atom_type_distribution and edge_type_distribution
-        atom_tokens, atom_type_distribution = remove_token_from_distribution(
-            atom_tokens, atom_type_distribution, "<MASK>"
-        )
-        edge_tokens, edge_type_distribution = remove_token_from_distribution(
-            edge_tokens, edge_type_distribution, "<MASK>"
-        )
-    if cfg.data.n_atoms_strategy == "fixed":
-        # remove <DEATH> token from the n_atoms_distribution
-        atom_tokens, atom_type_distribution = remove_token_from_distribution(
-            atom_tokens, atom_type_distribution, "<DEATH>"
-        )
-
-    # update the configs such that model parameters are updated correctly
-    OmegaConf.update(cfg.data, "atom_tokens", atom_tokens)
-    OmegaConf.update(cfg.data, "edge_tokens", edge_tokens)
-    OmegaConf.update(cfg.data, "charge_tokens", charge_tokens)
+    OmegaConf.update(cfg.data, "tokens", tokens)
 
     hydra.utils.log.info(
-        f"Preprocessing complete.\n"
-        f"Found {len(atom_tokens)} atom tokens: {atom_tokens}\n"
-        f"Found {len(edge_tokens)} edge tokens: {edge_tokens}\n"
-        f"Found {len(charge_tokens)} charge tokens: {charge_tokens}"
+        f"Preprocessing complete. Found {len(tokens)} tokens: {tokens}"
     )
-
     hydra.utils.log.info("Distributions computed from training dataset.")
 
     # Instantiate datamodule
@@ -70,14 +43,10 @@ def run(cfg: DictConfig):
     )
     # Set tokens and distributions after initialization
     datamodule.set_tokens_and_distributions(
-        atom_tokens=atom_tokens,
-        edge_tokens=edge_tokens,
-        charge_tokens=charge_tokens,
+        tokens=tokens,
         atom_type_distribution=atom_type_distribution,
         edge_type_distribution=edge_type_distribution,
-        charge_type_distribution=charge_type_distribution,
         n_atoms_distribution=n_atoms_distribution,
-        coord_std=coordinate_std,
     )
     # Call setup to create datasets with tokens and distributions
     datamodule.setup()
@@ -90,21 +59,15 @@ def run(cfg: DictConfig):
     )
     # Set tokens and distribution after initialization
     module.set_tokens_and_distribution(
-        atom_tokens=atom_tokens,
-        edge_tokens=edge_tokens,
-        charge_tokens=charge_tokens,
+        tokens=tokens,
         atom_type_distribution=atom_type_distribution,
-        edge_type_distribution=edge_type_distribution,
-        charge_type_distribution=charge_type_distribution,
+        coordinate_std=coordinate_std,
     )
-    # module.compile()
 
     # Setup logging and callbacks
     wandb_logger = WandbLogger(**cfg.logging)
     callbacks = build_callbacks(cfg)
-    lr_monitor = LearningRateMonitor(logging_interval="step")
 
-    callbacks.append(lr_monitor)
     # Instantiate trainer
     trainer = pl.Trainer(
         logger=wandb_logger,

@@ -157,6 +157,3 @@ configs/local/default.yaml
 
 outputs/
 logs/
-data/
-*.ipynb
-*.sdf

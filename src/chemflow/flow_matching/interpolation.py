@@ -2,95 +2,25 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from torch_geometric.utils import to_dense_adj
-from torch_geometric.data import Batch
-
 from chemflow.flow_matching.gmm import interpolate_gmm, interpolate_typed_gmm
 from chemflow.flow_matching.sampling import sample_births, sample_deaths
 from chemflow.flow_matching.assignment import assign_targets_batched
-from chemflow.utils import token_to_index, build_fully_connected_edge_index
+from chemflow.utils import token_to_index
 from external_code.egnn import unsorted_segment_mean
-
-from chemflow.dataset.molecule_data import (
-    PointCloud,
-    MoleculeData,
-    MoleculeBatch,
-    join_molecules,
-)
-from chemflow.flow_matching.sampling import sample_prior_graph
 
 
 class Interpolator:
-    def __init__(
-        self,
-        atom_tokens,
-        edge_tokens,
-        charge_tokens,
-        atom_type_distribution,
-        edge_type_distribution,
-        cat_strategy="uniform-sample",
-        n_atoms_strategy="flexible",
-        N_samples=20,
-    ):
-        self.atom_tokens = atom_tokens
-        self.edge_tokens = edge_tokens
-        self.charge_tokens = charge_tokens
-        self.cat_strategy = cat_strategy
-        self.n_atoms_strategy = n_atoms_strategy
+    def __init__(self, tokens, atom_type_distribution, typed_gmm=True, N_samples=20):
+        self.tokens = tokens
+        self.typed_gmm = typed_gmm
         self.N_samples = N_samples
 
-        if self.n_atoms_strategy != "fixed":
-            self.atom_death_token = token_to_index(self.atom_tokens, "<DEATH>")
-        if self.cat_strategy == "mask":
-            self.atom_mask_token = token_to_index(self.atom_tokens, "<MASK>")
-            self.edge_mask_token = token_to_index(self.edge_tokens, "<MASK>")
+        self.mask_token = token_to_index(self.tokens, "<MASK>")
+        self.death_token = token_to_index(self.tokens, "<DEATH>")
 
         self.atom_type_distribution = atom_type_distribution
-        self.edge_type_distribution = edge_type_distribution
 
-        # TODO I'm lazy and this will always be 3
-        self.D = 3
-        self.M = len(atom_type_distribution)
-        self.E = len(edge_type_distribution)
-        self.C = len(charge_tokens)
-
-    def interpolate_mols(self, m_0: MoleculeData, m_1: MoleculeData, t):
-        """
-        Interpolates between two molecules.
-
-        Args:
-            m0: MoleculeData at time 0
-            m1: MoleculeData at time 1
-            t: float, interpolation time in [0, 1]
-        Returns:
-            m_t: MoleculeData at time t
-        """
-        x_0, a_0, c_0, e_0, edge_index_0 = m_0.unpack()
-        x_1, a_1, c_1, e_1, edge_index_1 = m_1.unpack()
-
-        x_t = self.interpolate_continuous(x_0, x_1, t)
-        a_t = self.interpolate_discrete(a_0, a_1, t)
-        c_t = self.interpolate_discrete(c_0, c_1, t)
-
-        # e_0 and e_1 can be different sizes. Need to convert to dense adjacency matrices.
-        # Then interpolate the dense adjacency matrices.
-        # Then convert back to sparse adjacency matrices.
-        e_0_dense = to_dense_adj(edge_index_0, edge_attr=e_0)
-        e_1_dense = to_dense_adj(edge_index_1, edge_attr=e_1)
-
-        _, N, N = e_0_dense.shape
-        e_t_dense = self.interpolate_discrete(
-            e_0_dense.flatten(), e_1_dense.flatten(), t
-        )
-        e_t_dense = e_t_dense.view(N, N)
-
-        # NOTE assuming fully connected graph for now
-        edge_index_t = build_fully_connected_edge_index(N, device=x_t.device)
-
-        e_t = e_t_dense[edge_index_t[0], edge_index_t[1]]
-        return MoleculeData(x=x_t, a=a_t, e=e_t, edge_index=edge_index_t, c=c_t)
-
-    def interpolate_continuous(self, x0, x1, t):
+    def interpolate_x(self, x0, x1, t):
         """
         Continuous interpolation for continuous variables.
 
@@ -103,303 +33,396 @@ class Interpolator:
         """
         return x0 * (1 - t) + x1 * t
 
-    def interpolate_discrete(self, c0_idx, c1_idx, t):
+    def interpolate_c(self, c0, c1, t):
         """
         Discrete interpolation for discrete variables / one-hot classes c.
 
         Args:
-            c0_idx: (N,) class indices tensor at time 0
-            c1_idx: (N,) class indices tensor at time 1
+            c0: (N, M) one-hot tensor at time 0
+            c1: (N, M) one-hot tensor at time 1
             t: float, interpolation time in [0, 1]
         Returns:
-            y_t: (N, ) interpolated class indices tensor at time t
+            y_t: (N, M) interpolated one-hot tensor at time t
         """
 
-        N = c0_idx.shape[0]
+        N, M = c0.shape
+        # Convert one-hot to integer indices
+        c0_idx = torch.argmax(c0, dim=-1)
+        c1_idx = torch.argmax(c1, dim=-1)
 
         # Sample Bernoulli mask for which positions to keep from y0
         mask = torch.rand(N, device=t.device) > t  # True = keep from y0
         mask = mask.view(N)
 
         # Start from y1 and overwrite with y0 where mask=True
-        ct_idx = c1_idx.clone()
-        ct_idx[mask] = c0_idx[mask]
+        c1_idx[mask] = c0_idx[mask]
 
-        return ct_idx
+        # Convert back to one-hot
+        ct = F.one_hot(c1_idx, M)
+
+        return ct
 
     def interpolate_different_size(
-        self, samples_batched, targets_batched, t, optimal_transport="equivariant"
+        self,
+        x0,
+        c0,
+        x0_batch_id,
+        x1,
+        c1,
+        x1_batch_id,
+        t,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
         """
         Interpolates between x0 and x1, and c0 and c1 for graphs with flexible sizes using batch_id.
         Handles matched nodes, death processes (unmatched x0), and birth processes.
 
         Args:
-            samples_batched (Batch): Batch of samples
-            targets_batched (Batch): Batch of targets
+            x0: Shape (N_total, D) - concatenated nodes from all graphs
+            c0: Shape (N_total, M+1) - concatenated types from all graphs
+            x0_batch_id: Shape (N_total,) - batch assignment for each x0 node
+            x1: Shape (M_total, D) - concatenated nodes from all graphs
+            c1: Shape (M_total, M+1) - concatenated types from all graphs
+            x1_batch_id: Shape (M_total,) - batch assignment for each x1 node
             t: Shape (num_graphs,) or scalar - time parameter for each graph
-            optimal_transport (str): Optimal transport strategy
 
         Returns:
             tuple: A tuple of:
-            - mols_t: MoleculeBatch of interpolated molecules
+            - xt: Shape (K_total, D) - interpolated positions, concatenated
+            - ct: Shape (K_total, M+1) - interpolated types, concatenated
+            - xt_batch_id: Shape (K_total,) - batch assignment for each interpolated node
             - targets: Dictionary containing the following keys:
-                - mols_1: MoleculeBatch of target molecules
+                - target_vf: Shape (K_total, D) - velocity field targets
+                - target_cvf: Shape (K_total, M+1) - velocity field targets for types
                 - birth_rate_target: Shape (num_graphs, 1) - birth rate targets
                 - death_rate_target: Shape (num_graphs, 1) - death rate targets
-                - atoms_to_birth: PointCloud of atoms to birth
+                - birth_locations: Shape (num_graphs, D) - GMM samples
+                - birth_types: Shape (num_graphs, M) - GMM samples for types
+                - birth_locations_batch_ids: Shape (num_graphs, N_samples) - batch ids for GMM samples
         """
-        device = samples_batched.x.device
+        D = x0.shape[-1]  # dimension of the data
+        M = len(self.tokens)  # number of classes
 
         # 1. Assign targets
-        matched_samples, matched_targets, unmatched_samples, unmatched_targets = (
-            assign_targets_batched(samples_batched, targets_batched, optimal_transport)
+        assigned_targets = assign_targets_batched(
+            x0, c0, x0_batch_id, x1, c1, x1_batch_id
         )
+
+        matched_x0, matched_x1 = assigned_targets["matched"]["x"]
+        matched_c0, matched_c1 = assigned_targets["matched"]["c"]
+
+        unmatched_x0, unmatched_x1 = assigned_targets["unmatched"]["x"]
+        unmatched_c0, unmatched_c1 = assigned_targets["unmatched"]["c"]
 
         # 2.1 Interpolate the matched targets
-        matched_m_t = [
-            self.interpolate_mols(m_0, m_1, t_i)
-            for m_0, m_1, t_i in zip(matched_samples, matched_targets, t)
+        matched_xt = [
+            self.interpolate_x(matched_x0_i, matched_x1_i, t_i)
+            for matched_x0_i, matched_x1_i, t_i in zip(matched_x0, matched_x1, t)
+        ]
+        matched_ct = [
+            self.interpolate_c(matched_c0_i, matched_c1_i, t_i)
+            for matched_c0_i, matched_c1_i, t_i in zip(matched_c0, matched_c1, t)
         ]
 
-        matched_m_1 = []
-        # for the targets, adjust the edges to be fully connected w/o self-loops
-        for matched_target in matched_targets:
-            matched_m_1_i = matched_target.clone()
-
-            edge_index_1 = matched_m_1_i.edge_index
-            e_1 = matched_m_1_i.e
-            e_1_dense = to_dense_adj(edge_index_1, edge_attr=e_1)[0]
-
-            # NOTE assuming fully connected graph for now
-            edge_index_1 = build_fully_connected_edge_index(
-                matched_m_1_i.num_nodes, device=device
-            )
-
-            e_1 = e_1_dense[edge_index_1[0], edge_index_1[1]]
-            matched_m_1_i.e = e_1
-            matched_m_1_i.edge_index = edge_index_1
-            matched_m_1.append(matched_m_1_i)
-
+        matched_vf = [
+            matched_x1_i - matched_x0_i
+            for matched_x0_i, matched_x1_i in zip(matched_x0, matched_x1)
+        ]
+        matched_cvf = [
+            F.one_hot(torch.argmax(c1_i, dim=-1), num_classes=M) for c1_i in matched_c1
+        ]
         # 2.2 Handle unmatched samples / targets
-        death_atoms_t = []
-        death_atoms_1 = []
+        death_xt = []
+        death_x1 = []
+        death_vf = []
+        death_ct = []
+        death_cvf = []
         death_rate_target = []
 
-        born_atoms_t = []
-        born_atoms_1 = []
+        birth_xt = []
+        birth_x1 = []
+        birth_vf = []
+        birth_ct = []
+        birth_cvf = []
         birth_rate_target = []
-        atoms_to_birth = []
+        birth_locations = []
+        birth_types = []
 
-        empty_x = torch.empty((0, self.D), device=device, dtype=torch.float32)
-        empty_a = torch.empty((0), device=device, dtype=torch.long)
-        empty_c = torch.empty((0), device=device, dtype=torch.long)
-        empty_e = torch.empty((0), device=device, dtype=torch.long)
-        empty_edge_index = torch.empty((2, 0), device=device, dtype=torch.long)
-
-        empty_mol = MoleculeData(
-            x=empty_x, a=empty_a, e=empty_e, edge_index=empty_edge_index, c=empty_c
-        )
-        empty_point_cloud = PointCloud(x=empty_x, a=empty_a, c=empty_c)
+        empty_x = torch.empty((0, D), device=x0.device, dtype=x0.dtype)
+        empty_c = torch.empty((0, M), device=x0.device, dtype=x0.dtype)
 
         # create a sink state that all unmatched x0 will move towards
-        x_sink = torch.zeros((1, self.D), device=device)
+        x_sink = torch.zeros((1, D), device=x0.device)
 
         for index, (
-            unmatched_sample_i,
-            unmatched_target_i,
+            unmatched_x0_i,
+            unmatched_c0_i,
+            unmatched_x1_i,
+            unmatched_c1_i,
             t_i,
-        ) in enumerate(
-            zip(
-                unmatched_samples,
-                unmatched_targets,
-                t,
-            )
-        ):
+        ) in enumerate(zip(unmatched_x0, unmatched_c0, unmatched_x1, unmatched_c1, t)):
             instantaneous_rate = 1 / torch.clamp(1 - t_i, min=1e-8)
 
             # 2.3 Death process
-            if unmatched_sample_i.num_nodes > 0:
+            if unmatched_x0_i.shape[0] > 0:
                 # sample death times
-                death_times, is_dead, x0_alive_at_xt, a0_alive_at_xt = sample_deaths(
-                    unmatched_sample_i.x, unmatched_sample_i.a, t_i
+                death_times, is_dead, x0_alive_at_xt, c0_alive_at_xt = sample_deaths(
+                    unmatched_x0_i, unmatched_c0_i, t_i
                 )
 
                 # interpolate the unmatched x0 to the sink state
                 death_xt_i = self.interpolate_x(x0_alive_at_xt, x_sink, t_i)
 
-                death_a1_i = self.death_token * torch.ones(
+                death_c1_i = self.death_token * torch.ones(
                     (death_xt_i.shape[0],), dtype=torch.long, device=death_xt_i.device
                 )
-                death_a1_i = F.one_hot(death_a1_i, num_classes=len(self.atom_tokens))
-                death_at_i = self.interpolate_classes(a0_alive_at_xt, death_a1_i, t_i)
+                death_c1_i = F.one_hot(death_c1_i, num_classes=len(self.tokens))
+                death_ct_i = self.interpolate_c(c0_alive_at_xt, death_c1_i, t_i)
 
                 # Global death rate is now the actual number of nodes to remove in this batch item
                 N_necessary_deaths = x0_alive_at_xt.shape[0]
                 death_rate_target_i = N_necessary_deaths * instantaneous_rate
 
-                # create edge type targets as null
-                e_targets_i = matched_et[index] + torch.zeros(
-                    (matched_et[index].shape[0] + N_necessary_deaths, self.E),
-                    device=x0.device,
-                )
-
                 death_xt.append(death_xt_i)
                 death_x1.append(x_sink.repeat(death_xt_i.shape[0], 1))
                 death_vf.append(x_sink.repeat(death_xt_i.shape[0], 1) - x0_alive_at_xt)
 
-                death_at.append(death_at_i)
-                death_avf.append(death_a1_i)
+                death_ct.append(death_ct_i)
+                death_cvf.append(death_c1_i)
                 death_rate_target.append(death_rate_target_i.view(1, 1))
 
-                born_atoms_t.append(empty_mol.clone())
-                born_atoms_1.append(empty_mol.clone())
+                birth_xt.append(empty_x)
+                birth_x1.append(empty_x)
+                birth_vf.append(empty_x)
 
-                birth_rate_target.append(torch.zeros((1, 1), device=device))
-                atoms_to_birth.append(empty_point_cloud.clone())
+                birth_ct.append(empty_c)
+                birth_cvf.append(empty_c)
+
+                birth_rate_target.append(torch.zeros((1, 1), device=x0.device))
+                # birth_locations.append(-1e3 * torch.ones((1, D), device=x0.device))
+                # birth_types.append(-1e3 * torch.ones((1), device=x0.device))
+                birth_locations.append(empty_x)
+                birth_types.append(torch.zeros((0), device=x0.device))
 
             # 2.4 Birth process
-            elif unmatched_target_i.num_nodes > 0:
+            elif unmatched_x1_i.shape[0] > 0:
                 # sample birth times and locations
                 (
                     birth_times,
-                    born_atoms_1_i,
-                    unborn_atoms_1_i,
-                ) = sample_births(
-                    unmatched_target_i,
-                    t_i,
-                )
+                    birth_xt_i,
+                    birth_x1_i,
+                    birth_c1_i,
+                    unborn_x1_i,
+                    unborn_c1_i,
+                ) = sample_births(unmatched_x1_i, unmatched_c1_i, t_i, sigma=0.5)
 
                 # check if any births are happening
-                if born_atoms_1_i.num_nodes > 0:
-                    raise ValueError("Not implemented")
-                    # sample prior graph for born nodes randomly
-                    born_atoms_0_i = sample_prior_graph(
-                        self.atom_type_distribution,
-                        self.edge_type_distribution,
-                        self.charge_type_distribution,
-                        self.n_atoms_distribution,
-                        n_atoms=born_atoms_1_i.num_nodes,
+                if birth_xt_i.shape[0] > 0:
+                    # interpolate the birth locations to the birth times
+                    t_birth_interpolation = (
+                        t_i.repeat(birth_times.shape[0]) - birth_times
+                    ).unsqueeze(-1)
+
+                    birth_xt_i = self.interpolate_x(
+                        birth_xt_i,
+                        birth_x1_i,
+                        t_birth_interpolation,
                     )
 
-                    # do another matching between 0 and 1 for born nodes
-                    (
-                        born_atoms_0_i,
-                        born_atoms_1_i,
-                        _,
-                        _,
-                    ) = assign_targets_batched(
-                        born_atoms_0_i, born_atoms_1_i, optimal_transport
+                    if self.typed_gmm:
+                        # use atom distribution (e.g. empirical distribution) for birth types
+                        birth_c0_i = self.atom_type_distribution.unsqueeze(0).to(
+                            x0.device
+                        )
+                        birth_c0_i = birth_c0_i.repeat(birth_xt_i.shape[0], 1)
+                        birth_ct_i = self.interpolate_c(
+                            birth_c0_i,
+                            birth_c1_i,
+                            t_birth_interpolation.view(-1),
+                        )
+                    else:
+                        # use mask token for birth types
+                        birth_c0_i = self.mask_token * torch.ones(
+                            (birth_xt_i.shape[0],),
+                            dtype=torch.long,
+                            device=birth_xt_i.device,
+                        )
+                        birth_c0_i = F.one_hot(birth_c0_i, num_classes=len(self.tokens))
+
+                        birth_ct_i = self.interpolate_c(
+                            birth_c0_i,
+                            birth_c1_i,
+                            t_birth_interpolation.view(-1),
+                        )
+                    # sample birth types from atom type distribution
+                    birth_ct_distr = torch.distributions.Categorical(
+                        probs=self.atom_type_distribution
                     )
+                    birth_ct_i = birth_ct_distr.sample((birth_xt_i.shape[0],))
+                    birth_ct_i = F.one_hot(birth_ct_i, num_classes=len(self.tokens))
+                    birth_ct_i = birth_ct_i.to(x0.device)
 
-                    born_atoms_t_i = [
-                        self.interpolate_mols(m_0, m_1, t_i)
-                        for m_0, m_1, t_i in zip(born_atoms_0_i, born_atoms_1_i, t_i)
-                    ]
+                    birth_xt.append(birth_xt_i)
+                    birth_x1.append(birth_x1_i)
+                    birth_vf.append((birth_x1_i - birth_xt_i) * instantaneous_rate)
 
-                    born_atoms_t.append(born_atoms_t_i)
-                    born_atoms_1.append(born_atoms_1_i)
+                    birth_ct.append(birth_ct_i)
+                    birth_cvf.append(birth_c1_i)
 
                 else:
                     # no birth was sampled
-                    born_atoms_t.append(empty_mol.clone())
-                    born_atoms_1.append(empty_mol.clone())
+                    birth_xt.append(empty_x)
+                    birth_x1.append(empty_x)
+                    birth_vf.append(empty_x)
 
-                death_atoms_t.append(empty_mol.clone())
-                death_atoms_1.append(empty_mol.clone())
-                death_rate_target.append(torch.zeros((1, 1), device=device))
+                    birth_ct.append(empty_c)
+                    birth_cvf.append(empty_c)
 
-                N_necessary_births = unborn_atoms_1_i.num_nodes
+                death_xt.append(empty_x)
+                death_x1.append(empty_x)
+                death_vf.append(empty_x)
+
+                death_ct.append(empty_c)
+                death_cvf.append(empty_c)
+                death_rate_target.append(torch.zeros((1, 1), device=x0.device))
+
+                N_necessary_births = unmatched_x1_i.shape[0] - birth_xt_i.shape[0]
                 birth_rate_target_i = N_necessary_births * instantaneous_rate
                 birth_rate_target.append(birth_rate_target_i.view(1, 1))
 
-                # check if there are any yet unborn atoms
-                if unborn_atoms_1_i.num_nodes > 0:
+                if unborn_x1_i.shape[0] > 0:
                     # Store the GMM samples for NLL calculation during training
-                    if self.cat_strategy == "uniform-sample":
-                        p_a_0 = self.atom_type_distribution.unsqueeze(0).to(device)
-                        p_a_1 = unborn_a1_i
+                    if self.typed_gmm:
+                        p_c_0 = self.atom_type_distribution.unsqueeze(0).to(x0.device)
+                        # p_c_1 = F.one_hot(unborn_c1_i.argmax(dim=-1), num_classes=M)
+                        p_c_1 = unborn_c1_i
                         # TODO make sigma hyperparameter
-                        # TODO add charge type
-                        sampled_x, sampled_a, sampled_c = interpolate_typed_gmm(
+                        sampled_locations, sampled_types = interpolate_typed_gmm(
                             p_x_1=unborn_x1_i,
-                            p_a_0=p_a_0,
-                            p_a_1=p_a_1,
+                            p_c_0=p_c_0,
+                            p_c_1=p_c_1,
                             t=t_i,
                             num_samples=self.N_samples,
                             sigma=0.5,
                         )
                     else:
-                        sampled_x = interpolate_gmm(
+                        sampled_locations = interpolate_gmm(
                             unborn_x1_i, t_i, num_samples=self.N_samples
                         )
-                        sampled_a = self.atom_mask_token * torch.ones(
+                        sampled_types = self.mask_token * torch.ones(
                             (sampled_locations.shape[0],),
                             dtype=torch.long,
                             device=birth_xt_i.device,
                         )
-                        sampled_c = self.charge_mask_token * torch.ones(
-                            (sampled_x.shape[0],),
-                            dtype=torch.long,
-                            device=birth_xt_i.device,
-                        )
-                    atoms_to_birth.append(
-                        PointCloud(x=sampled_x, a=sampled_a, c=sampled_c)
-                    )
-
+                    birth_locations.append(sampled_locations)
+                    birth_types.append(sampled_types)
                 else:
-                    # if no unborn x1, you're done
-                    atoms_to_birth.append(empty_point_cloud.clone())
+                    # if no unborn x1, you're done, so pad with very negative numbers
+                    """birth_locations.append(
+                        -1e3 * torch.ones((1, D), device=birth_xt_i.device)
+                    )
+                    birth_types.append(-1e3 * torch.ones((1), device=birth_xt_i.device))"""
+                    birth_locations.append(empty_x)
+                    birth_types.append(torch.zeros((0), device=birth_xt_i.device))
 
             # 2.5 No birth or death process, just movement
             else:
-                death_atoms_t.append(empty_mol.clone())
-                death_atoms_1.append(empty_mol.clone())
-                death_rate_target.append(torch.zeros((1, 1), device=device))
+                death_xt.append(empty_x)
+                death_x1.append(empty_x)
+                death_vf.append(empty_x)
 
-                born_atoms_t.append(empty_mol.clone())
-                born_atoms_1.append(empty_mol.clone())
-                birth_rate_target.append(torch.zeros((1, 1), device=device))
+                death_ct.append(empty_c)
+                death_cvf.append(empty_c)
+                death_rate_target.append(torch.zeros((1, 1), device=x0.device))
 
-                atoms_to_birth.append(empty_point_cloud.clone())
+                birth_xt.append(empty_x)
+                birth_x1.append(empty_x)
+                birth_vf.append(empty_x)
+
+                birth_ct.append(empty_c)
+                birth_cvf.append(empty_c)
+
+                birth_rate_target.append(torch.zeros((1, 1), device=x0.device))
+                # birth_locations.append(-1e3 * torch.ones((1, D), device=x0.device))
+                # birth_types.append(-1e3 * torch.ones((1), device=x0.device))
+                birth_locations.append(empty_x)
+                birth_types.append(torch.zeros((0), device=x0.device))
 
         # 3. Concatenate the matched, death, and birth processes
-        mols_t = [
-            join_molecules([m_t_i, b_t_i, d_t_i])
-            for m_t_i, b_t_i, d_t_i in zip(matched_m_t, born_atoms_t, death_atoms_t)
+        xt_list = [
+            torch.cat([matched_xt_i, death_xt_i, birth_xt_i], dim=0)
+            for matched_xt_i, death_xt_i, birth_xt_i in zip(
+                matched_xt, death_xt, birth_xt
+            )
         ]
-        mols_t = MoleculeBatch.from_data_list(mols_t)
+        ct_list = [
+            torch.cat([matched_ct_i, death_ct_i, birth_ct_i], dim=0)
+            for matched_ct_i, death_ct_i, birth_ct_i in zip(
+                matched_ct, death_ct, birth_ct
+            )
+        ]
 
         # 4. Concatenate the matched, death, and birth targets
-        mols_1 = [
-            join_molecules([m_1_i, b_1_i, d_1_i])
-            for m_1_i, b_1_i, d_1_i in zip(matched_m_1, born_atoms_1, death_atoms_1)
+        """target_vf_list = [
+            torch.cat([matched_vf_i, death_vf_i, birth_vf_i], dim=0)
+            for matched_vf_i, death_vf_i, birth_vf_i in zip(
+                matched_vf, death_vf, birth_vf
+            )
+        ]"""
+        target_x_list = [
+            torch.cat([matched_x1_i, death_x1_i, birth_x1_i], dim=0)
+            for matched_x1_i, death_x1_i, birth_x1_i in zip(
+                matched_x1, death_x1, birth_x1
+            )
         ]
-        mols_1 = MoleculeBatch.from_data_list(mols_1)
 
-        # TODO must add edges etc between unconnected components!!!
+        target_cvf_list = [
+            torch.cat([matched_cvf_i, death_cvf_i, birth_cvf_i], dim=0)
+            for matched_cvf_i, death_cvf_i, birth_cvf_i in zip(
+                matched_cvf, death_cvf, birth_cvf
+            )
+        ]
 
-        # remove mean of xt and target_x
-        # TODO do we need to do this? unsure, because we add / remove nodes
-        xt_mean = unsorted_segment_mean(mols_t.x, mols_t.batch, mols_t.num_graphs)
-        _ = mols_t.remove_com(xt_mean)
-        _ = mols_1.remove_com(xt_mean)
+        N_t = torch.tensor([xt.shape[0] for xt in xt_list])
+        xt_batch_id = torch.repeat_interleave(torch.arange(len(xt_list)), N_t).to(
+            x0.device
+        )
+        # concatenate and remove mean of xt
+        xt = torch.cat(xt_list, dim=0)
+        xt_mean = unsorted_segment_mean(xt, xt_batch_id, len(xt_list))
+        xt = xt - xt_mean[xt_batch_id]
 
-        # deal with samples for typed gmm
-        atoms_to_birth = Batch.from_data_list(atoms_to_birth)
-        atoms_to_birth.x = atoms_to_birth.x - xt_mean[atoms_to_birth.batch]
+        ct = torch.cat(ct_list, dim=0)
+
+        # target_vf = torch.cat(target_vf_list, dim=0)
+        target_x = torch.cat(target_x_list, dim=0)
+        target_cvf = torch.cat(target_cvf_list, dim=0)
 
         birth_rate_target = torch.cat(birth_rate_target, dim=0)
         death_rate_target = torch.cat(death_rate_target, dim=0)
 
+        # deal with samples for typed gmm
+        N_birth_samples = torch.tensor(
+            [birth_locations_i.shape[0] for birth_locations_i in birth_locations]
+        )
+        birth_locations_batch_ids = torch.repeat_interleave(
+            torch.arange(len(birth_locations)), N_birth_samples, dim=0
+        ).to(x0.device)
+
+        # remove xt_mean from birth locations
+        birth_locations = torch.cat(birth_locations, dim=0)
+        birth_locations = birth_locations - xt_mean[birth_locations_batch_ids]
+
+        birth_types = torch.cat(birth_types, dim=0)
+
         targets = {
-            # positions, atom types, charge types, edge types
-            "mols_1": mols_1,
-            # rate targets
+            "target_x": target_x,
+            "target_c": target_cvf,
             "birth_rate_target": birth_rate_target,
             "death_rate_target": death_rate_target,
             # targets for gmm
-            "atoms_to_birth": atoms_to_birth,
+            "birth_locations": birth_locations,
+            "birth_types": birth_types,
+            "birth_batch_ids": birth_locations_batch_ids,
         }
 
-        return mols_t, targets
+        return (xt, ct, xt_batch_id, targets)

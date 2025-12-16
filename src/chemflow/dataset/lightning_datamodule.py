@@ -4,7 +4,6 @@ from omegaconf import DictConfig
 import hydra
 import torch
 
-from chemflow.dataset.molecule_data import MoleculeBatch
 from chemflow.flow_matching.sampling import sample_prior_graph
 from chemflow.utils import token_to_index
 
@@ -15,25 +14,22 @@ class LightningDataModule(pl.LightningDataModule):
         datasets: DictConfig,
         num_workers: DictConfig,
         batch_size: DictConfig,
-        cat_strategy: str = "uniform-sample",
-        n_atoms_strategy: str = "flexible",
-        optimal_transport: str = "equivariant",
+        typed_gmm: bool = True,
+        cat_prior: str = "train_distribution-sample",
+        n_atoms_strategy: str = "flexible"
     ):
         self.datasets = datasets
         self.num_workers = num_workers
         self.batch_size = batch_size
-        self.cat_strategy = cat_strategy
+        self.typed_gmm = typed_gmm
+        self.cat_prior = cat_prior
         self.n_atoms_strategy = n_atoms_strategy
-        self.optimal_transport = optimal_transport
 
         # Will be set via setter methods
-        self.atom_tokens = None
-        self.edge_tokens = None
+        self.tokens = None
         self.atom_type_distribution = None
         self.edge_type_distribution = None
-        self.charge_type_distribution = None
         self.n_atoms_distribution = None
-        self.charge_tokens = None
         self.mask_token = None
 
         # will be set later
@@ -45,72 +41,50 @@ class LightningDataModule(pl.LightningDataModule):
 
     def set_tokens_and_distributions(
         self,
-        atom_tokens: list[str],
-        edge_tokens: list[str],
-        charge_tokens: list[str],
+        tokens: list[str],
         atom_type_distribution: torch.Tensor,
         edge_type_distribution: torch.Tensor,
-        charge_type_distribution: torch.Tensor,
         n_atoms_distribution: torch.Tensor,
-        cat_strategy: str = "uniform-sample",
-        coord_std: torch.Tensor = None,
+        cat_strategy: str = "train_dataset-sample",
     ):
         """Set tokens and distributions after initialization."""
-        self.atom_tokens = atom_tokens
-        self.edge_tokens = edge_tokens
-        self.charge_tokens = charge_tokens
+        self.tokens = tokens
         self.atom_type_distribution = atom_type_distribution
         self.edge_type_distribution = edge_type_distribution
-        self.charge_type_distribution = charge_type_distribution
         self.n_atoms_distribution = n_atoms_distribution
-        self.mask_token_index = token_to_index(self.atom_tokens, "<MASK>")
-        self.death_token_index = token_to_index(self.atom_tokens, "<DEATH>")
-        self.edge_mask_token_index = token_to_index(self.edge_tokens, "<MASK>")
-
+        self.mask_token = token_to_index(self.tokens, "<MASK>")
         if cat_strategy == "uniform-sample":
-            # TODO MALTE: I believe this is not correct.
-            # it should keep the distribution of the training data
-            # Therefore i commented it out
-            # self.atom_type_distribution = torch.ones_like(self.atom_type_distribution)
-            self.atom_type_distribution[self.mask_token_index] = 0.0
-            self.atom_type_distribution[self.death_token_index] = 0.0
-
-            self.edge_type_distribution[self.edge_mask_token_index] = 0.0
-
+            self.atom_type_distribution = torch.ones_like(self.atom_type_distribution)
+            self.atom_type_distribution[self.mask_token] = 0.0
+            self.atom_type_distribution[token_to_index(self.tokens), "<DEATH>"] = 0.0
+            self.edge_type_distribution = torch.ones_like(self.edge_type_distribution)
         elif cat_strategy == "mask":
             self.atom_type_distribution = torch.zeros_like(self.atom_type_distribution)
-            self.atom_type_distribution[self.mask_token_index] = 1.0
-
+            self.atom_type_distribution[self.mask_token] = 1.0
             # what about edges?
-            self.edge_type_distribution = torch.zeros_like(self.edge_type_distribution)
-            self.edge_type_distribution[self.edge_mask_token_index] = 1.0
 
-        self.coord_std = coord_std if coord_std is not None else None
 
     def setup(self, stage=None):
         """Construct datasets and assign data scalers."""
         # Check that tokens and distributions are set
-        if self.atom_tokens is None:
+        if self.tokens is None:
             raise ValueError(
-                "atom_tokens and distributions must be set before calling setup(). "
+                "tokens and distributions must be set before calling setup(). "
                 "Call set_tokens_and_distributions() first."
             )
 
         # Inject tokens and distributions into dataset configs
         train_cfg = self.datasets.train.copy()
-        train_cfg.coord_std = self.coord_std
         self.train_dataset = hydra.utils.instantiate(train_cfg)
 
         self.val_datasets = []
         for dataset_cfg in self.datasets.val:
             val_cfg = dataset_cfg.copy()
-            val_cfg.coord_std = self.coord_std
             self.val_datasets.append(hydra.utils.instantiate(val_cfg))
 
         self.test_datasets = []
         for dataset_cfg in self.datasets.test:
             test_cfg = dataset_cfg.copy()
-            test_cfg.coord_std = self.coord_std
             self.test_datasets.append(hydra.utils.instantiate(test_cfg))
 
     def collate_graphs(self, graph_dicts: list[dict]):
@@ -122,7 +96,6 @@ class LightningDataModule(pl.LightningDataModule):
         """
         # Extract required components
         atom_types_list = [item["atom_types"] for item in graph_dicts]
-        charges_list = [item["charges"] for item in graph_dicts]
         coord_list = [item["coord"] for item in graph_dicts]
         edge_types_list = [item["edge_types"] for item in graph_dicts]
 
@@ -147,10 +120,8 @@ class LightningDataModule(pl.LightningDataModule):
 
         # Concatenate node features, coordinates, and edge types
         batched_atom_types = torch.cat(atom_types_list, dim=0)
-        batched_charges = torch.cat(charges_list, dim=0)
         batched_coord = torch.cat(coord_list, dim=0)
-        # batched_edge_types = torch.cat(edge_types_list, dim=0)
-        batched_edge_types = torch.block_diag(*edge_types_list)
+        batched_edge_types = torch.cat(edge_types_list, dim=0)
 
         # Handle optional edge attributes
         if has_edge_attr and edge_attr_list[0] is not None:
@@ -174,7 +145,7 @@ class LightningDataModule(pl.LightningDataModule):
             ]
         )
 
-        """N_triu_edges = (N_atoms**2 - N_atoms) // 2
+        N_triu_edges = (N_atoms**2 - N_atoms) // 2
         edge_type_batch_index = torch.cat(
             [
                 torch.full(
@@ -185,18 +156,17 @@ class LightningDataModule(pl.LightningDataModule):
                 )
                 for i in range(len(graph_dicts))
             ]
-        )"""
+        )
 
         # Build result dictionary with only present attributes
         result = {
             "atom_types": batched_atom_types,
-            "charges": batched_charges,
             "coord": batched_coord,
             "edge_types": batched_edge_types,
             "batch_index": batch_index,
-            # "edge_type_batch_index": edge_type_batch_index,
+            "edge_type_batch_index": edge_type_batch_index,
             "N_atoms": N_atoms,
-            # "N_triu_edges": N_triu_edges,
+            "N_triu_edges": N_triu_edges,
         }
 
         # Add optional attributes if they exist
@@ -210,23 +180,24 @@ class LightningDataModule(pl.LightningDataModule):
     def collate_fn(self, batch):
         targets = batch
         if self.n_atoms_strategy == "fixed":
-            # n_atoms = [target["atom_types"].shape[-1] for target in targets]
-            n_atoms = [target.num_nodes for target in targets]
+            n_atoms = [target["atom_types"].shape[-1] for target in targets]
         else:
             n_atoms = [None for target in targets]
-
+        
         samples = [
             sample_prior_graph(
                 self.atom_type_distribution,
                 self.edge_type_distribution,
-                self.charge_type_distribution,
                 self.n_atoms_distribution,
-                n_atoms=n_atoms_i,
+                self.typed_gmm,
+                self.mask_token,
+                n_atoms=n_atoms_i
             )
             for n_atoms_i in n_atoms
         ]
-        samples_batched = MoleculeBatch.from_data_list(samples)
-        targets_batched = MoleculeBatch.from_data_list(targets)
+
+        samples_batched = self.collate_graphs(samples)
+        targets_batched = self.collate_graphs(targets)
         return samples_batched, targets_batched
 
     def train_dataloader(self):
@@ -236,7 +207,6 @@ class LightningDataModule(pl.LightningDataModule):
             shuffle=True,
             batch_size=self.batch_size.train,
             num_workers=self.num_workers.train,
-            persistent_workers=True,
             pin_memory=True,
             drop_last=True,
             collate_fn=self.collate_fn,
@@ -250,7 +220,6 @@ class LightningDataModule(pl.LightningDataModule):
                 shuffle=False,
                 batch_size=self.batch_size.val,
                 num_workers=self.num_workers.val,
-                persistent_workers=True,
                 pin_memory=True,
                 drop_last=True,
                 collate_fn=self.collate_fn,
@@ -266,7 +235,6 @@ class LightningDataModule(pl.LightningDataModule):
                 shuffle=False,
                 batch_size=self.batch_size.test,
                 num_workers=self.num_workers.test,
-                persistent_workers=True,
                 pin_memory=True,
                 collate_fn=self.collate_fn,
             )

@@ -2,24 +2,18 @@
 
 root_path: ${oc.env:PROJECT_ROOT}/data
 preprocess_workers: 0
-atom_tokens: None 
-edge_tokens: None
-charge_tokens: None
+tokens: None 
 atom_type_distribution: None
 edge_type_distribution: None
 n_atoms_distribution: None
-
-n_atoms_strategy: "fixed"
-cat_strategy: "uniform-sample" #"mask" # "uniform-sample"
+n_atoms_strategy: fixed
 
 # Preprocessing configuration - computes tokens from data and distributions from training dataset only
 preprocessing:
   _target_: chemflow.dataset.preprocessing.Preprocessing
   root: ${data.root_path}/qm9
-  atom_tokens_path: ${data.preprocessing.root}/processed/atom_tokens.txt
-  edge_tokens_path: ${data.preprocessing.root}/processed/edge_tokens.txt
-  charge_tokens_path: ${data.preprocessing.root}/processed/charge_tokens.txt
-  distributions_path: ${data.preprocessing.root}/processed/distributions.pt
+  tokens_path: ${data.root_path}/qm9/processed/tokens.txt
+  distributions_path: ${data.root_path}/qm9/processed/distributions.pt
   # Tokens and distributions will be discovered from data and saved to files
   # On subsequent runs, they will be loaded from the files
 
@@ -32,21 +26,18 @@ datamodule:
     train:
       _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
       root: ${data.root_path}/qm9
-      atom_tokens: ${data.atom_tokens}
-      charge_tokens: ${data.charge_tokens}
+      tokens: ${data.tokens}
       
 
     val:
       - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
-        root: ${data.root_path}/qm9
-        atom_tokens: ${data.atom_tokens}
-        charge_tokens: ${data.charge_tokens}
+        root: ${data.root_path}/qm9_testing
+        tokens: ${data.tokens}
 
     test:
       - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
-        root: ${data.root_path}/qm9
-        atom_tokens: ${data.atom_tokens}
-        charge_tokens: ${data.charge_tokens}
+        root: ${data.root_path}/qm9_testing
+        tokens: ${data.tokens}
 
   num_workers:
     train: 4
@@ -55,7 +46,8 @@ datamodule:
     predict: 4
 
   batch_size:
-    train: 64
-    val: 64
-    test: 64
+    train: 256
+    val: 256
+    test: 256
   
+  typed_gmm: ${model.module.typed_gmm}
