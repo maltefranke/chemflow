@@ -7,6 +7,8 @@ from chemflow.losses import typed_gmm_loss, rate_loss
 from chemflow.losses import gmm_loss as untyped_gmm_loss
 from torch_geometric.nn import knn_graph
 
+from torch.distributions import Uniform, Distribution
+
 
 from chemflow.flow_matching.integration import Integrator
 from chemflow.utils import (
@@ -20,6 +22,8 @@ from chemflow.flow_matching.interpolation import Interpolator
 from chemflow.flow_matching.gmm import compute_equivariant_gmm
 
 from chemflow.dataset.molecule_data import MoleculeData, PointCloud, MoleculeBatch
+
+from chemflow.metrics import calc_metrics_, init_metrics
 
 
 class LightningModule(pl.LightningModule):
@@ -35,10 +39,11 @@ class LightningModule(pl.LightningModule):
         D: int = 3,
         n_atoms_strategy: str = "fixed",
         cat_strategy: str = "uniform-sample",  # "mask" or "uniform-sample"
-        type_loss_token_weights: str = "training",  # "uniform" or "training"
+        type_loss_token_weights: str = "uniform",  # "uniform" or "training"
         num_integration_steps: int = 100,
         cat_noise_level: float = 0.0,
         coord_noise_level: float = 0.0,
+        time_dist: DictConfig = None,
     ):
         super().__init__()
 
@@ -64,7 +69,16 @@ class LightningModule(pl.LightningModule):
         self.cat_noise_level = cat_noise_level
         self.num_integration_steps = num_integration_steps
         self.coord_noise_level = coord_noise_level
-        self.time_dist = torch.distributions.Uniform(0.0, 1.0)
+
+        if time_dist is None:
+            time_dist = DictConfig(
+                {
+                    "_target_": "torch.distributions.Uniform",
+                    "low": 0.0,
+                    "high": 1.0,
+                }
+            )
+        self.time_dist = hydra.utils.instantiate(time_dist)
 
         # Set default loss weights if not provided
         if loss_weights is None:
@@ -97,6 +111,8 @@ class LightningModule(pl.LightningModule):
                 }
             )
         self.optimizer_config = optimizer_config
+
+        self.metrics, self.stability_metrics = init_metrics()
 
         self.save_hyperparameters()
         self.model = hydra.utils.instantiate(model)
@@ -235,16 +251,7 @@ class LightningModule(pl.LightningModule):
             t,
         )
 
-        # TODO make choice flexible
-        # build kNN graph
-        # edge_index = knn_graph(xt, k=self.k_nn_edges, batch=xt_batch_id)
-
-        # build a fully connected graph per batch
-        # edge_index = build_fully_connected_edge_index(xt_batch_id)
-
-        # edge_type_ids = et[edge_index[0], edge_index[1]]
-
-        # random self-conditioning
+        # randomized self-conditioning with p = 0.5 during training
         is_random_self_conditioning = (torch.rand(1) > 0.5).item()
 
         preds = self.model(
@@ -388,25 +395,42 @@ class LightningModule(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        # Define the validation step logic here
-        loss = self.shared_step(batch, batch_idx)
-        # Log val_loss at epoch level for ReduceLROnPlateau scheduler
-        self.log(
-            "val_loss",
-            loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-            batch_size=batch[0].batch_size,
-        )
-        return loss
+        batched_mols = self.sample(batch, batch_idx, return_traj=False)
+
+        # List of MoleculeData objects
+        mols = batched_mols.to_data_list()
+
+        # List of RDKit molecules or None
+        rdkit_mols = [
+            mol.to_rdkit_mol(self.atom_tokens, self.edge_tokens, self.charge_tokens)
+            for mol in mols
+        ]
+        eval_metrics = calc_metrics_(rdkit_mols, self.metrics)
+        print(eval_metrics)
+
+        for key, value in eval_metrics.items():
+            self.log(
+                f"val_{key}",
+                value,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                batch_size=len(mols),
+            )
+
+        return eval_metrics
+
+        return
 
     def test_step(self, batch, batch_idx):
         # Define the test step logic here
         pass
 
     def predict_step(self, batch, batch_idx):
+        return self.sample(batch, batch_idx, return_traj=True)
+
+    def sample(self, batch, batch_idx, return_traj: bool = False):
         """
         Inference step for flow matching.
 
@@ -424,10 +448,6 @@ class LightningModule(pl.LightningModule):
                 "Call set_tokens_and_distribution() first."
             )
 
-        # For inference, we start from noise and integrate forward from t=0 to t=1
-        # For now, assume batch contains batch_size or we use a default
-        # In practice, you might want to pass initial conditions or use a prior
-
         # Get batch size from the batch (assuming it's similar to training)
         mol_t, _ = batch
 
@@ -438,11 +458,23 @@ class LightningModule(pl.LightningModule):
 
         # Time parameters
         num_steps = self.num_integration_steps
-        dt = 1.0 / num_steps
+        # TODO: make this a hyperparameter
+        strategy = "log"
         t = torch.zeros(batch_size, device=self.device)  # Start at t=0
 
-        # Hyperparameters
-        cat_noise_level = self.cat_noise_level
+        if strategy == "linear":
+            time_points = torch.linspace(0, 1, num_steps + 1).tolist()
+
+        elif strategy == "log":
+            # torch requires the log of the start and end points
+            start_log = torch.log10(torch.tensor(0.01, device=self.device))
+            end_log = torch.log10(torch.tensor(1.0, device=self.device))
+            time_points = (
+                1 - torch.logspace(start_log, end_log, num_steps + 1)
+            ).tolist()
+            time_points.reverse()
+
+        step_sizes = [t1 - t0 for t0, t1 in zip(time_points[:-1], time_points[1:])]
 
         # Trajectory storage
         mol_traj = [mol_t.clone()]
@@ -451,13 +483,7 @@ class LightningModule(pl.LightningModule):
         preds = None
 
         # Integration loop: integrate from t=0 to t=1
-        for _ in range(num_steps):
-            # TODO make choice flexible
-            # Build kNN graph
-            # edge_index = knn_graph(xt, k=self.k_nn_edges, batch=batch_id)
-            # edge_index = build_fully_connected_edge_index(batch_id)
-            # edge_type_ids = et[edge_index[0], edge_index[1]]
-
+        for step_size in step_sizes:
             # Get model predictions
             preds = self.model(
                 mol_t,
@@ -515,8 +541,8 @@ class LightningModule(pl.LightningModule):
                 birth_rate=birth_rate,
                 birth_gmm_dict=gmm_dict,
                 t=t,
-                dt=dt,
-                cat_noise_level=cat_noise_level,
+                dt=step_size,
+                cat_noise_level=self.cat_noise_level,
             )
 
             # remove mean from xt for each batch
@@ -524,21 +550,29 @@ class LightningModule(pl.LightningModule):
 
             # Update time forward
             # Number of graphs stays constant (batch_size)
-            t = t + dt
+            t = t + step_size
 
-            # Save  state to trajectory
-            mol_traj.append(mol_t.clone())
+            if torch.all(t >= 1.0):
+                # save final predicted state to trajectory
+                mol_traj.append(mol_1_pred.clone())
+            else:
+                # Save  state to trajectory
+                mol_traj.append(mol_t.clone())
 
-        # rectify the trajectory such that we get a traj for each molecule
-        traj_lists = [mol_traj_i.to_data_list() for mol_traj_i in mol_traj]
+        if return_traj:
+            # rectify the trajectory such that we get a traj for each molecule
+            traj_lists = [mol_traj_i.to_data_list() for mol_traj_i in mol_traj]
 
-        traj_per_mol = [[] for _ in range(batch_size)]
-        for i in range(batch_size):
-            for mol_t in traj_lists:
-                traj_per_mol[i].append(mol_t[i])
+            traj_per_mol = [[] for _ in range(batch_size)]
+            for i in range(batch_size):
+                for mol_t in traj_lists:
+                    traj_per_mol[i].append(mol_t[i])
 
-        # Return results
-        return traj_per_mol
+            # Return results
+            return traj_per_mol
+
+        else:
+            return mol_traj[-1].clone()
 
     def configure_optimizers(self):
         # Instantiate optimizer from config

@@ -202,8 +202,10 @@ class FlowMatchingQM9Dataset(QM9Charges):
         edge_types = edge_types[data.edge_index[0], data.edge_index[1]]
         edge_types = edge_types.to(torch.long)
 
+        """
+        # moved to sampling step
         if self.coord_std is not None:
-            coord = coord / self.coord_std
+            coord = coord / self.coord_std"""
 
         charges = data.charges.tolist()
         charges = [

@@ -1,16 +1,28 @@
 from torch_geometric.data import Data, Batch, HeteroData
 import torch
 from torch_geometric.utils import to_dense_adj
-from external_code.egnn import unsorted_segment_mean
+from rdkit import Chem
 
+from chemflow.utils import index_to_token
+from external_code.egnn import unsorted_segment_mean
 
 from torch_geometric.utils import to_dense_batch, dense_to_sparse
 from torch.distributions import Categorical
 
+from chemflow.repr import tensors_to_rdkit_mol
+
+
+IDX_BOND_MAP = {
+    "1": Chem.BondType.SINGLE,
+    "2": Chem.BondType.DOUBLE,
+    "3": Chem.BondType.TRIPLE,
+    "4": Chem.BondType.AROMATIC,
+}
+
 
 class PointCloud(Data):
     """
-    A generic point cloud data object.
+    A generic point cloud data object. Contains only x, a, and c - no edges.
     """
 
     def __init__(
@@ -25,7 +37,7 @@ class PointCloud(Data):
 
 class MoleculeData(PointCloud):
     """
-    A generic molecule data object.
+    A generic molecule data object. Contains x, a, c, and the typed edges between them.
 
     Attributes:
         x: The node coordinates.
@@ -89,8 +101,9 @@ class MoleculeData(PointCloud):
             self.edge_index, edge_attr=self.e, max_num_nodes=self.num_nodes
         )
         dense = dense.squeeze()
-        e_triu = dense[torch.triu_indices(self.num_nodes, self.num_nodes, offset=1)]
-        return e_triu
+        edge_index = torch.triu_indices(self.num_nodes, self.num_nodes, offset=1)
+        e_triu = dense[edge_index[0], edge_index[1]]
+        return e_triu, edge_index
 
     def get_permuted_subgraph(self, subset):
         """
@@ -128,6 +141,42 @@ class MoleculeData(PointCloud):
         return MoleculeData(
             x=new_x, a=new_a, e=new_e, edge_index=new_edge_index, c=new_c
         )
+
+    def to_rdkit_mol(
+        self,
+        atom_tokens: list[str],
+        edge_tokens: list[str],
+        charge_tokens: list[str],
+        sanitize: bool = True,
+    ):
+        a = self.a.clone().detach().cpu().numpy()
+        x = self.x.clone().detach().cpu().numpy()
+        c = self.c.clone().detach().cpu().numpy()
+
+        atom_tokens = [index_to_token(atom_tokens, index) for index in a]
+        charge_tokens = [int(index_to_token(charge_tokens, index)) for index in c]
+
+        e_triu, edge_index_triu = self.get_e_triu()
+        e = e_triu.clone().detach().cpu().numpy()
+        edge_tokens = [index_to_token(edge_tokens, index) for index in e]
+
+        # make edge_index (2, N) -> (N, 2)
+        edge_index = edge_index_triu.clone().detach().cpu().numpy()
+        edge_index = edge_index.T.tolist()
+
+        edge_types = []
+        edge_index_list = []
+        for edge, edge_type in zip(edge_index, edge_tokens):
+            if edge_type == "<NO_BOND>":
+                continue
+            edge_types.append(IDX_BOND_MAP[edge_type])
+            edge_index_list.append(edge)
+
+        mol = tensors_to_rdkit_mol(
+            atom_tokens, x, charge_tokens, edge_types, edge_index_list
+        )
+
+        return mol
 
 
 class MoleculeBatch(Batch):

@@ -13,6 +13,7 @@ def sample_prior_graph(
     charge_type_distribution,
     n_atoms_distribution,
     n_atoms=None,
+    coord_std=1.0,
 ):
     p_atom_types = Categorical(probs=atom_type_distribution)
     p_edge_types = Categorical(probs=edge_type_distribution)
@@ -34,7 +35,7 @@ def sample_prior_graph(
     charge_types = charge_types.to(torch.long)
 
     # sample coordinates randomly, and make sure to center the coordinates
-    coord = torch.randn(N_atoms, 3)
+    coord = torch.randn(N_atoms, 3) * coord_std
     coord = coord - coord.mean(dim=0)
 
     # instantiate fully connected

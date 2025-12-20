@@ -4,6 +4,8 @@ import torch
 
 from chemflow.utils import rigid_alignment
 
+from chemflow.dataset.molecule_data import MoleculeData
+
 
 def distance_based_assignment(valid_x0, valid_x1):
     """
@@ -64,6 +66,16 @@ def assign_targets_batched(
     unmatched_samples = []
     unmatched_targets = []
 
+    device = samples_batched.x.device
+
+    empty_mol = MoleculeData(
+        x=torch.empty((0, 3), device=device, dtype=torch.float32),
+        a=torch.empty((0), device=device, dtype=torch.long),
+        c=torch.empty((0), device=device, dtype=torch.long),
+        e=torch.empty((0), device=device, dtype=torch.long),
+        edge_index=torch.empty((2, 0), device=device, dtype=torch.long),
+    )
+
     for b in range(targets_batched.batch_size):
         sampled_mol = samples_batched[b]
         target_mol = targets_batched[b]
@@ -77,32 +89,22 @@ def assign_targets_batched(
         # Handle edge cases where one or both sets are empty
         if N_x0 == 0:
             # No x0 items to match
-            all_matched_x0.append(empty_x)
-            all_matched_x1.append(empty_x)
+            matched_samples.append(empty_mol.clone())
+            matched_targets.append(empty_mol.clone())
 
             # All valid x1 are unmatched
-            all_unmatched_x0.append(empty_x)
-            all_unmatched_x1.append(valid_x1)
-
-            all_unmatched_a0.append(empty_a)
-            all_unmatched_a1.append(valid_a1)
-            all_unmatched_c0.append(empty_c)
-            all_unmatched_c1.append(valid_c1)
+            unmatched_samples.append(empty_mol.clone())
+            unmatched_targets.append(target_mol.clone())
             continue
 
         if N_x1 == 0:
             # No x1 items to match
-            all_matched_x0.append(empty_x)
-            all_matched_x1.append(empty_x)
+            matched_samples.append(empty_mol.clone())
+            matched_targets.append(empty_mol.clone())
 
             # All valid x0 are unmatched
-            all_unmatched_x0.append(valid_x0)
-            all_unmatched_x1.append(empty_x)
-
-            all_unmatched_a0.append(valid_a0)
-            all_unmatched_a1.append(empty_a)
-            all_unmatched_c0.append(valid_c0)
-            all_unmatched_c1.append(empty_c)
+            unmatched_samples.append(sampled_mol)
+            unmatched_targets.append(empty_mol.clone())
             continue
 
         # Assign targets using distance-based assignment

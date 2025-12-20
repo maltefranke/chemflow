@@ -36,6 +36,7 @@ class LightningDataModule(pl.LightningDataModule):
         self.charge_tokens = None
         self.atom_mask_token_index = None
         self.edge_mask_token_index = None
+        self.coord_std = None
 
         # will be set later
         self.train_dataset = None
@@ -125,6 +126,7 @@ class LightningDataModule(pl.LightningDataModule):
                 self.charge_type_distribution,
                 self.n_atoms_distribution,
                 n_atoms=n_atoms_i,
+                coord_std=self.coord_std,
             )
             for n_atoms_i in n_atoms
         ]

@@ -167,9 +167,9 @@ class Interpolator:
         for matched_target in matched_targets:
             matched_m_1_i = matched_target.clone()
 
-            edge_index_1 = matched_m_1_i.edge_index
-            e_1 = matched_m_1_i.e
-            e_1_dense = to_dense_adj(edge_index_1, edge_attr=e_1)[0]
+            e_1_dense = to_dense_adj(
+                matched_m_1_i.edge_index, edge_attr=matched_m_1_i.e
+            )[0]
 
             # NOTE assuming fully connected graph for now
             edge_index_1 = build_fully_connected_edge_index(
@@ -191,16 +191,18 @@ class Interpolator:
         birth_rate_target = []
         atoms_to_birth = []
 
-        empty_x = torch.empty((0, self.D), device=device, dtype=torch.float32)
-        empty_a = torch.empty((0), device=device, dtype=torch.long)
-        empty_c = torch.empty((0), device=device, dtype=torch.long)
-        empty_e = torch.empty((0), device=device, dtype=torch.long)
-        empty_edge_index = torch.empty((2, 0), device=device, dtype=torch.long)
-
         empty_mol = MoleculeData(
-            x=empty_x, a=empty_a, e=empty_e, edge_index=empty_edge_index, c=empty_c
+            x=torch.empty((0, self.D), device=device, dtype=torch.float32),
+            a=torch.empty((0), device=device, dtype=torch.long),
+            c=torch.empty((0), device=device, dtype=torch.long),
+            e=torch.empty((0), device=device, dtype=torch.long),
+            edge_index=torch.empty((2, 0), device=device, dtype=torch.long),
         )
-        empty_point_cloud = PointCloud(x=empty_x, a=empty_a, c=empty_c)
+        empty_point_cloud = PointCloud(
+            x=torch.empty((0, self.D), device=device, dtype=torch.float32),
+            a=torch.empty((0), device=device, dtype=torch.long),
+            c=torch.empty((0), device=device, dtype=torch.long),
+        )
 
         # create a sink state that all unmatched x0 will move towards
         x_sink = torch.zeros((1, self.D), device=device)
@@ -318,11 +320,13 @@ class Interpolator:
                     # Store the GMM samples for NLL calculation during training
                     if self.cat_strategy == "uniform-sample":
                         p_a_0 = self.atom_type_distribution.unsqueeze(0).to(device)
-                        p_a_1 = unborn_a1_i
+                        p_a_1 = F.one_hot(
+                            unborn_atoms_1_i.a, num_classes=len(self.atom_tokens)
+                        )
                         # TODO make sigma hyperparameter
                         # TODO add charge type
                         sampled_x, sampled_a, sampled_c = interpolate_typed_gmm(
-                            p_x_1=unborn_x1_i,
+                            p_x_1=unborn_atoms_1_i.x,
                             p_a_0=p_a_0,
                             p_a_1=p_a_1,
                             t=t_i,
@@ -380,7 +384,7 @@ class Interpolator:
         # TODO must add edges etc between unconnected components!!!
 
         # remove mean of xt and target_x
-        # TODO do we need to do this? unsure, because we add / remove nodes
+        # TODO do we need to do this? I think so, because we add / remove nodes
         xt_mean = unsorted_segment_mean(mols_t.x, mols_t.batch, mols_t.num_graphs)
         _ = mols_t.remove_com(xt_mean)
         _ = mols_1.remove_com(xt_mean)

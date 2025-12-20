@@ -20,8 +20,14 @@ module:
   n_atoms_strategy: ${data.n_atoms_strategy}
   cat_strategy: ${data.cat_strategy}
   num_integration_steps: 100
-  cat_noise_level: 0.0  # Start here: ~1% masking per step. Adjust: 0.5-2.0 for balance, >2.0 for more stability
+  cat_noise_level: 0.1  # Start here: ~1% masking per step. Adjust: 0.5-2.0 for balance, >2.0 for more stability
   coord_noise_level: 0.0
+  time_dist:
+    # Beta distribution for time scheduling. 1.0 , 1.0 is equivalent to uniform distribution.
+    # SEMLAFLOW uses 2.0, 1.0
+    _target_: torch.distributions.Beta
+    concentration1: 2.0
+    concentration0: 1.0
   
   # Loss component weights
   loss_weights:
@@ -63,24 +69,24 @@ module:
 atom_type_embedding:
   _target_: chemflow.model.embedding.Embedding
   in_nf: ${len:${data.atom_tokens}}
-  out_nf: 64
+  out_nf: 128
 
 edge_type_embedding:
   _target_: chemflow.model.embedding.Embedding
   in_nf: ${len:${data.edge_tokens}}
-  out_nf: 64
+  out_nf: 128
 
 egnn:
   _target_: chemflow.model.gnn.EGNNWithEdgeType
   in_node_nf: ${model.atom_type_embedding.out_nf}
-  hidden_nf: 64
-  out_node_nf: 64
-  in_edge_nf: ${model.edge_type_embedding.out_nf} # set to zeo when not predicting edge types
-  n_layers: 6
+  hidden_nf: 128
+  out_node_nf: 128
+  in_edge_nf: ${model.edge_type_embedding.out_nf} # set to zero when not predicting edge types
+  n_layers: 10
   residual: True
   attention: True
   normalize: True
-  tanh: False
+  tanh: True
 
 heads:
   _target_: chemflow.model.heads.MultiHeadModule
@@ -93,12 +99,12 @@ heads:
       atom_type_head:
         input_dim: ${model.egnn.out_node_nf}
         output_dim: ${len:${data.atom_tokens}}
-        hidden_dim: 32
+        hidden_dim: 64
 
       charge_head:
         input_dim: ${model.egnn.out_node_nf}
         output_dim: ${len:${data.charge_tokens}}
-        hidden_dim: 32
+        hidden_dim: 64
 
       gmm_head:
         input_dim: ${model.egnn.out_node_nf}
@@ -113,7 +119,7 @@ heads:
       net_rate_head:
         input_dim: ${model.egnn.out_node_nf}
         output_dim: 1
-        hidden_dim: 32
+        hidden_dim: 64
 
       #gmm_head:
       #  input_dim: ${model.egnn.out_node_nf}
@@ -124,5 +130,5 @@ heads:
       edge_type_head:
         input_dim: ${model.egnn.out_node_nf}
         output_dim: ${len:${data.edge_tokens}}
-        hidden_dim: 32
+        hidden_dim: 64
       

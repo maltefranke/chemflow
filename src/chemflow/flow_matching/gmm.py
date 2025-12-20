@@ -521,14 +521,15 @@ def interpolate_typed_gmm(
     2. The type components are p_t(c | c_1) = (1-t)*p_0(c) + t*p_1(c)
 
     Args:
-        means (torch.Tensor): The target spatial locations (x_1).
+        p_x_1 (torch.Tensor): The target spatial locations (x_1).
             Shape: (N, D)
-        types (torch.Tensor): The target discrete types (c_1).
-            Shape: (N,)
+        p_c_0 (torch.Tensor): The target discrete types (c_1).
+            Shape: (N, N_types)
+        p_c_1 (torch.Tensor): The target discrete types (c_1).
+            Shape: (N, N_types)
         t (torch.Tensor): A tensor containing a single time-step value.
-        N_types (int): The total number of discrete types.
-        sigma (float): Base sigma value for spatial noise.
         num_samples (int): The number of samples to draw (M).
+        sigma (float): Base sigma value for spatial noise.
 
     Returns:
         tuple:

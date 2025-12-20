@@ -42,6 +42,82 @@ class Integrator:
             self.edge_mask_index = token_to_index(edge_tokens, "<MASK>")
             self.atom_mask_index = token_to_index(atom_tokens, "<MASK>")
 
+    def discrete_integration_step_gnn(
+        self,
+        class_curr: torch.Tensor,
+        class_probs_1: torch.Tensor,
+        t: torch.Tensor,
+        batch_idx: torch.Tensor,
+        dt: float,
+        noise_scale: float = 0.0,
+        mask: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Performs a single Euler-Forward integration step for Discrete Flow Matching
+        adapted for Graph Neural Networks (stacked node batching).
+
+        Args:
+            class_curr (Tensor): Current node token indices. Shape [N, 1] or [N].
+            class_probs_1 (Tensor): Predicted target probabilities. Shape [N, Vocab].
+            t (Tensor): Current time per graph. Shape [Batch_Size].
+            batch_idx (Tensor): Batch index for each node (e.g., from PyG Data.batch). Shape [N].
+            dt (float): Integration timestep size.
+            noise_scale (float): Additive uniform noise rate.
+            mask (Tensor, optional): Boolean mask (True to ignore node). Shape [N, 1] or [N].
+
+        Returns:
+            a_next (Tensor): Updated node tokens. Shape [N, 1].
+        """
+        # 0. Standardization
+        # Ensure a_curr is [N, 1] for scatter consistency, but we often need [N] for logic
+        if class_curr.ndim == 1:
+            class_curr = class_curr.unsqueeze(-1)  # [N, 1]
+
+        # 1. Broadcast Time to Nodes
+        # t is [Batch_Size], we need [N, 1] to match a_1_probs
+        # t[batch_idx] expands it to [N], then view adds the vocab dim
+        times = t[batch_idx].view(-1, 1).clamp(min=1e-5, max=1.0 - 1e-5)
+
+        # 2. Calculate Deterministic Rate: Rate = p_1(y) / (1 - t)
+        # rate_scalar will be [N, 1]
+        rate_scalar = 1.0 / (1.0 - times)
+        rates = class_probs_1 * rate_scalar
+
+        # 3. Add Stochastic Noise (Optional)
+        if noise_scale > 0:
+            rates = rates + noise_scale
+
+        # 4. Zero out the Diagonal (Self-transitions)
+        # rates is [N, Vocab], a_curr is [N, 1]
+        # We set the rate of staying (x -> x) to 0 temporarily
+        rates.scatter_(-1, class_curr, 0.0)
+
+        # 5. Convert Rates to Probabilities
+        step_probs = rates * dt
+
+        # 6. Calculate Probability to Stay
+        # P(stay) = 1 - sum(P(jump to y))
+        off_diag_sum = step_probs.sum(dim=-1, keepdim=True)
+        stay_prob = (1.0 - off_diag_sum).clamp(min=0.0)
+
+        # Insert stay probability back into the current token's position
+        step_probs.scatter_(-1, class_curr, stay_prob)
+
+        # 7. Sample Next State
+        # Categorical samples from [N, Vocab] -> returns [N]
+        class_pred = torch.distributions.Categorical(probs=step_probs).sample()
+
+        # Reshape back to [N, 1] to maintain input shape consistency
+        class_pred = class_pred.view(-1, 1)
+
+        # 8. Apply Mask (if provided)
+        if mask is not None:
+            if mask.ndim == 1:
+                mask = mask.unsqueeze(-1)
+            class_pred = torch.where(mask, class_curr, class_pred)
+
+        return class_pred
+
     def sample_death_process_gnn(
         self,
         global_death_rate: torch.Tensor,
@@ -255,31 +331,17 @@ class Integrator:
         x = x + velocity * dt
 
         # 2. Update node types
-        # a_pred = torch.distributions.Categorical(mol_1_pred.a).sample()
-
         if self.cat_strategy == "uniform-sample":
-            # probability to stay in the current type
-            p_a_stay_curr = torch.gather(a_1, -1, a.unsqueeze(-1))
-
-            # Setup batched time tensor and noise tensor
-            ones = [1] * (len(a_1.shape) - 1)
-            times = t[batch_id].view(-1, *ones).clamp(min=1e-3, max=1.0 - 1e-3)
-            noise = torch.zeros_like(times)
-            noise[times + dt < 1.0] = cat_noise_level
-
-            # Off-diagonal step probs
-            mult = (1 + ((2 * noise) * (a_1.shape[-1] - 1) * times)) / (1 - times)
-            first_term = dt * mult * a_1
-            second_term = dt * noise * p_a_stay_curr
-            a_step_probs = (first_term + second_term).clamp(max=1.0)
-
-            # On-diagonal step probs
-            a_step_probs.scatter_(-1, a.unsqueeze(-1), 0.0)
-            diags = (1.0 - a_step_probs.sum(dim=-1, keepdim=True)).clamp(min=0.0)
-            a_step_probs.scatter_(-1, a.unsqueeze(-1), diags)
-
-            a_pred = torch.distributions.Categorical(a_step_probs).sample()
-            a = a_pred
+            a = self.discrete_integration_step_gnn(
+                class_curr=a,
+                class_probs_1=a_1,
+                t=t,
+                batch_idx=batch_id,
+                dt=dt,
+                noise_scale=cat_noise_level,
+                mask=None,
+            )
+            a = a.view(-1)
 
         else:
             # Get time for each node (expand t to match nodes)
@@ -307,53 +369,36 @@ class Integrator:
             a[mask] = self.atom_mask_index
 
         # 2.5. Update edge types
-        num_edge_classes = e_1.shape[-1]
-
         # Get current edge types (already indices)
-        e_curr = e.long().clone()
-        e_pred = e_1.long().clone()
+        e_curr = e.clone()
+        e_pred = e_1.clone()
 
         # we will deal with only the upper triangle of the edge types and symmetrize them later
-        _, e_curr_triu = get_canonical_upper_triangle_with_index(edge_index, e_curr)
-        edge_index_triu, e_pred_triu = get_canonical_upper_triangle_with_index(
+        edge_index_triu_curr, e_curr_triu = get_canonical_upper_triangle_with_index(
+            edge_index, e_curr
+        )
+        edge_index_triu_pred, e_pred_triu = get_canonical_upper_triangle_with_index(
             edge_index_1, e_pred
+        )
+
+        assert torch.all(edge_index_triu_curr == edge_index_triu_pred), (
+            "The edge indices must be the same."
         )
 
         # Only update edges that exist in edge_index
         if self.cat_strategy == "uniform-sample":
-            # Get probability of current edge type for valid edges
-            # et_curr_valid = et_new[edge_index[0], edge_index[1]]
-            # print(et_curr_valid)
+            batch_idx_edge = batch_id[edge_index_triu_curr[0]]
 
-            # p_e_stay_curr = mol_1_pred.e.gather(1, et_new.unsqueeze(-1)).squeeze(-1)
-            p_e_stay_curr = torch.gather(
-                e_pred_triu, -1, e_curr_triu.unsqueeze(-1)
-            ).squeeze(-1)
-
-            # Compute edge times (average of connected nodes)
-            node_times = t[batch_id]
-            edge_times = (
-                node_times[edge_index_triu[0]] + node_times[edge_index_triu[1]]
-            ) / 2.0
-            edge_times = edge_times.clamp(min=1e-3, max=1.0 - 1e-3)
-            noise = torch.zeros_like(edge_times)
-            noise[edge_times + dt < 1.0] = cat_noise_level
-
-            # Compute step probabilities for valid edges
-            mult = (1 + ((2 * noise) * (num_edge_classes - 1) * edge_times)) / (
-                1 - edge_times
+            et_new_triu = self.discrete_integration_step_gnn(
+                class_curr=e_curr_triu,
+                class_probs_1=e_pred_triu,
+                t=t,
+                batch_idx=batch_idx_edge,
+                dt=dt,
+                noise_scale=cat_noise_level,
+                mask=None,
             )
-            first_term = dt * mult.unsqueeze(-1) * e_pred_triu
-            second_term = dt * noise.unsqueeze(-1) * p_e_stay_curr.unsqueeze(-1)
-            step_probs = (first_term + second_term).clamp(max=1.0)
-
-            # Set diagonal probabilities
-            step_probs.scatter_(1, e_curr_triu.unsqueeze(-1), 0.0)
-            diags = (1.0 - step_probs.sum(dim=-1, keepdim=True)).clamp(min=0.0)
-            step_probs.scatter_(1, e_curr_triu.unsqueeze(-1), diags)
-
-            # Sample new edge types for valid edges
-            et_new_triu = torch.distributions.Categorical(step_probs).sample()
+            et_new_triu = et_new_triu.view(-1)
 
         else:
             # Get edge times for valid edges
@@ -389,7 +434,7 @@ class Integrator:
             et_new_triu[edge_index[1], edge_index[0]] = et_new_valid
 
         # finally, symmetrize the edge types
-        edge_index, e = symmetrize_upper_triangle(edge_index_triu, et_new_triu)
+        edge_index, e = symmetrize_upper_triangle(edge_index_triu_pred, et_new_triu)
 
         if self.n_atoms_strategy != "fixed":
             # 3.1. Sample death process

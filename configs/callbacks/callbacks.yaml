@@ -1,7 +1,7 @@
 ## Put your callback args here
 callbacks:
-  monitor_metric: "val_loss" 
-  monitor_metric_mode: min
+  monitor_metric: "val_validity" 
+  monitor_metric_mode: max
 
   early_stopping:
     patience: 20
