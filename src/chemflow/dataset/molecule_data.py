@@ -2,16 +2,18 @@ from torch_geometric.data import Data, Batch, HeteroData
 import torch
 from torch_geometric.utils import to_dense_adj
 from rdkit import Chem
+import numpy as np
 
-from chemflow.utils import index_to_token
+from chemflow.utils import index_to_token, EdgeAligner
 from external_code.egnn import unsorted_segment_mean
 
-from torch_geometric.utils import to_dense_batch, dense_to_sparse
+from torch_geometric.utils import sort_edge_index
 from torch.distributions import Categorical
 
 from chemflow.repr import tensors_to_rdkit_mol
 
 
+# RDKit bond type to index mapping
 IDX_BOND_MAP = {
     "1": Chem.BondType.SINGLE,
     "2": Chem.BondType.DOUBLE,
@@ -260,164 +262,494 @@ def join_molecules(mol_list: list[MoleculeData]) -> MoleculeData:
     return merged_mol
 
 
-def join_molecule_with_atoms(
-    mol: MoleculeBatch, atoms: PointCloud, edge_distribution: torch.Tensor
-) -> MoleculeBatch:
+class AugmentedMoleculeData(Data):
     """
-    Merges a batch of molecules with a batch of atoms and samples new edges
-    for the atoms based on the provided distribution.
-
-    Args:
-        mol: Batch of existing molecules.
-        atoms: Batch of new atoms to add.
-        edge_distribution: 1D Tensor of probs [P(No_Edge), P(Type_1), P(Type_2)...].
-                           Index 0 is assumed to be 'No Edge'.
-    """
-    raise NotImplementedError("This function must be debugged.")
-    assert mol.batch is not None
-    assert atoms.batch is not None
-    device = mol.x.device
-
-    # --- 1. Convert to Dense Representations ---
-    # Convert node features to dense [Batch, Max_Nodes, Features]
-    # mask_mol is [Batch, Max_Mol_Nodes] (True = Real Node, False = Padding)
-    x_mol, mask_mol = to_dense_batch(mol.x, mol.batch)
-    a_mol, _ = to_dense_batch(mol.a, mol.batch)
-    c_mol, _ = to_dense_batch(mol.c, mol.batch)
-
-    # Do the same for the new atoms
-    x_atom, mask_atom = to_dense_batch(atoms.x, atoms.batch)
-    a_atom, _ = to_dense_batch(atoms.a, atoms.batch)
-    c_atom, _ = to_dense_batch(atoms.c, atoms.batch)
-
-    # Convert edge attributes to dense [Batch, Max_Mol_Nodes, Max_Mol_Nodes]
-    # Note: If mol.e is None, to_dense_adj creates a binary adjacency.
-    # We assume mol.e contains integer edge types (or 1s).
-    adj_mol = to_dense_adj(mol.edge_index, mol.batch, edge_attr=mol.e)
-
-    # Handle case where adj might have an extra last dimension if edge_attr was [E, 1]
-    if adj_mol.dim() > 3:
-        adj_mol = adj_mol.squeeze(-1)
-
-    # --- 2. Combine Dense Tensors ---
-    # Concatenate along the node dimension (dim 1)
-    # The new layout for each graph is: [Old_Nodes, New_Atoms, Padding]
-    x_combined = torch.cat([x_mol, x_atom], dim=1)
-    a_combined = torch.cat([a_mol, a_atom], dim=1)
-    c_combined = torch.cat([c_mol, c_atom], dim=1)
-    mask_combined = torch.cat([mask_mol, mask_atom], dim=1)
-
-    batch_size, n_mol_max = x_mol.shape[:2]
-    _, n_atom_max = x_atom.shape[:2]
-    n_total = n_mol_max + n_atom_max
-
-    # --- 3. Construct and Sample New Adjacency ---
-    # Initialize full adjacency with zeros (No Edge)
-    adj_new = torch.zeros(
-        (batch_size, n_total, n_total), device=device, dtype=adj_mol.dtype
-    )
-
-    # A. Copy existing edges (Top-Left block)
-    adj_new[:, :n_mol_max, :n_mol_max] = adj_mol
-
-    # B. Sample New Edges
-    # We need to sample for the interaction blocks:
-    # 1. Mol <-> Atom (Top-Right)
-    # 2. Atom <-> Atom (Bottom-Right)
-    # 3. Atom <-> Mol (Bottom-Left) -- Symmetric to Top-Right
-
-    # Create a sampler based on the provided distribution
-    # We sample indices [0, 1, 2...] where 0 is 'No Edge'
-    sampler = Categorical(probs=edge_distribution)
-
-    # Sample a full matrix of random edge types
-    # Shape: [Batch, Total, Total]
-    random_edges = sampler.sample((batch_size, n_total, n_total)).to(adj_mol.dtype)
-
-    # Create a mask for where we are ALLOWED to add new edges
-    # We only want to touch the blocks involving the new atoms
-    sampling_mask = torch.zeros(
-        (batch_size, n_total, n_total), device=device, dtype=torch.bool
-    )
-
-    # Enable sampling for Mol-Atom (Top-Right)
-    sampling_mask[:, :n_mol_max, n_mol_max:] = True
-    # Enable sampling for Atom-Atom (Bottom-Right)
-    sampling_mask[:, n_mol_max:, n_mol_max:] = True
-
-    # Enforce symmetry? (Molecules are undirected)
-    # If undirected, we only sample Upper Triangle and copy to Lower
-    upper_tri_mask = torch.triu(
-        torch.ones((n_total, n_total), device=device, dtype=torch.bool), diagonal=1
-    )
-    final_sampling_mask = sampling_mask & upper_tri_mask.unsqueeze(0)
-
-    # Apply sampled values to the allowed regions
-    # Where mask is True, use random_edges. Where False, keep existing adj_new (which has old edges + zeros)
-    adj_new = torch.where(final_sampling_mask, random_edges, adj_new)
-
-    # Symmetrize: Copy Upper Triangle to Lower Triangle
-    # adj_new = adj_new + adj_new.transpose(1, 2)
-    # WARNING: Simple addition doubles the diagonal and fails for categorical types.
-    # Correct way for categorical adjacency symmetrization:
-    adj_new_t = adj_new.transpose(1, 2)
-    adj_new = torch.max(
-        adj_new, adj_new_t
-    )  # Max works if 0 is No Edge and >0 are types
-
-    # --- 4. Convert Back to Sparse (MoleculeData) ---
-    # dense_to_sparse filters out elements that are 0 (No Edge)
-    # It returns edge_index and the values (edge_attr)
-    edge_index, edge_attr = dense_to_sparse(adj_new, mask=mask_combined)
-
-    # Extract the flattened node features using the mask
-    # The mask ensures we drop the padding nodes
-    new_x = x_combined[mask_combined]
-    new_a = a_combined[mask_combined]
-    new_c = c_combined[mask_combined]
-
-    # Reconstruct the batch vector
-    # We count how many real nodes are in each graph to recreate the batch indices
-    nodes_per_graph = mask_combined.sum(dim=1)
-    new_batch = torch.repeat_interleave(
-        torch.arange(batch_size, device=device), nodes_per_graph
-    )
-
-    return MoleculeData(
-        x=new_x, a=new_a, e=edge_attr, edge_index=edge_index, c=new_c, batch=new_batch
-    )
-
-
-class ConditioningData(Data):
-    """
-    A generic conditioning data object.
-
-    Attributes:
-        x: The conditioning embeddings.
-    """
-
-    def __init__(self, x: torch.Tensor | None = None, **kwargs):
-        # Allow PyTorch Geometric's separate() to create empty instances
-        # It will populate attributes via stores_as() mechanism
-        super().__init__(x=x, **kwargs)
-
-
-class EditData(HeteroData):
-    """
-    A tuple of input molecule M0, edit instructions E, and output molecule M1.
-    M0 and M1 are MoleculeData objects and E is a TextData object.
-
-    Must have m1 (the target molecule) for unconditional or conditional generation.
-    Can have m0 (input molecule) and e (conditioning data) for conditional generation.
+    An Augmented molecule object that contains auxiliary nodes. Used for aligning samples and targets.
+    Simplifies interpolation of birth and death nodes.
     """
 
     def __init__(
         self,
-        m1: MoleculeData,
-        m0: MoleculeData | None = None,
-        e: ConditioningData | None = None,
+        x: torch.Tensor | None = None,
+        a: torch.Tensor | None = None,
+        is_auxiliary: torch.Tensor | None = None,
+        edge_index: torch.Tensor | None = None,
+        e: torch.Tensor | None = None,
+        c: torch.Tensor | None = None,
+        spawn_node_idx: torch.Tensor | None = None,
+        **kwargs,
     ):
-        super().__init__()
-        self.m0 = m0
-        self.e = e
-        self.m1 = m1
+        # Initialize PyG Data base
+        super().__init__(x=x, edge_index=edge_index, **kwargs)
+
+        # Explicitly assign attributes to ensure they are registered
+        if a is not None:
+            self.a = a
+        if c is not None:
+            self.c = c
+        if e is not None:
+            self.e = e
+        if is_auxiliary is not None:
+            self.is_auxiliary = is_auxiliary
+        if spawn_node_idx is not None:
+            self.spawn_node_idx = spawn_node_idx
+
+    def unpack(self):
+        """
+        Unpack the data into a tuple of tensors.
+        Returns:
+            x: The coordinates.
+            a: The atom types.
+            c: The charge types.
+        """
+        return self.x, self.a, self.c, self.e, self.edge_index  # , self.is_auxiliary
+
+    @classmethod
+    def from_molecule(cls, mol) -> "AugmentedMoleculeData":
+        """Creates an AugmentedMoleculeData from your existing MoleculeData/PointCloud."""
+        N = mol.x.shape[0]
+        device = mol.x.device
+
+        return cls(
+            x=mol.x.clone().to(device),
+            a=mol.a.clone().to(device),
+            c=mol.c.clone().to(device),
+            e=mol.e.clone().to(device),
+            edge_index=mol.edge_index.clone().to(device),
+            is_auxiliary=torch.zeros((N, 1), dtype=torch.bool, device=device),
+        )
+
+    def pad(self, num_auxiliary: int) -> "AugmentedMoleculeData":
+        """Appends `num_auxiliary` zero-initialized nodes (with is_auxiliary=True)."""
+        if num_auxiliary <= 0:
+            return self
+
+        device = self.x.device
+
+        # Helper to concatenate padding
+        def _pad(tensor, width):
+            if tensor is None:
+                return None
+            pad_block = torch.zeros(
+                (num_auxiliary, width), dtype=tensor.dtype, device=device
+            )
+            return torch.cat([tensor, pad_block], dim=0)
+
+        # Pad Node Attributes
+        self.x = _pad(self.x, self.x.shape[1])
+
+        # a and c are (N, ) tensors, so we need to unsqueeze them and pad them to (N, 1)
+        self.a = self.a.unsqueeze(1)
+        self.a = _pad(self.a, 1).squeeze(-1)
+
+        self.c = self.c.unsqueeze(1)
+        self.c = _pad(self.c, 1).squeeze(-1)
+
+        # Pad Mask
+        dummy_mask = torch.ones((num_auxiliary, 1), dtype=torch.bool, device=device)
+        self.is_auxiliary = torch.cat([self.is_auxiliary, dummy_mask], dim=0)
+
+        return self
+
+    def permute_nodes(
+        self, indices: np.ndarray | torch.Tensor
+    ) -> "AugmentedMoleculeData":
+        """Permutes nodes and updates edge connectivity to match new indices."""
+        device = self.x.device
+        N_total = self.x.shape[0]
+
+        # 1. Update Topology
+        # We map the VALUES in edge_index to the new node positions.
+        # The edges themselves (and their features `e`) do not change order.
+        if self.edge_index is not None and self.edge_index.numel() > 0:
+            # Create a map: old_index -> new_index
+            mapping = torch.full((N_total,), -1, dtype=torch.long, device=device)
+            perm_tensor = torch.as_tensor(indices, device=device, dtype=torch.long)
+            mapping[perm_tensor] = torch.arange(len(indices), device=device)
+
+            # Apply map to edge_index
+            self.edge_index = mapping[self.edge_index]
+
+        # 2. Permute Node Tensors
+        self.x = self.x[indices]
+        self.a = self.a[indices]
+        self.is_auxiliary = self.is_auxiliary[indices]
+
+        if hasattr(self, "c") and self.c is not None:
+            self.c = self.c[indices]
+
+        return self
+
+
+def filter_nodes(mol: Data | Batch, mask: torch.Tensor) -> "AugmentedMoleculeData":
+    """Keeps only nodes where mask is True. Removes edges connected to dropped nodes."""
+    mol = mol.clone()
+    device = mol.x.device
+
+    # 1. Update Topology
+    if mol.edge_index is not None and mol.edge_index.numel() > 0:
+        # Map: current_index -> new_compact_index (or -1 if dropped)
+        indices_kept = torch.nonzero(mask.squeeze(), as_tuple=True)[0]
+        mapping = torch.full((mol.x.shape[0],), -1, dtype=torch.long, device=device)
+        mapping[indices_kept] = torch.arange(len(indices_kept), device=device)
+
+        # Remap edges
+        new_edge_index = mapping[mol.edge_index]
+
+        # Identify valid edges (both endpoints must exist)
+        valid_edge_mask = (new_edge_index[0] >= 0) & (new_edge_index[1] >= 0)
+
+        # Slice BOTH edge_index AND edge attributes
+        edge_index = new_edge_index[:, valid_edge_mask]
+        e = mol.e[valid_edge_mask]
+
+    else:
+        # Handle empty/None edge case
+        edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+        e = torch.empty((0,), dtype=torch.long, device=device)
+
+    # 2. Slice Node Tensors
+    x = mol.x[mask]
+    a = mol.a[mask]
+    c = mol.c[mask]
+
+    if isinstance(mol, MoleculeBatch):
+        return MoleculeBatch(
+            x=x,
+            a=a,
+            c=c,
+            e=e,
+            edge_index=edge_index,
+            batch=mol.batch[mask],
+        )
+
+    elif isinstance(mol, AugmentedMoleculeData):
+        return AugmentedMoleculeData(
+            x=x,
+            a=a,
+            c=c,
+            e=e,
+            edge_index=edge_index,
+            is_auxiliary=mol.is_auxiliary[mask],
+        )
+    else:
+        return MoleculeData(
+            x=x,
+            a=a,
+            c=c,
+            e=e,
+            edge_index=edge_index,
+        )
+
+
+def sort_nodes_by_batch(data):
+    """
+    Sorts nodes in a Data/Batch object so that all nodes belonging to
+    batch 0 come first, then batch 1, etc. Remaps edge indices accordingly.
+    """
+    if not hasattr(data, "batch") or data.batch is None:
+        return data
+
+    # 1. Get the sorting permutation
+    # stable=True keeps original order of nodes within the same batch
+    perm = data.batch.argsort(stable=True)
+
+    # 2. Reorder node features
+    if hasattr(data, "x") and data.x is not None:
+        data.x = data.x[perm]
+    if hasattr(data, "a") and data.a is not None:
+        data.a = data.a[perm]
+    if hasattr(data, "c") and data.c is not None:
+        data.c = data.c[perm]
+    data.batch = data.batch[perm]
+
+    # 3. Remap edge_index
+    if hasattr(data, "edge_index") and data.edge_index is not None:
+        num_nodes = data.num_nodes
+
+        # Create the mapping: map[old_position] = new_position
+        perm_map = torch.empty(num_nodes, dtype=torch.long, device=data.x.device)
+        perm_map[perm] = torch.arange(num_nodes, device=data.x.device)
+
+        # Apply mapping
+        data.edge_index = perm_map[data.edge_index]
+
+        # Optional: Sort edges for faster sparse ops later
+        data.edge_index, data.e = sort_edge_index(data.edge_index, data.e)
+
+    return data
+
+
+def join_molecules_with_atoms(
+    mol: MoleculeData | MoleculeBatch | AugmentedMoleculeData,
+    atoms: PointCloud,
+    edge_dist: torch.Tensor,
+) -> MoleculeData | MoleculeBatch | AugmentedMoleculeData:
+    """
+    Joins a molecule with atoms. Adds fully connected edges between the molecule and the atoms.
+    The new edges are sampled from the edge distribution.
+    """
+    assert hasattr(mol, "batch") and mol.batch is not None, "Molecule must have a batch"
+    assert hasattr(atoms, "batch") and atoms.batch is not None, (
+        "Atoms must have a batch"
+    )
+
+    # get the batch ids
+    batch_ids = mol.batch
+    batch_ids_atoms = atoms.batch
+
+    # get the number of nodes in the molecule
+    num_nodes = mol.num_nodes
+
+    device = mol.x.device
+    edge_aligner = EdgeAligner()
+
+    # 1. Concatenate node features
+    new_x = torch.cat([mol.x, atoms.x], dim=0)
+    new_a = torch.cat([mol.a, atoms.a], dim=0)
+    new_c = torch.cat([mol.c, atoms.c], dim=0)
+    new_batch = torch.cat([batch_ids, batch_ids_atoms], dim=0)
+
+    # 2. Get existing edges from molecule (keep as is)
+    if mol.edge_index is not None:
+        existing_edge_index = mol.edge_index.clone()
+    else:
+        existing_edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+    if mol.e is not None:
+        existing_e = mol.e.clone()
+    else:
+        existing_e = torch.empty((0,), dtype=torch.long, device=device)
+
+    # 3. Create new edges: fully connected between mol nodes and atom nodes,
+    # and between atom nodes. We create only upper triangle edges, then symmetrize.
+    # We need to do this per batch.
+    new_edges_triu_list = []
+    new_e_triu_list = []
+
+    # Sample edge types from distribution
+    edge_dist_categorical = Categorical(probs=edge_dist)
+
+    for batch_id in batch_ids.unique():
+        # Get indices for this batch
+        mol_mask = batch_ids == batch_id
+        atom_mask = batch_ids_atoms == batch_id
+
+        mol_indices = torch.where(mol_mask)[0]
+        # Offset by num_nodes to account for mol nodes
+        atom_indices = torch.where(atom_mask)[0] + num_nodes
+
+        # Create edges between mol nodes and atom nodes (upper triangle only)
+        # Since mol_indices < atom_indices (mol nodes come first), all mol->atom edges
+        # are in upper triangle, but we filter to be explicit
+        if len(mol_indices) > 0 and len(atom_indices) > 0:
+            mol_atom_edges = torch.cartesian_prod(mol_indices, atom_indices)
+            mol_atom_edges = mol_atom_edges.T  # Shape: (2, N)
+            # Keep only upper triangle (row < col)
+            triu_mask = mol_atom_edges[0] < mol_atom_edges[1]
+            mol_atom_edges_triu = mol_atom_edges[:, triu_mask]
+
+            if mol_atom_edges_triu.shape[1] > 0:
+                new_edges_triu_list.append(mol_atom_edges_triu)
+                # Sample edge types for mol-atom edges
+                n_mol_atom_edges = mol_atom_edges_triu.shape[1]
+                mol_atom_e = edge_dist_categorical.sample((n_mol_atom_edges,)).to(
+                    device
+                )
+                new_e_triu_list.append(mol_atom_e)
+
+        # Create edges between atom nodes (upper triangle only, no self-loops)
+        if len(atom_indices) > 1:
+            atom_atom_edges = torch.cartesian_prod(atom_indices, atom_indices)
+            atom_atom_edges = atom_atom_edges.T  # Shape: (2, N)
+            # Keep only upper triangle (row < col, which also removes self-loops)
+            triu_mask = atom_atom_edges[0] < atom_atom_edges[1]
+            atom_atom_edges_triu = atom_atom_edges[:, triu_mask]
+
+            if atom_atom_edges_triu.shape[1] > 0:
+                new_edges_triu_list.append(atom_atom_edges_triu)
+                # Sample edge types for atom-atom edges
+                n_atom_atom_edges = atom_atom_edges_triu.shape[1]
+                atom_atom_e = edge_dist_categorical.sample((n_atom_atom_edges,)).to(
+                    device
+                )
+                new_e_triu_list.append(atom_atom_e)
+
+    # 4. Combine all triu edges and symmetrize
+    if len(new_edges_triu_list) > 0:
+        new_edge_index_triu = torch.cat(new_edges_triu_list, dim=1)
+        new_e_triu = torch.cat(new_e_triu_list, dim=0)
+
+        # Symmetrize the upper triangle edges to get full symmetric representation
+        new_edge_index, new_e_attrs = edge_aligner.symmetrize_edges(
+            new_edge_index_triu, [new_e_triu]
+        )
+        new_e = new_e_attrs[0]
+
+        # Combine with existing edges
+        combined_edge_index = torch.cat([existing_edge_index, new_edge_index], dim=1)
+        combined_e = torch.cat([existing_e, new_e], dim=0)
+    else:
+        combined_edge_index = existing_edge_index
+        combined_e = existing_e
+
+    # 5. Create the result object
+    # Determine return type based on input type
+    result = MoleculeBatch(
+        x=new_x,
+        a=new_a,
+        c=new_c,
+        e=combined_e,
+        edge_index=combined_edge_index,
+        batch=new_batch,
+    )
+
+    result = sort_nodes_by_batch(result)
+
+    return result
+
+
+def join_molecules_with_predicted_edges(
+    mol: MoleculeBatch,
+    new_atoms: PointCloud,
+    ins_edge_logits: torch.Tensor,
+    spawn_node_idx: torch.Tensor,
+    target_node_idx: torch.Tensor,
+    fallback_edge_dist: torch.Tensor,
+) -> MoleculeBatch:
+    """
+    Join molecules with new atoms using predicted edge types instead of random sampling.
+    Works on upper triangular edges only, then symmetrizes.
+
+    IMPORTANT: spawn_node_idx and target_node_idx must be in post-deletion index space,
+    i.e., they should be valid indices into `mol`.
+
+    Args:
+        mol: Current molecule batch (after any deletions)
+        new_atoms: New atoms to insert (with batch attribute set)
+        ins_edge_logits: [E_ins, n_edge_types] - Predicted edge logits for edges
+                         between new atoms and existing nodes
+        spawn_node_idx: [E_ins] - Spawn node indices in mol (nodes that triggered insertions)
+        target_node_idx: [E_ins] - Target node indices in mol (existing nodes to connect to)
+        fallback_edge_dist: Edge type distribution for edges between new atoms
+
+    Returns:
+        mol: Updated molecule batch with new atoms and predicted edges
+    """
+    device = mol.x.device
+    batch_ids = mol.batch
+    batch_ids_atoms = new_atoms.batch
+    num_existing_nodes = mol.num_nodes
+    num_new_atoms = new_atoms.num_nodes
+    edge_aligner = EdgeAligner()
+
+    # 1. Concatenate node features
+    new_x = torch.cat([mol.x, new_atoms.x], dim=0)
+    new_a = torch.cat([mol.a, new_atoms.a], dim=0)
+    new_c = torch.cat([mol.c, new_atoms.c], dim=0)
+    new_batch = torch.cat([batch_ids, batch_ids_atoms], dim=0)
+
+    # 2. Keep existing edges (already symmetric)
+    if mol.edge_index is not None and mol.edge_index.numel() > 0:
+        existing_edge_index = mol.edge_index.clone()
+        existing_e = mol.e.clone()
+    else:
+        existing_edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+        existing_e = torch.empty((0,), dtype=torch.long, device=device)
+
+    # 3. Build mapping: spawn_node_idx (in mol) -> new_atom_idx
+    # Each unique spawn node spawns one new atom, in order
+    unique_spawn_nodes = spawn_node_idx.unique()
+    spawn_to_new_atom = {}
+    for i, spawn_idx in enumerate(unique_spawn_nodes.tolist()):
+        spawn_to_new_atom[spawn_idx] = i + num_existing_nodes
+
+    # 4. Create NEW edges in upper triangular form only (row < col)
+    new_edges_triu_list = []
+    new_e_triu_list = []
+
+    if ins_edge_logits is not None and ins_edge_logits.numel() > 0:
+        # Sample edge types from logits
+        edge_probs = torch.softmax(ins_edge_logits, dim=-1)
+        sampled_edge_types = Categorical(probs=edge_probs).sample()
+
+        # For each predicted edge, create upper triangular edge only
+        for i in range(len(spawn_node_idx)):
+            spawn_idx = spawn_node_idx[i].item()
+            target_idx = target_node_idx[i].item()
+            edge_type = sampled_edge_types[i].item()
+
+            # Validate indices are within bounds
+            if spawn_idx not in spawn_to_new_atom:
+                continue
+            if target_idx < 0 or target_idx >= num_existing_nodes:
+                continue
+
+            new_atom_idx = spawn_to_new_atom[spawn_idx]
+
+            # Store in upper triangular form (min_idx, max_idx)
+            row = min(new_atom_idx, target_idx)
+            col = max(new_atom_idx, target_idx)
+            new_edges_triu_list.append([row, col])
+            new_e_triu_list.append(edge_type)
+
+    # 5. Create edges between new atoms in the same graph (upper triangular only)
+    edge_dist_cat = Categorical(probs=fallback_edge_dist)
+
+    for batch_id in batch_ids_atoms.unique():
+        atom_mask = batch_ids_atoms == batch_id
+        atom_indices = torch.where(atom_mask)[0] + num_existing_nodes
+
+        # Edges between new atoms (upper triangular: i < j)
+        if len(atom_indices) > 1:
+            for i, idx_i in enumerate(atom_indices):
+                for idx_j in atom_indices[i + 1 :]:
+                    edge_type = edge_dist_cat.sample().item()
+                    # idx_i < idx_j by construction
+                    new_edges_triu_list.append([idx_i.item(), idx_j.item()])
+                    new_e_triu_list.append(edge_type)
+
+    # 6. Symmetrize new edges and combine with existing
+    if len(new_edges_triu_list) > 0:
+        new_edge_index_triu = torch.tensor(
+            new_edges_triu_list, dtype=torch.long, device=device
+        ).T
+        new_e_triu = torch.tensor(new_e_triu_list, dtype=torch.long, device=device)
+
+        # Symmetrize the upper triangular edges
+        new_edge_index, new_e_attrs = edge_aligner.symmetrize_edges(
+            new_edge_index_triu, [new_e_triu]
+        )
+        new_e = new_e_attrs[0]
+
+        # Combine with existing edges
+        combined_edge_index = torch.cat([existing_edge_index, new_edge_index], dim=1)
+        combined_e = torch.cat([existing_e, new_e], dim=0)
+
+        # Sort for canonical ordering
+        combined_edge_index, combined_e = sort_edge_index(
+            combined_edge_index, combined_e
+        )
+    else:
+        combined_edge_index = existing_edge_index
+        combined_e = existing_e
+
+    # 7. Validate final edge indices are in bounds
+    total_nodes = num_existing_nodes + num_new_atoms
+    if combined_edge_index.numel() > 0:
+        assert combined_edge_index.max() < total_nodes, (
+            f"Edge index {combined_edge_index.max()} >= total nodes {total_nodes}"
+        )
+
+    # 8. Create result
+    result = MoleculeBatch(
+        x=new_x,
+        a=new_a,
+        c=new_c,
+        e=combined_e,
+        edge_index=combined_edge_index,
+        batch=new_batch,
+    )
+
+    result = sort_nodes_by_batch(result)
+
+    return result

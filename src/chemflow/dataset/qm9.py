@@ -17,6 +17,7 @@ from torch_geometric.io import fs
 from torch_geometric.utils import one_hot, scatter
 
 from chemflow.dataset.molecule_data import MoleculeData
+from chemflow.dataset.vocab import Vocab, Distributions
 
 
 class QM9Charges(QM9):
@@ -169,17 +170,15 @@ class FlowMatchingQM9Dataset(QM9Charges):
     def __init__(
         self,
         root,
-        atom_tokens: list[str],
-        charge_tokens: list[str],
-        coord_std: float = None,
+        vocab: Vocab,
+        distributions: Distributions,
         transform=None,
         pre_transform=None,
     ):
         super().__init__(root, transform, pre_transform)
 
-        self.atom_tokens = atom_tokens
-        self.charge_tokens = charge_tokens
-        self.coord_std = coord_std
+        self.vocab = vocab
+        self.distributions = distributions
 
     def __getitem__(self, index):
         data = super().__getitem__(index)
@@ -189,7 +188,9 @@ class FlowMatchingQM9Dataset(QM9Charges):
 
         atom_types = data.z
         atom_types = z_to_atom_types(atom_types.tolist())
-        atom_types = [token_to_index(self.atom_tokens, token) for token in atom_types]
+        atom_types = [
+            token_to_index(self.vocab.atom_tokens, token) for token in atom_types
+        ]
         atom_types = torch.tensor(atom_types, dtype=torch.long)
 
         # add 1 to the edge types to make them 1-indexed
@@ -202,14 +203,13 @@ class FlowMatchingQM9Dataset(QM9Charges):
         edge_types = edge_types[data.edge_index[0], data.edge_index[1]]
         edge_types = edge_types.to(torch.long)
 
-        """
         # moved to sampling step
-        if self.coord_std is not None:
-            coord = coord / self.coord_std"""
+        if self.distributions.coordinate_std is not None:
+            coord = coord / self.distributions.coordinate_std
 
         charges = data.charges.tolist()
         charges = [
-            token_to_index(self.charge_tokens, str(charge)) for charge in charges
+            token_to_index(self.vocab.charge_tokens, str(charge)) for charge in charges
         ]
         charges = torch.tensor(charges, dtype=torch.long)
 

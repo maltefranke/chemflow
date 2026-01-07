@@ -4,13 +4,14 @@ trainer:
   devices: auto 
   accelerator: auto
   precision: 32
-  max_epochs: 400
+  max_epochs: 200
   accumulate_grad_batches: 1 # Makes effective batch size = N * batch_size
   num_sanity_val_steps: 1 
-  gradient_clip_val: 10
+  gradient_clip_val: 5
   gradient_clip_algorithm: value
+  val_check_interval: 0.5
  # profiler: simple
 
-  limit_train_batches: 2
-  limit_val_batches: 1
-  limit_predict_batches: 1
+  # limit_train_batches: 4
+  limit_val_batches: 4
+  limit_predict_batches: 2

@@ -1,3 +1,4 @@
+from typing import Any
 import hydra
 from omegaconf import DictConfig
 from pytorch_lightning import Callback
@@ -203,20 +204,43 @@ def compute_token_weights(
 
     Args:
         token_list: List of all tokens (e.g., atom types or edge types)
-        distribution: Distribution of token types from training data
+        distribution: Distribution of token types from training data.
+            MUST have the same length as token_list and be aligned by index.
         special_token_names: List of special token names to handle specially
             (e.g., ["<MASK>", "<DEATH>"] for nodes or ["<MASK>", "<NO_BOND>"] for edges)
         weight_alpha: Alpha parameter for weight scaling (default: 1.0)
         type_loss_token_weights: "uniform" or "training" - if "uniform", returns
-            uniform weights (all 1.0)
+            uniform weights (all 1.0) except for <MASK> which stays 0.0
 
     Returns:
         Weights tensor with same shape as distribution
     """
-    # Get indices for special tokens
-    special_token_indices = {
-        token_to_index(token_list, token_name) for token_name in special_token_names
-    }
+    # Validate inputs
+    if len(distribution) != len(token_list):
+        raise ValueError(
+            f"Distribution length ({len(distribution)}) must match "
+            f"token_list length ({len(token_list)})"
+        )
+
+    # Get indices for special tokens (with validation)
+    special_token_indices = set()
+    mask_token_idx = None
+    for token_name in special_token_names:
+        if token_name not in token_list:
+            print(f"Warning: Special token '{token_name}' not in token_list, skipping")
+            continue
+        idx = token_to_index(token_list, token_name)
+        special_token_indices.add(idx)
+        if token_name == "<MASK>":
+            mask_token_idx = idx
+
+    # --- Handle uniform weights case early ---
+    if type_loss_token_weights == "uniform":
+        final_weights = torch.ones_like(distribution)
+        # <MASK> should always have 0 weight (ignore in loss)
+        if mask_token_idx is not None:
+            final_weights[mask_token_idx] = 0.0
+        return final_weights
 
     # --- 1. Initial Weight Calculation (Inverse Frequency) ---
     epsilon = 1e-8
@@ -225,18 +249,13 @@ def compute_token_weights(
 
     # --- 2. Isolate & Normalize REGULAR Tokens ---
     all_indices = set(range(len(token_list)))
-    # Convert to list for indexing
     regular_token_indices = list(all_indices - special_token_indices)
 
     if not regular_token_indices:
         # Fallback if no regular tokens (unlikely, but good to handle)
         final_weights = torch.ones_like(weights)
-        for token_name in special_token_names:
-            token_idx = token_to_index(token_list, token_name)
-            if token_name == "<MASK>":
-                final_weights[token_idx] = 0.0
-            else:
-                final_weights[token_idx] = 1.0
+        if mask_token_idx is not None:
+            final_weights[mask_token_idx] = 0.0
         return final_weights
 
     # Get weights for only the regular tokens
@@ -247,47 +266,32 @@ def compute_token_weights(
     if mean_regular_weight > 0:
         regular_weights = regular_weights / mean_regular_weight
 
-    # Find the min weight *after* normalization
-    min_regular_weight = regular_weights.min()
-
     # --- 3. Build Final Weights Tensor ---
-    # Start with zeros
-    final_weights = torch.zeros_like(weights)
+    # Start with the full weights (including special tokens computed from distribution)
+    final_weights = weights.clone()
 
     # Assign normalized regular weights to their correct positions
     final_weights[regular_token_indices] = regular_weights
 
-    # Assign special token weights based on the normalized regular weights
+    # Handle special tokens
     for token_name in special_token_names:
+        if token_name not in token_list:
+            continue
         token_idx = token_to_index(token_list, token_name)
+
         if token_name == "<MASK>":
+            # <MASK> should never contribute to loss
             final_weights[token_idx] = 0.0
         else:
-            # For other special tokens (e.g., DEATH, NO_BOND), use min weight
-            final_weights[token_idx] = min_regular_weight
-
-    if type_loss_token_weights == "uniform":
-        final_weights = torch.ones_like(final_weights)
+            # For other special tokens (e.g., <NO_BOND>), use their actual
+            # inverse frequency weight, normalized the same way as regular tokens
+            # This ensures common special tokens (like <NO_BOND>) get low weight
+            special_weight = weights[token_idx]
+            if mean_regular_weight > 0:
+                special_weight = special_weight / mean_regular_weight
+            final_weights[token_idx] = special_weight
 
     return final_weights
-
-
-def get_canonical_upper_triangle_with_index(edge_index, edge_attr, include_diag=False):
-    """
-    Returns (edge_index, edge_attr) for the upper triangle.
-    """
-    # 1. Sort first to ensure canonical order
-    edge_index, edge_attr = sort_edge_index(edge_index, edge_attr)
-    row, col = edge_index
-
-    # 2. Filter
-    if include_diag:
-        mask = row <= col
-    else:
-        mask = row < col
-
-    # Return BOTH the filtered index and attributes
-    return edge_index[:, mask], edge_attr[mask]
 
 
 def symmetrize_upper_triangle(edge_index, edge_attr):
@@ -325,3 +329,138 @@ def remove_token_from_distribution(token_list, distribution, token="<MASK>"):
         [distribution[:token_index], distribution[token_index + 1 :]]
     )
     return token_list, distribution
+
+
+class EdgeAligner:
+    """
+    Helper class to handle edge indices and attributes.
+    Can be used to align edge indices and attributes between two groups of edges.
+    """
+
+    def __init__(self):
+        pass
+
+    def get_canonical_upper_triangle_with_index(
+        self, edge_index, edge_attr, include_diag=False
+    ):
+        """
+        Returns (edge_index, edge_attr) for the upper triangle.
+        """
+        # 1. Sort first to ensure canonical order
+        edge_index, edge_attr = sort_edge_index(edge_index, edge_attr)
+        row, col = edge_index
+
+        # 2. Filter
+        if include_diag:
+            mask = row <= col
+        else:
+            mask = row < col
+
+        # Return BOTH the filtered index and attributes
+        return edge_index[:, mask], edge_attr[mask]
+
+    def _process_edge_group(self, edge_index, attrs):
+        """
+        Helper: Takes an edge_index and a LIST of attributes.
+        Returns the canonical upper-tri edge_index and the list of processed attributes.
+        """
+        if not attrs:
+            return None, []
+
+        processed_attrs = []
+        canonical_index = None
+
+        for attr in attrs:
+            # We call your existing helper for each attribute
+            curr_index, curr_attr_triu = self.get_canonical_upper_triangle_with_index(
+                edge_index, attr
+            )
+
+            # Store the index from the first attribute to use for validation
+            if canonical_index is None:
+                canonical_index = curr_index
+
+            processed_attrs.append(curr_attr_triu)
+
+        return canonical_index, processed_attrs
+
+    def align_edges(self, source_group, target_group=None):
+        """
+        Flexible handler for aligning edge attributes.
+
+        Args:
+            source_group: Tuple of (edge_index, [attr1, attr2, ...])
+            target_group: (Optional) Tuple of (edge_index, [attr1, attr2, ...])
+
+        Returns:
+            Flat tuple of all processed attributes from source then target.
+        """
+        src_index, src_attrs = source_group
+        tgt_index, tgt_attrs = (None, None) if target_group is None else target_group
+
+        # 1. Process Source Group
+        src_triu_index, src_triu_attrs = self._process_edge_group(src_index, src_attrs)
+
+        # 2. Process Target Group (if exists)
+        tgt_triu_attrs = []
+        if target_group:
+            tgt_triu_index, tgt_triu_attrs = self._process_edge_group(
+                tgt_index, tgt_attrs
+            )
+
+            # 3. Assert Alignment
+            assert torch.all(src_triu_index == tgt_triu_index), (
+                "The edge indices between source and target groups must be the same."
+            )
+
+            # Return all attributes flattened
+            out = {
+                "edge_index": (src_triu_index, tgt_triu_index),
+                "edge_attr": tuple(src_triu_attrs + tgt_triu_attrs),
+            }
+
+        else:
+            out = {
+                "edge_index": src_triu_index,
+                "edge_attr": src_triu_attrs,
+            }
+        return out
+
+    def symmetrize_edges(
+        self, edge_index_triu: torch.Tensor, attrs: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        """
+        Reverse: Upper Triangle -> Full Symmetric
+        Handles a list of attributes efficiently by calculating the sort permutation once.
+        """
+        row, col = edge_index_triu
+
+        # 1. Identify off-diagonal edges to mirror
+        mask = row < col
+
+        # 2. Create the mirrored index
+        mirror_index = torch.stack([col[mask], row[mask]], dim=0)
+        full_edge_index = torch.cat([edge_index_triu, mirror_index], dim=1)
+
+        # 3. Compute Sort Permutation ONCE
+        # We cannot use sort_edge_index repeatedly or we risk attributes getting out of sync
+        # if the sort isn't stable. We compute indices explicitly.
+        # Simple Lexical Sort: row * max_cols + col
+        # (Or use PyTorch's stable sort on rows then cols)
+        num_nodes = full_edge_index.max().item() + 1
+        perm = (full_edge_index[0] * num_nodes + full_edge_index[1]).argsort()
+
+        # Apply sort to index
+        full_edge_index_sorted = full_edge_index[:, perm]
+
+        # 4. Process all attributes
+        full_attrs_sorted = []
+        for attr in attrs:
+            # Mirror the attributes corresponding to the mask
+            mirror_attr = attr[mask]
+            full_attr = torch.cat([attr, mirror_attr], dim=0)
+
+            # Apply the SAME permutation
+            full_attrs_sorted.append(full_attr[perm])
+
+        return full_edge_index_sorted, tuple(full_attrs_sorted)

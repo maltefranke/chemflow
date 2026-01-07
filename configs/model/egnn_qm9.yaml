@@ -3,7 +3,7 @@ K: 10
 D: 3
 
 is_typed: ${if:${eq:${data.cat_strategy},uniform-sample},true,false}
-output_dim_typed: ${oc.eval:"${model.K} + ${model.K} + ${model.K}*${len:${data.atom_tokens}}"}
+output_dim_typed: ${oc.eval:"${model.K} + ${model.K} + ${model.K}*${len:${data.atom_tokens}} + ${model.K}*${len:${data.charge_tokens}}"}
 output_dim_untyped: ${oc.eval:"${model.K} + ${model.K}"}
 
 module:

@@ -2,15 +2,13 @@
 
 root_path: ${oc.env:PROJECT_ROOT}/data
 preprocess_workers: 0
-atom_tokens: None 
-edge_tokens: None
-charge_tokens: None
-atom_type_distribution: None
-edge_type_distribution: None
-n_atoms_distribution: None
 
-n_atoms_strategy: "fixed"
+n_atoms_strategy: "flexible" # "fixed"
 cat_strategy: "uniform-sample" #"mask" # "uniform-sample"
+optimal_transport: "equivariant"
+ins_noise_scale: 0.5
+t_end_del: 0.95
+t_end_ins: 0.95
 
 # Preprocessing configuration - computes tokens from data and distributions from training dataset only
 preprocessing:
@@ -23,39 +21,61 @@ preprocessing:
   # Tokens and distributions will be discovered from data and saved to files
   # On subsequent runs, they will be loaded from the files
 
+vocab: None
+
+interpolator:
+  _target_: chemflow.flow_matching.interpolation.Interpolator
+  cat_strategy: ${data.cat_strategy}
+  n_atoms_strategy: ${data.n_atoms_strategy}
+  # will be set in the instantiate method
+  vocab: ${data.vocab}
+  distributions: None
+  optimal_transport: ${data.optimal_transport}
+  ins_noise_scale: ${data.ins_noise_scale}
+  t_end_del: ${data.t_end_del}
+  t_end_ins: ${data.t_end_ins}
+
 datamodule:
   _target_: chemflow.dataset.lightning_datamodule.LightningDataModule
-  n_atoms_strategy: ${data.n_atoms_strategy}
   # tokens and distributions will be passed from preprocessing in run.py
+
+  vocab: ${data.vocab}
+  distributions: None
 
   datasets:
     train:
       _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
       root: ${data.root_path}/qm9
-      atom_tokens: ${data.atom_tokens}
-      charge_tokens: ${data.charge_tokens}
+      vocab: ${data.vocab}
+      distributions: None
       
-
     val:
       - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
         root: ${data.root_path}/qm9
-        atom_tokens: ${data.atom_tokens}
-        charge_tokens: ${data.charge_tokens}
+        vocab: ${data.vocab}
+        distributions: None
 
     test:
       - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
         root: ${data.root_path}/qm9
-        atom_tokens: ${data.atom_tokens}
-        charge_tokens: ${data.charge_tokens}
-
+        vocab: ${data.vocab}
+        distributions: None
+  
+  interpolator: ${data.interpolator}
+  
   num_workers:
-    train: 4
-    val: 4
-    test: 4
-    predict: 4
+    train: 6
+    val: 6
+    test: 6
+    predict: 6
 
   batch_size:
-    train: 64
-    val: 64
-    test: 64
+    train: 256
+    val: 256
+    test: 8
+
+  n_atoms_strategy: ${data.n_atoms_strategy}
+  cat_strategy: ${data.cat_strategy}
+  optimal_transport: ${data.optimal_transport}
+  time_dist: ${model.module.time_dist}
   

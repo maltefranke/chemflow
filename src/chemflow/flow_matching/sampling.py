@@ -1,24 +1,19 @@
 import torch
-from torch.distributions import Categorical, MixtureSameFamily, Normal, Independent
-import torch.nn.functional as F
+from torch.distributions import Categorical
 
 from chemflow.dataset.molecule_data import MoleculeData
-from torch_geometric.utils import remove_self_loops
 from chemflow.utils import build_fully_connected_edge_index
+from chemflow.dataset.vocab import Distributions, Vocab
 
 
 def sample_prior_graph(
-    atom_type_distribution,
-    edge_type_distribution,
-    charge_type_distribution,
-    n_atoms_distribution,
+    distributions: Distributions,
     n_atoms=None,
-    coord_std=1.0,
 ):
-    p_atom_types = Categorical(probs=atom_type_distribution)
-    p_edge_types = Categorical(probs=edge_type_distribution)
-    p_charge_types = Categorical(probs=charge_type_distribution)
-    p_n_atoms = Categorical(probs=n_atoms_distribution)
+    p_atom_types = Categorical(probs=distributions.atom_type_distribution)
+    p_edge_types = Categorical(probs=distributions.edge_type_distribution)
+    p_charge_types = Categorical(probs=distributions.charge_type_distribution)
+    p_n_atoms = Categorical(probs=distributions.n_atoms_distribution)
 
     # sample number of atoms from train distribution
     if n_atoms:
@@ -35,7 +30,7 @@ def sample_prior_graph(
     charge_types = charge_types.to(torch.long)
 
     # sample coordinates randomly, and make sure to center the coordinates
-    coord = torch.randn(N_atoms, 3) * coord_std
+    coord = torch.randn(N_atoms, 3)
     coord = coord - coord.mean(dim=0)
 
     # instantiate fully connected
@@ -66,33 +61,29 @@ def sample_prior_graph(
     return sampled_graph
 
 
-def sample_births(unmatched_mol_1, t, sigma=1.0):
-    num_unmatched_atoms = unmatched_mol_1.num_nodes
+class Sampler:
+    def __init__(self, vocab: Vocab, distributions: Distributions):
+        self.vocab = vocab
+        self.distributions = distributions
 
-    # sample birth times
-    birth_times = torch.rand(num_unmatched_atoms, device=unmatched_mol_1.x.device)
+    def sample_de_novo():
+        pass
 
-    # select birth times that are less than t
-    birth_times_mask = birth_times < t
-    birth_times = birth_times[birth_times_mask]
+    def sample_conformer(self, graph):
+        pass
 
-    born_nodes_1 = unmatched_mol_1.subgraph(birth_times_mask)
-    unborn_nodes_1 = unmatched_mol_1.subgraph(~birth_times_mask)
+    def sample(self, batch):
+        all_sampled_graphs = []
+        for batch_i in batch:
+            task = batch_i.task
 
-    return birth_times, born_nodes_1, unborn_nodes_1
+            if task == "de_novo":
+                sampled_graph = self.sample_de_novo()
+            elif task == "conformer":
+                sampled_graph = self.sample_conformer(batch_i)
+            else:
+                raise ValueError(f"Invalid task: {task}")
 
+            all_sampled_graphs.append(sampled_graph)
 
-def sample_deaths(unmatched_x0, unmatched_a0, t):
-    """
-    unmatched_x0 (N, D)
-    unmatched_a0 (N, C)
-    t (float)
-    """
-    num_unmatched_atoms = unmatched_x0.shape[0]
-
-    # sample death times
-    death_times = torch.rand(num_unmatched_atoms, device=unmatched_x0.device)
-    is_dead = death_times < t
-    x0_alive_at_xt = unmatched_x0[~is_dead]
-    a0_alive_at_xt = unmatched_a0[~is_dead]
-    return death_times, is_dead, x0_alive_at_xt, a0_alive_at_xt
+        return all_sampled_graphs

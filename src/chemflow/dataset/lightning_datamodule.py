@@ -3,6 +3,7 @@ from torch.utils.data import DataLoader
 from omegaconf import DictConfig
 import hydra
 import torch
+from functools import partial
 
 from chemflow.dataset.molecule_data import MoleculeBatch
 from chemflow.flow_matching.sampling import sample_prior_graph
@@ -12,107 +13,109 @@ from chemflow.utils import token_to_index
 class LightningDataModule(pl.LightningDataModule):
     def __init__(
         self,
+        vocab: DictConfig,
+        distributions: DictConfig,
         datasets: DictConfig,
+        interpolator: DictConfig,
         num_workers: DictConfig,
         batch_size: DictConfig,
         cat_strategy: str = "uniform-sample",
         n_atoms_strategy: str = "flexible",
         optimal_transport: str = "equivariant",
+        time_dist: DictConfig = None,
     ):
+        self.vocab = vocab
+        self.distributions = distributions
         self.datasets = datasets
+        self.interpolator = interpolator
         self.num_workers = num_workers
         self.batch_size = batch_size
         self.cat_strategy = cat_strategy
         self.n_atoms_strategy = n_atoms_strategy
         self.optimal_transport = optimal_transport
 
-        # Will be set via setter methods
-        self.atom_tokens = None
-        self.edge_tokens = None
-        self.atom_type_distribution = None
-        self.edge_type_distribution = None
-        self.charge_type_distribution = None
-        self.n_atoms_distribution = None
-        self.charge_tokens = None
-        self.atom_mask_token_index = None
-        self.edge_mask_token_index = None
-        self.coord_std = None
+        if time_dist is None:
+            time_dist = DictConfig(
+                {
+                    "_target_": "torch.distributions.Uniform",
+                    "low": 0.0,
+                    "high": 1.0,
+                }
+            )
+        self.time_dist = hydra.utils.instantiate(time_dist)
 
+        # Will be set via setter methods
         # will be set later
         self.train_dataset = None
         self.val_datasets = None
         self.test_datasets = None
 
+        if self.cat_strategy == "mask":
+            self.atom_mask_token_index = token_to_index(
+                self.vocab.atom_tokens, "<MASK>"
+            )
+            self.edge_mask_token_index = token_to_index(
+                self.vocab.edge_tokens, "<MASK>"
+            )
+
+            self.distributions.atom_type_distribution = torch.zeros_like(
+                self.distributions.atom_type_distribution
+            )
+            # always sample a mask token
+            self.distributions.atom_type_distribution[self.atom_mask_token_index] = 1.0
+
+            self.distributions.edge_type_distribution = torch.zeros_like(
+                self.distributions.edge_type_distribution
+            )
+            # always sample a mask token
+            self.distributions.edge_type_distribution[self.edge_mask_token_index] = 1.0
+
+        self.distributions.coordinate_std = (
+            self.distributions.coordinate_std
+            if self.distributions.coordinate_std is not None
+            else None
+        )
+
+        self.interpolator = hydra.utils.instantiate(
+            interpolator, distributions=self.distributions
+        )
+
         super().__init__()
-
-    def set_tokens_and_distributions(
-        self,
-        atom_tokens: list[str],
-        edge_tokens: list[str],
-        charge_tokens: list[str],
-        atom_type_distribution: torch.Tensor,
-        edge_type_distribution: torch.Tensor,
-        charge_type_distribution: torch.Tensor,
-        n_atoms_distribution: torch.Tensor,
-        coord_std: torch.Tensor = None,
-    ):
-        """Set tokens and distributions after initialization."""
-        self.atom_tokens = atom_tokens
-        self.edge_tokens = edge_tokens
-        self.charge_tokens = charge_tokens
-        self.atom_type_distribution = atom_type_distribution
-        self.edge_type_distribution = edge_type_distribution
-        self.charge_type_distribution = charge_type_distribution
-        self.n_atoms_distribution = n_atoms_distribution
-
-        if self.n_atoms_strategy != "fixed":
-            self.death_token_index = token_to_index(self.atom_tokens, "<DEATH>")
-
-            if self.cat_strategy == "uniform-sample":
-                # We never want to sample a death token
-                self.atom_type_distribution[self.death_token_index] = 0.0
-
-        elif self.cat_strategy == "mask":
-            self.atom_mask_token_index = token_to_index(self.atom_tokens, "<MASK>")
-            self.edge_mask_token_index = token_to_index(self.edge_tokens, "<MASK>")
-
-            self.atom_type_distribution = torch.zeros_like(self.atom_type_distribution)
-            # always sample a mask token
-            self.atom_type_distribution[self.atom_mask_token_index] = 1.0
-
-            self.edge_type_distribution = torch.zeros_like(self.edge_type_distribution)
-            # always sample a mask token
-            self.edge_type_distribution[self.edge_mask_token_index] = 1.0
-
-        self.coord_std = coord_std if coord_std is not None else None
 
     def setup(self, stage=None):
         """Construct datasets and assign data scalers."""
         # Check that tokens and distributions are set
-        if self.atom_tokens is None:
+        if self.vocab is None:
             raise ValueError(
-                "atom_tokens and distributions must be set before calling setup(). "
+                "vocab and distributions must be set before calling setup(). "
                 "Call set_tokens_and_distributions() first."
             )
 
         # Inject tokens and distributions into dataset configs
         train_cfg = self.datasets.train.copy()
-        train_cfg.coord_std = self.coord_std
-        self.train_dataset = hydra.utils.instantiate(train_cfg)
+        self.train_dataset = hydra.utils.instantiate(
+            train_cfg, vocab=self.vocab, distributions=self.distributions
+        )
 
         self.val_datasets = []
         for dataset_cfg in self.datasets.val:
             val_cfg = dataset_cfg.copy()
-            val_cfg.coord_std = self.coord_std
-            self.val_datasets.append(hydra.utils.instantiate(val_cfg))
+            self.val_datasets.append(
+                hydra.utils.instantiate(
+                    val_cfg, vocab=self.vocab, distributions=self.distributions
+                )
+            )
 
         self.test_datasets = []
         for dataset_cfg in self.datasets.test:
             test_cfg = dataset_cfg.copy()
-            test_cfg.coord_std = self.coord_std
-            self.test_datasets.append(hydra.utils.instantiate(test_cfg))
+            self.test_datasets.append(
+                hydra.utils.instantiate(
+                    test_cfg, vocab=self.vocab, distributions=self.distributions
+                )
+            )
 
-    def collate_fn(self, batch):
+    def collate_fn(self, batch, stage="train"):
         targets = batch
         if self.n_atoms_strategy == "fixed":
             n_atoms = [target.num_nodes for target in targets]
@@ -121,18 +124,29 @@ class LightningDataModule(pl.LightningDataModule):
 
         samples = [
             sample_prior_graph(
-                self.atom_type_distribution,
-                self.edge_type_distribution,
-                self.charge_type_distribution,
-                self.n_atoms_distribution,
+                self.distributions,
                 n_atoms=n_atoms_i,
-                coord_std=self.coord_std,
             )
             for n_atoms_i in n_atoms
         ]
         samples_batched = MoleculeBatch.from_data_list(samples)
         targets_batched = MoleculeBatch.from_data_list(targets)
-        return samples_batched, targets_batched
+
+        if stage == "train":
+            batch_size = targets_batched.batch_size
+            device = targets_batched.x.device
+
+            # interpolate
+            t = self.time_dist.sample((batch_size,)).to(device)
+            mols_t, mols_1, ins_targets = self.interpolator.interpolate_different_size(
+                samples_batched,
+                targets_batched,
+                t,
+            )
+            return mols_t, mols_1, ins_targets, t
+
+        else:
+            return samples_batched, targets_batched
 
     def train_dataloader(self):
         # Return a DataLoader for training
@@ -142,9 +156,9 @@ class LightningDataModule(pl.LightningDataModule):
             batch_size=self.batch_size.train,
             num_workers=self.num_workers.train,
             persistent_workers=True,
-            pin_memory=True,
+            pin_memory=False,
             drop_last=True,
-            collate_fn=self.collate_fn,
+            collate_fn=partial(self.collate_fn, stage="train"),
         )
 
     def val_dataloader(self):
@@ -156,9 +170,9 @@ class LightningDataModule(pl.LightningDataModule):
                 batch_size=self.batch_size.val,
                 num_workers=self.num_workers.val,
                 persistent_workers=True,
-                pin_memory=True,
+                pin_memory=False,
                 drop_last=True,
-                collate_fn=self.collate_fn,
+                collate_fn=partial(self.collate_fn, stage="val"),
             )
             for dataset in self.val_datasets
         ]
@@ -172,8 +186,8 @@ class LightningDataModule(pl.LightningDataModule):
                 batch_size=self.batch_size.test,
                 num_workers=self.num_workers.test,
                 persistent_workers=True,
-                pin_memory=True,
-                collate_fn=self.collate_fn,
+                pin_memory=False,
+                collate_fn=partial(self.collate_fn, stage="test"),
             )
             for dataset in self.test_datasets
         ]
