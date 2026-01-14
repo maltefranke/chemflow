@@ -160,7 +160,7 @@ class MultiHeadModule(nn.Module):
 
 
 class EquivariantGMMHead(nn.Module):
-    def __init__(self, hidden_dim, K, N_a, N_c):
+    def __init__(self, hidden_dim, K, N_a, N_c, rbf_embedding_args: DictConfig = None):
         """
         Args:
             hidden_dim: Input dimension of invariant features h.
@@ -172,24 +172,53 @@ class EquivariantGMMHead(nn.Module):
         self.K = K
         self.N_a = N_a
         self.N_c = N_c
+        self.rbf_embedding = hydra.utils.instantiate(rbf_embedding_args)
+        dist_feat_dim = rbf_embedding_args.get(
+            "out_dim", rbf_embedding_args.get("num_rbf", 16)
+        )
 
         # --- 1. Invariant Scalar Head (MLP) ---
         # Predicts: Pi (K), Sigma (K), AtomProbs (K*N_a), ChargeProbs (K*N_c)
+        # --- 2. Invariant Scalar Head (MLP) ---
         scalar_out_dim = K + K + (K * N_a) + (K * N_c)
         self.scalar_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),  # Stabilizer
             nn.SiLU(),
             nn.Linear(hidden_dim, scalar_out_dim),
         )
 
-        # --- 2. Equivariant Vector Head (Edge Processor) ---
-        # We need a small network to compute weights for the K vectors
-        # Input: h_i, h_j, dist_sq
+        # --- 3. Equivariant Vector Head (Edge Processor) ---
+        # Input: h_i (dim) + h_j (dim) + rbf_feat (dim)
+        input_dim_coord = hidden_dim * 2 + dist_feat_dim
+
         self.coord_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 1, hidden_dim),
+            nn.Linear(input_dim_coord, hidden_dim),
+            nn.LayerNorm(hidden_dim),  # Stabilizer
             nn.SiLU(),
-            nn.Linear(hidden_dim, K),  # Output K weights per edge
+            nn.Linear(hidden_dim, K, bias=False),
         )
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # 1. Standard Init for Hidden Layers
+        # (Note: RBFEmbedding has its own init, so we skip it here)
+        for m in [self.scalar_mlp[0], self.coord_mlp[0]]:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
+        # 2. "Near-Zero" Init for Coordinate Output
+        # CRITICAL: Ensures mu starts as current position
+        last_coord = self.coord_mlp[-1]
+        nn.init.uniform_(last_coord.weight, -1e-4, 1e-4)
+        # nn.init.zeros_(last_coord.bias)
+
+        # 3. Stable Init for Scalar Output
+        last_scalar = self.scalar_mlp[-1]
+        nn.init.xavier_uniform_(last_scalar.weight, gain=0.1)
+        nn.init.zeros_(last_scalar.bias)
 
     def forward(self, h, x, edge_index):
         """
@@ -227,17 +256,22 @@ class EquivariantGMMHead(nn.Module):
         # ----------------------------------------
         # Part B: Predict Equivariant Means (The "Minimal" Fix)
         # ----------------------------------------
-        # 1. Calculate relative differences
+        # Calculate relative differences
         diff = x[row] - x[col]  # [E, 3]
         dist_sq = torch.sum(diff**2, dim=1, keepdim=True)  # [E, 1]
+        dist = torch.sqrt(dist_sq + 1e-8)
+
+        # 1. Embed distances
+        dist_feat = self.rbf_embedding(dist)
 
         # 2. Prepare edge features for the weighting function
-        # Concatenate: h_i, h_j, dist_sq
-        edge_feat = torch.cat([h[row], h[col], dist_sq], dim=1)  # [E, 2*dim + 1]
+        # Concatenate: h_i, h_j, dist_feat
+        edge_feat = torch.cat(
+            [h[row], h[col], dist_feat], dim=1
+        )  # [E, 2*dim + dist_feat_dim]
 
         # 3. Predict weights for K distinct vectors
         # Weights shape: [E, K]
-        # We scale weights by 1/(dist+1) or similar for stability (optional but recommended)
         weights = self.coord_mlp(edge_feat)
 
         # 4. Weighted Sum (Equivariant Aggregation)
@@ -248,6 +282,15 @@ class EquivariantGMMHead(nn.Module):
         # Result: [N, K, 3]
         shift = torch.zeros(N, self.K, 3, device=x.device)
         shift.index_add_(0, row, weighted_diff)
+
+        # If an atom has 50 neighbors, the sum is huge. Divide by degree.
+        # Calculate degree
+        deg = torch.zeros(N, 1, device=x.device)
+        deg.index_add_(0, row, torch.ones(row.shape[0], 1, device=x.device))
+        deg = deg.clamp(min=1.0)  # Avoid division by zero
+
+        # Normalize shift (Broadcasting: [N, K, 3] / [N, 1, 1])
+        shift = shift / deg.unsqueeze(-1)
 
         # 5. Final Equivariant Means
         # The mean is the current position + the calculated shift
@@ -298,29 +341,6 @@ class InsertionEdgeHead(nn.Module):
         self.n_edge_types = n_edge_types
         self.n_atom_types = n_atom_types
         self.n_charge_types = n_charge_types
-
-        """# RBF embedding for distance encoding
-        if use_distance_features:
-            if rbf_embedding_args is not None:
-                # Check if it's already instantiated (Hydra may auto-instantiate nested configs)
-                if isinstance(rbf_embedding_args, DictConfig):
-                    # It's a config, instantiate it ourselves
-                    self.rbf_embedding = hydra.utils.instantiate(rbf_embedding_args)
-                    dist_feat_dim = rbf_embedding_args.get(
-                        "out_dim", rbf_embedding_args.get("num_rbf", 16)
-                    )
-                else:
-                    # Already instantiated by Hydra, use as-is
-                    self.rbf_embedding = rbf_embedding_args
-                    # Get out_dim from the RBFEmbedding object
-                    dist_feat_dim = getattr(self.rbf_embedding, "out_dim", 16)
-            else:
-                # Fallback to default if not provided
-                self.rbf_embedding = RBFEmbedding(num_rbf=16, rbf_dmax=10.0)
-                dist_feat_dim = 16
-        else:
-            self.rbf_embedding = None
-            dist_feat_dim = 1"""
 
         self.rbf_embedding = hydra.utils.instantiate(rbf_embedding_args)
         dist_feat_dim = rbf_embedding_args.get(

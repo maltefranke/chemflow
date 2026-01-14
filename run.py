@@ -95,15 +95,15 @@ def run(cfg: DictConfig):
     )
 
     # Train the model
-    """trainer.fit(
+    trainer.fit(
         module,
         datamodule=datamodule,
-    )"""
+    )
 
     results = trainer.predict(
         module,
         dataloaders=datamodule.test_dataloader(),
-        ckpt_path="/cluster/project/krause/frankem/chemflow/outputs/2026-01-07/16-01-08/logs/chemflow/dhked3dn/checkpoints/epoch=0-step=510.ckpt",
+        # ckpt_path="/cluster/project/krause/frankem/chemflow/outputs/2026-01-13/10-43-06/checkpoints/epoch=306-step=78234.ckpt",
     )
     torch.save(results, "results.pt")
 

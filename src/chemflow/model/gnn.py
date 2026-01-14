@@ -1,17 +1,11 @@
 from src.external_code.egnn import EGNN
-from omegaconf import DictConfig, OmegaConf
-import torch.nn as nn
+from omegaconf import DictConfig
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 import hydra
-import random
-
-from src.chemflow.model.embedding import (
-    CountEmbedding,
-    TimeEmbedding,
-    RBFEmbedding,
-)
-from src.chemflow.model.self_conditioning import SelfConditioningResidualLayer
-
+from chemflow.model.self_conditioning import SelfConditioningResidualLayer
 from chemflow.dataset.molecule_data import MoleculeBatch
 
 
@@ -20,37 +14,32 @@ class EGNNWithEdgeType(EGNN):
         super().__init__(*args, **kwargs)
         out_node_nf = kwargs.get("out_node_nf", 0)
 
-        """# RBF embedding for distance encoding
-        if rbf_embedding_args is not None:
-            # Check if it's already instantiated (Hydra may auto-instantiate nested configs)
-            if isinstance(rbf_embedding_args, DictConfig):
-                # It's a config, instantiate it ourselves
-                self.rbf_embedding = hydra.utils.instantiate(rbf_embedding_args)
-                rbf_out_dim = rbf_embedding_args.get(
-                    "out_dim", rbf_embedding_args.get("num_rbf", 16)
-                )
-            else:
-                # Already instantiated by Hydra, use as-is
-                self.rbf_embedding = rbf_embedding_args
-                # Get out_dim from the RBFEmbedding object
-                rbf_out_dim = getattr(self.rbf_embedding, "out_dim", 16)
-        else:
-            # Fallback to default if not provided
-            self.rbf_embedding = RBFEmbedding(num_rbf=16, rbf_dmax=10.0)
-            rbf_out_dim = 16"""
-
         self.rbf_embedding = hydra.utils.instantiate(rbf_embedding_args)
         rbf_out_dim = rbf_embedding_args.get(
             "out_dim", rbf_embedding_args.get("num_rbf", 16)
         )
 
+        edge_dim = 2 * out_node_nf + rbf_out_dim
+        projection_dim = out_node_nf
+        self.edge_embedding_out = nn.Sequential(
+            nn.LayerNorm(edge_dim),
+            nn.Linear(edge_dim, projection_dim),
+            nn.LayerNorm(projection_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+        )
+
         # Update input dimension to account for RBF embedding instead of raw distance
-        self.edge_embedding_out = nn.Linear(2 * out_node_nf + rbf_out_dim, out_node_nf)
+        # self.edge_embedding_out = nn.Linear(2 * out_node_nf + rbf_out_dim, out_node_nf)
 
     def forward(self, h, x, edges, edge_attr):
         h = self.embedding_in(h)
         for i in range(0, self.n_layers):
             h, x, _ = self._modules["gcl_%d" % i](h, edges, x, edge_attr=edge_attr)
+
+            # residual connection: add information of conditioning to all GNN layers
+            # h = h + h_out
+
         h = self.embedding_out(h)
 
         rows, cols = edges
@@ -94,6 +83,26 @@ class BaseEGNN(nn.Module):
         self.time_embedding = hydra.utils.instantiate(time_embedding_args)
         self.node_count_embedding = hydra.utils.instantiate(node_count_embedding_args)
         self.egnn = hydra.utils.instantiate(egnn_args)
+
+        # override the embedding_in and embedding_out from the EGNN class to more stable versions
+        self.egnn.embedding_in = nn.Sequential(
+            nn.Linear(egnn_args["in_node_nf"], egnn_args["hidden_nf"]),
+            nn.LayerNorm(egnn_args["hidden_nf"]),  # CRITICAL: Normalizes the projection
+            nn.GELU(),  # GELU is smoother than ReLU (better for grad flow)
+            nn.Dropout(0.1),  # Optional: Prevents over-reliance on specific nodes
+        )
+
+        self.egnn.embedding_out = nn.Sequential(
+            # Normalize the GNN output immediately to stay safe from aggregation explosion.
+            nn.LayerNorm(egnn_args["hidden_nf"]),
+            nn.Linear(egnn_args["hidden_nf"], egnn_args["out_node_nf"]),
+            # Post-normalization: Normalizing the output of the projection
+            # ensures the GMM head receives standardized features, preventing
+            # the "variance collapse" driver from seeing wild inputs.
+            nn.LayerNorm(egnn_args["out_node_nf"]),
+            nn.GELU(),
+            nn.Dropout(0.1),
+        )
 
 
 class EGNNwithHeads(BaseEGNN):
@@ -303,5 +312,10 @@ class EGNNwithHeads(BaseEGNN):
             )
 
         outs = self.denoise_graph(h, x, edge_index, e, batch)
+
+        # rates must be positive
+        for key in outs:
+            if "rate" in key:
+                outs[key] = F.softplus(outs[key])
 
         return outs

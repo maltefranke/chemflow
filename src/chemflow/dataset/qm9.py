@@ -185,6 +185,8 @@ class FlowMatchingQM9Dataset(QM9Charges):
 
         # remove center of mass
         coord = data.pos - data.pos.mean(dim=0)
+        if self.distributions.coordinate_std is not None:
+            coord = coord / self.distributions.coordinate_std
 
         atom_types = data.z
         atom_types = z_to_atom_types(atom_types.tolist())
@@ -202,10 +204,6 @@ class FlowMatchingQM9Dataset(QM9Charges):
 
         edge_types = edge_types[data.edge_index[0], data.edge_index[1]]
         edge_types = edge_types.to(torch.long)
-
-        # moved to sampling step
-        if self.distributions.coordinate_std is not None:
-            coord = coord / self.distributions.coordinate_std
 
         charges = data.charges.tolist()
         charges = [

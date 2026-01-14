@@ -43,7 +43,9 @@ def gmm_loss(gmm_output, target_locations, target_batch_ids, mask_value=-1e3):
     return -torch.mean(log_likelihood)
 
 
-def typed_gmm_loss(gmm_output, target_x, target_a, target_c, target_batch_ids):
+def typed_gmm_loss(
+    gmm_output, target_x, target_a, target_c, target_batch_ids, reduction="mean"
+):
     """
     Computes the NLL loss using the get_typed_gmm_components helper.
 
@@ -94,18 +96,11 @@ def typed_gmm_loss(gmm_output, target_x, target_a, target_c, target_batch_ids):
     log_likelihood = torch.logsumexp(log_joint, dim=-1)
 
     # Average over nodes
-    return -torch.mean(log_likelihood)
-
-
-def rate_loss(predicted_rate, target_rate):
-    rate_loss = F.poisson_nll_loss(
-        predicted_rate,
-        target_rate,
-        log_input=False,
-    )
-
-    # Check for NaN and replace with 0 if needed
-    if torch.isnan(rate_loss):
-        rate_loss = torch.tensor(0.0, device=predicted_rate.device)
-
-    return rate_loss
+    if reduction == "mean":
+        return -torch.mean(log_likelihood)
+    elif reduction == "sum":
+        return -torch.sum(log_likelihood)
+    elif reduction == "none":
+        return -log_likelihood
+    else:
+        raise ValueError(f"Invalid reduction: {reduction}")

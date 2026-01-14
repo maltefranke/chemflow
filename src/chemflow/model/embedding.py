@@ -177,48 +177,51 @@ class TimeEmbedding(nn.Module):
 
 class RBFEncoding(nn.Module):
     """
-    Radial Basis Function (RBF) encoding for distances.
-    Computes RBF features using Gaussian basis functions.
-
-    Input:  Float Tensor [N] (distances)
-    Output: Float Tensor [N, num_rbf]
+    Trainable Radial Basis Function (RBF) encoding.
+    Both the centers and the widths (sigmas) of the Gaussians are learnable.
     """
 
-    def __init__(self, num_rbf: int = 16, rbf_dmax: float = 10.0):
-        """
-        Args:
-            num_rbf: Number of RBF basis functions
-            rbf_dmax: Maximum distance for RBF
-        """
+    def __init__(
+        self, num_rbf: int = 16, rbf_dmax: float = 10.0, trainable: bool = True
+    ):
         super().__init__()
         self.num_rbf = num_rbf
         self.rbf_dmax = rbf_dmax
 
-        # RBF centers for distance encoding
-        self.register_buffer("rbf_centers", torch.linspace(0, rbf_dmax, num_rbf))
-        self.rbf_gamma = 1.0 / (rbf_dmax / num_rbf)
+        # 1. Initialize centers evenly spaced (same as before)
+        initial_centers = torch.linspace(0, rbf_dmax, num_rbf)
+
+        # 2. Initialize sigmas (widths)
+        # The gap between centers is dmax / num_rbf.
+        # A good default sigma is often the gap size itself or slightly smaller.
+        initial_sigma = (rbf_dmax / num_rbf) * torch.ones(num_rbf)
+
+        if trainable:
+            # Wrap in nn.Parameter to enable gradient descent
+            self.rbf_centers = nn.Parameter(initial_centers)
+            self.rbf_sigma = nn.Parameter(initial_sigma)
+        else:
+            # Keep them fixed if desired
+            self.register_buffer("rbf_centers", initial_centers)
+            self.register_buffer("rbf_sigma", initial_sigma)
 
     def forward(self, distances: torch.Tensor) -> torch.Tensor:
-        """
-        Compute RBF features for distances.
-
-        Args:
-            distances: Tensor of shape [N] or [N, 1] containing distances
-
-        Returns:
-            Tensor of shape [N, num_rbf] containing RBF encodings
-        """
-        # Ensure distances is [N]
+        """Returns: [N, num_rbf]"""
         if distances.ndim > 1:
             distances = distances.squeeze(-1)
 
-        # Compute RBF features: exp(-gamma * (dist - centers)^2)
-        # distances: [N], rbf_centers: [num_rbf]
-        # distances.unsqueeze(-1): [N, 1], rbf_centers: [num_rbf]
-        # Broadcasting: [N, 1] - [num_rbf] -> [N, num_rbf]
-        return torch.exp(
-            -self.rbf_gamma * (distances.unsqueeze(-1) - self.rbf_centers) ** 2
-        )
+        # Broadcasting logic:
+        # distances:       [N, 1]
+        # centers/sigmas:  [num_rbf]
+
+        # We calculate gamma dynamically based on the current learnable sigma
+        # Gamma = 1 / sigma^2
+        # We use abs() or clamp() on sigma to ensure widths stay positive and non-zero
+        sigmas = torch.abs(self.rbf_sigma) + 1e-5  # Stability trick
+        gamma = 1.0 / (sigmas**2)
+
+        # Formula: exp( -gamma * (x - mu)^2 )
+        return torch.exp(-gamma * (distances.unsqueeze(-1) - self.rbf_centers) ** 2)
 
 
 class RBFEmbedding(nn.Module):
