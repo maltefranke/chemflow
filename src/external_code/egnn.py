@@ -10,7 +10,6 @@ import torch
 class E_GCL(nn.Module):
     """
     E(n) Equivariant Convolutional Layer
-    re
     """
 
     def __init__(

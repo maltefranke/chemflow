@@ -1,208 +1,196 @@
 import torch
-import torch.nn.functional as F
-from torch_geometric.utils import subgraph
 
-from chemflow.flow_matching.gmm import sample_from_typed_gmm, sample_from_gmm
+from chemflow.flow_matching.gmm import (
+    sample_from_typed_gmm,
+    sample_from_gmm,
+)
 from chemflow.utils import (
     token_to_index,
-    build_fully_connected_edge_index,
-    get_canonical_upper_triangle_with_index,
-    symmetrize_upper_triangle,
+    EdgeAligner,
 )
 
+from chemflow.dataset.molecule_data import (
+    MoleculeData,
+    PointCloud,
+    MoleculeBatch,
+    join_molecules_with_atoms,
+    join_molecules_with_predicted_edges,
+    filter_nodes,
+)
+from chemflow.dataset.vocab import Vocab, Distributions
 
-from chemflow.dataset.molecule_data import MoleculeData, PointCloud, MoleculeBatch
-from chemflow.dataset.molecule_data import join_molecule_with_atoms
 
-
-class Integrator:
+class RateIntegrator:
     def __init__(
         self,
-        atom_tokens,
-        edge_tokens,
-        edge_type_distribution,
-        K,
-        D,
+        vocab: Vocab,
+        distributions: Distributions,
+        gmm_params,
         cat_strategy="uniform-sample",
         n_atoms_strategy="flexible",
-        device="cpu",
+        num_integration_steps=100,
+        time_strategy="log",
+        device="cuda" if torch.cuda.is_available() else "cpu",
     ):
-        self.atom_tokens = atom_tokens
-        self.K = K
-        self.D = D
+        self.vocab = vocab
+        self.distributions = distributions
+        self.gmm_params = gmm_params
         self.cat_strategy = cat_strategy
         self.n_atoms_strategy = n_atoms_strategy
+        self.time_strategy = time_strategy
+        self.num_integration_steps = num_integration_steps
         self.device = device
-        self.edge_type_distribution = edge_type_distribution
-
-        if self.n_atoms_strategy != "fixed":
-            self.death_token_index = token_to_index(atom_tokens, "<DEATH>")
 
         if self.cat_strategy == "mask":
-            self.edge_mask_index = token_to_index(edge_tokens, "<MASK>")
-            self.atom_mask_index = token_to_index(atom_tokens, "<MASK>")
+            self.edge_mask_index = token_to_index(self.vocab.edge_tokens, "<MASK>")
+            self.atom_mask_index = token_to_index(self.vocab.atom_tokens, "<MASK>")
 
-    def sample_death_process_gnn(
+        self.edge_aligner = EdgeAligner()
+
+    def get_time_steps(self, num_steps: int | None = None) -> list[float]:
+        if num_steps is None:
+            num_steps = self.num_integration_steps
+
+        if self.time_strategy == "linear":
+            time_points = torch.linspace(0, 1, num_steps + 1).tolist()
+
+        elif self.time_strategy == "log":
+            # torch requires the log of the start and end points
+            start_log = torch.log10(torch.tensor(0.01, device=self.device))
+            end_log = torch.log10(torch.tensor(1.0, device=self.device))
+            time_points = (
+                1 - torch.logspace(start_log, end_log, num_steps + 1)
+            ).tolist()
+            time_points.reverse()
+        else:
+            raise ValueError(f"Invalid time strategy: {self.time_strategy}")
+
+        step_sizes = [t1 - t0 for t0, t1 in zip(time_points[:-1], time_points[1:])]
+
+        return step_sizes
+
+    def discrete_integration_step_gnn(
         self,
-        global_death_rate: torch.Tensor,
-        class_preds: torch.Tensor,
-        xt_mask: torch.Tensor,
-        batch_id: torch.Tensor,
-        death_token_index: int,
+        class_curr: torch.Tensor,
+        class_probs_1: torch.Tensor,
+        t: torch.Tensor,
+        batch_idx: torch.Tensor,
         dt: float,
+        noise_scale: float = 0.0,
+        mask: torch.Tensor = None,
     ) -> torch.Tensor:
         """
-        Sample particle deaths using the death process.
-
-        Works with flat tensors and batch_id for variable-sized graphs.
-        Selects nodes with highest probability mass on the death token.
+        Performs a single Euler-Forward integration step for Discrete Flow Matching
+        adapted for Graph Neural Networks (stacked node batching).
 
         Args:
-            global_death_rate: Shape (num_graphs,) - graph-level death rates
-            class_preds: Shape (N_total, num_classes) - class predictions (softmaxed logits)
-            xt_mask: Shape (N_total,) - mask indicating which nodes are alive
-            batch_id: Shape (N_total,) - batch assignment for each node
-            death_token_index: Index of the death token in the class vocabulary
-            dt: Time step
-            device: Device to use
+            class_curr (Tensor): Current node token indices. Shape [N, 1] or [N].
+            class_probs_1 (Tensor): Predicted target probabilities. Shape [N, Vocab].
+            t (Tensor): Current time per graph. Shape [Batch_Size].
+            batch_idx (Tensor): Batch index for each node (e.g., from PyG Data.batch). Shape [N].
+            dt (float): Integration timestep size.
+            noise_scale (float): Additive uniform noise rate.
+            mask (Tensor, optional): Boolean mask (True to ignore node). Shape [N, 1] or [N].
 
         Returns:
-            death_mask: Shape (N_total,) - boolean mask indicating which nodes die
+            a_next (Tensor): Updated node tokens. Shape [N, 1].
         """
-        num_graphs = global_death_rate.shape[0]
-        death_mask = torch.zeros_like(xt_mask, dtype=torch.bool, device=self.device)
+        # 0. Standardization
+        # Ensure a_curr is [N, 1] for scatter consistency, but we often need [N] for logic
+        if class_curr.ndim == 1:
+            class_curr = class_curr.unsqueeze(-1)  # [N, 1]
 
-        # Extract probability for death token for each node
-        death_token_probs = class_preds[:, death_token_index]  # Shape: (N_total,)
+        # 1. Broadcast Time to Nodes
+        # t is [Batch_Size], we need [N, 1] to match a_1_probs
+        # t[batch_idx] expands it to [N], then view adds the vocab dim
+        times = t[batch_idx].view(-1, 1).clamp(min=1e-5, max=1.0 - 1e-5)
 
-        # Sample number of deaths using Poisson distribution
-        # global_death_rate is already the expected count over remaining time
-        death_intensity = global_death_rate * dt
-        num_deaths = torch.poisson(death_intensity)
+        # 2. Calculate Deterministic Rate: Rate = p_1(y) / (1 - t)
+        # rate_scalar will be [N, 1]
+        rate_scalar = 1.0 / (1.0 - times)
+        rates = class_probs_1 * rate_scalar
 
-        for graph_id in range(num_graphs):
-            # Get nodes in this graph
-            graph_mask = (batch_id == graph_id) & xt_mask
-            if not graph_mask.any():
-                continue
+        # 3. Add Stochastic Noise (Optional)
+        if noise_scale > 0:
+            rates = rates + noise_scale
 
-            # Get valid particles for this graph
-            valid_indices = torch.where(graph_mask)[0]
-            num_valid = len(valid_indices)
-            num_deaths_g = num_deaths[graph_id].to(torch.int32).item()
+        # 4. Zero out the Diagonal (Self-transitions)
+        # rates is [N, Vocab], a_curr is [N, 1]
+        # We set the rate of staying (x -> x) to 0 temporarily
+        rates.scatter_(-1, class_curr, 0.0)
 
-            if num_valid > 0 and num_deaths_g > 0:
-                # Get death token probabilities for this graph's nodes
-                graph_death_probs = death_token_probs[valid_indices]
+        # 5. Convert Rates to Probabilities
+        step_probs = rates * dt
 
-                # Select the top num_deaths_g particles with highest death token probability
-                num_to_kill = min(num_deaths_g, num_valid)
+        # 6. Calculate Probability to Stay
+        # P(stay) = 1 - sum(P(jump to y))
+        off_diag_sum = step_probs.sum(dim=-1, keepdim=True)
+        stay_prob = (1.0 - off_diag_sum).clamp(min=0.0)
 
-                # Get indices of particles with highest death token probability
-                _, death_indices = torch.topk(
-                    graph_death_probs, num_to_kill, largest=True
-                )
+        # Insert stay probability back into the current token's position
+        step_probs.scatter_(-1, class_curr, stay_prob)
 
-                # Get the actual indices in the flat tensor
-                actual_death_indices = valid_indices[death_indices]
+        # 7. Sample Next State
+        # Categorical samples from [N, Vocab] -> returns [N]
+        class_pred = torch.distributions.Categorical(probs=step_probs).sample()
 
-                # Apply death mask
-                death_mask[actual_death_indices] = True
+        # Reshape back to [N, 1] to maintain input shape consistency
+        class_pred = class_pred.view(-1, 1)
 
-        return death_mask
+        # 8. Apply Mask (if provided)
+        if mask is not None:
+            if mask.ndim == 1:
+                mask = mask.unsqueeze(-1)
+            class_pred = torch.where(mask, class_curr, class_pred)
 
-    def sample_birth_process_gnn(
+        return class_pred
+
+    def sample_insertions(
         self,
-        birth_rate: torch.Tensor,
-        birth_gmm_dict: dict,
-        batch_id: torch.Tensor,
-        dt: float,
-        N_types: int,
+        ins_gmm_dict: dict,
+        N_a: int,
+        N_c: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample birth process for GNN (works with batch_ids).
 
         Args:
-            birth_rate: Shape (num_graphs,) - graph-level birth rates
-            # GMM parameters per graph
-            birth_gmm_dict: dict - GMM parameters per graph
-            batch_id: Shape (N_total,) - current batch assignments (for determining num_graphs)
-            dt: Time step
-            N_types: Number of atom types
+            ins_gmm_dict: dict - GMM parameters per graph
+            N_a: Number of atom types
+            N_c: Number of charge types
 
         Returns:
-            new_particles: Shape (N_new, D) - new particle positions
-            new_types: Shape (N_new, N_types) - new particle types (one-hot)
-            new_batch_ids: Shape (N_new,) - batch assignments for new particles
+            new_atoms: PointCloud - new atoms
         """
-        num_graphs = birth_rate.shape[0]
-        new_atoms = []
-        for graph_id in range(num_graphs):
-            # Sample number of births for this graph
-            # Expected number of births = birth_rate * dt
-            expected_births = birth_rate[graph_id] * dt
+        # We will only do one insertion at a time
+        num_ins = 1
 
-            # Use Poisson sampling (approximate with normal for large values)
-            if expected_births > 0:
-                num_births = torch.poisson(expected_births.unsqueeze(0)).item()
-                num_births = int(num_births)
-            else:
-                num_births = 0
-
-            if num_births == 0:
-                continue
-
-            # Sample from GMM for this graph
-            # Keep batch dimension
-            gmm_params = {
-                "mu": birth_gmm_dict["mu"][graph_id].unsqueeze(0),
-                "sigma": birth_gmm_dict["sigma"][graph_id].unsqueeze(0),
-                "pi": birth_gmm_dict["pi"][graph_id].unsqueeze(0),
-            }
-            if self.cat_strategy == "uniform-sample":
-                sampled_x, sampled_a, sampled_c = sample_from_typed_gmm(
-                    gmm_params, num_births, self.K, self.D, N_types
-                )
-            else:
-                sampled_x = sample_from_gmm(gmm_params, num_births, self.K, self.D)
-                sampled_a = self.atom_mask_index * torch.ones(
-                    (num_births,),
-                    dtype=torch.long,
-                    device=self.device,
-                )
-                sampled_c = self.charge_mask_index * torch.ones(
-                    (num_births,),
-                    dtype=torch.long,
-                    device=self.device,
-                )
-
-            # Convert to one-hot for types
-            # sampled_types_onehot = F.one_hot(sampled_types, num_classes=N_types).float()
-
-            # Squeeze batch dimension if needed
-            if sampled_x.dim() == 3:
-                sampled_x = sampled_x.squeeze(0)
-            # if sampled_types_onehot.dim() == 3:
-            #    sampled_types_onehot = sampled_types_onehot.squeeze(0)
-
-            new_atoms_i = PointCloud(
-                x=sampled_x,
-                a=sampled_a,
-                c=sampled_c,
+        # Sample from GMM for this graph
+        # Keep batch dimension
+        if self.cat_strategy == "uniform-sample":
+            sampled_x, sampled_a, sampled_c = sample_from_typed_gmm(
+                ins_gmm_dict, num_ins, self.gmm_params.K, self.gmm_params.D, N_a, N_c
             )
-            new_atoms.append(new_atoms_i)
-
-        if len(new_atoms) == 0:
-            # No births, return empty tensors
-            new_atoms = PointCloud(
-                x=torch.empty((0, self.D), device=self.device),
-                a=torch.empty((0, N_types), device=self.device),
-                batch=torch.empty((0,), device=self.device, dtype=batch_id.dtype),
+        else:
+            sampled_x = sample_from_gmm(
+                ins_gmm_dict, num_ins, self.gmm_params.K, self.gmm_params.D
+            )
+            sampled_a = self.atom_mask_index * torch.ones(
+                (num_ins,),
+                dtype=torch.long,
+                device=self.device,
+            )
+            sampled_c = self.charge_mask_index * torch.ones(
+                (num_ins,),
+                dtype=torch.long,
+                device=self.device,
             )
 
-            return new_atoms
-
-        new_atoms = MoleculeBatch.from_data_list(new_atoms)
+        new_atoms = PointCloud(
+            x=sampled_x.view(-1, self.gmm_params.D),
+            a=sampled_a.view(-1),
+            c=sampled_c.view(-1),
+        )
 
         return new_atoms
 
@@ -210,13 +198,17 @@ class Integrator:
         self,
         mol_t: MoleculeData,
         mol_1_pred: MoleculeData,
-        global_death_rate: torch.Tensor,
-        birth_rate: torch.Tensor,
-        birth_gmm_dict: dict,
+        sub_rate_a: torch.Tensor,
+        sub_rate_c: torch.Tensor,
+        sub_rate_e: torch.Tensor,
+        del_rate: torch.Tensor,
+        ins_rate: torch.Tensor,
+        ins_gmm_preds: torch.Tensor,
         t: torch.Tensor,
         dt: float,
-        cat_noise_level: float = 0.0,
         eps: float = 1e-6,
+        h_latent: torch.Tensor = None,
+        ins_edge_head=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Integrate one step of the stochastic process for GNN models.
@@ -227,26 +219,24 @@ class Integrator:
         Args:
             mol_t: MoleculeData - current molecule
             mol_1_pred: MoleculeData - predicted molecule
-            global_death_rate: Shape (num_graphs,) - graph-level death rates
-            birth_rate: Shape (num_graphs,) - graph-level birth rates
-            birth_gmm_dict: dict - GMM parameters per graph
+            sub_rate_a: Shape (N,) - node-level atom type substitution rates
+            sub_rate_c: Shape (N,) - node-level charge substitution rates
+            sub_rate_e: Shape (E,) - edge-level edge type substitution rates
+            del_rate: Shape (N,) - node-level deletion rates
+            ins_rate: Shape (N,) - node-level insertion rates
+            ins_gmm_preds:       - GMM parameters for each node
             t: Shape (num_graphs,) - current time for each graph
             dt: Time step
-            cat_noise_level: Categorical noise level for type updates
             eps: Small epsilon value for numerical stability
+            h_latent: Shape (N, hidden_dim) - latent node features for edge prediction
+            ins_edge_head: InsertionEdgeHead instance for predicting edges (or None)
 
         Returns:
-            mol_t_final: MoleculeData - updated molecule
+            mol_t_final: MoleculeData - updated molecule with the new atoms
         """
-        # setup the input molecules
-        mol_t_out = mol_t.clone()
-        mol_1_pred = mol_1_pred.clone()
 
-        x, a, c, e, edge_index, batch_id = mol_t_out.unpack()
+        x, a, c, e, edge_index, batch_id = mol_t.unpack()
         x_1, a_1, c_1, e_1, edge_index_1, _ = mol_1_pred.unpack()
-
-        # keeps track of which nodes are alive
-        xt_mask = torch.ones_like(batch_id, dtype=torch.bool, device=self.device)
 
         # 1. Update positions (Euler-Maruyama scheme)
         velocity = (x_1 - x) / (1 - t[batch_id].unsqueeze(-1)).clamp(
@@ -254,222 +244,180 @@ class Integrator:
         )
         x = x + velocity * dt
 
-        # 2. Update node types
-        # a_pred = torch.distributions.Categorical(mol_1_pred.a).sample()
+        # 1. Independent Insertion (as per text)
+        # Sample whether to insert with probability h * lambda_ins
+        p_ins = ins_rate * dt
+        p_ins = p_ins.squeeze(-1)
+        do_ins = torch.rand_like(p_ins) < p_ins
 
-        if self.cat_strategy == "uniform-sample":
-            # probability to stay in the current type
-            p_a_stay_curr = torch.gather(a_1, -1, a.unsqueeze(-1))
+        # 2. Deletion OR Substitution (Hierarchical Step)
+        # Sample whether to delete or substitute with probability h(lambda_del + lambda_sub)
+        total_mod_rate = del_rate + sub_rate_a + sub_rate_c
 
-            # Setup batched time tensor and noise tensor
-            ones = [1] * (len(a_1.shape) - 1)
-            times = t[batch_id].view(-1, *ones).clamp(min=1e-3, max=1.0 - 1e-3)
-            noise = torch.zeros_like(times)
-            noise[times + dt < 1.0] = cat_noise_level
+        p_mod = total_mod_rate * dt
+        p_mod = p_mod.squeeze(-1)
+        do_mod = torch.rand_like(p_mod) < p_mod
 
-            # Off-diagonal step probs
-            mult = (1 + ((2 * noise) * (a_1.shape[-1] - 1) * times)) / (1 - times)
-            first_term = dt * mult * a_1
-            second_term = dt * noise * p_a_stay_curr
-            a_step_probs = (first_term + second_term).clamp(max=1.0)
+        # Initialize masks
+        do_del = torch.zeros_like(do_mod)
+        do_sub = torch.zeros_like(do_mod)
 
-            # On-diagonal step probs
-            a_step_probs.scatter_(-1, a.unsqueeze(-1), 0.0)
-            diags = (1.0 - a_step_probs.sum(dim=-1, keepdim=True)).clamp(min=0.0)
-            a_step_probs.scatter_(-1, a.unsqueeze(-1), diags)
+        # Only process the positions where a modification actually occurred
+        # This saves computation and strictly follows the "exclusive" logic
+        mod_indices = torch.nonzero(do_mod)
 
-            a_pred = torch.distributions.Categorical(a_step_probs).sample()
-            a = a_pred
+        if len(mod_indices) > 0:
+            # Select del with p = lambda_del / (lambda_del + lambda_sub)
+            # Extract rates only for the active indices to save memory/compute
+            curr_del_rate = del_rate[do_mod].squeeze(-1)
+            curr_total_rate = total_mod_rate[do_mod].squeeze(-1)
 
-        elif self.cat_strategy == "mask":
-            # Get time for each node (expand t to match nodes)
-            num_graphs = t.shape[0]
-            node_times = torch.zeros_like(batch_id, dtype=t.dtype, device=self.device)
-            for graph_id in range(num_graphs):
-                graph_mask = batch_id == graph_id
-                node_times[graph_mask] = t[graph_id]
+            # Calculate conditional split w/ epsilon for stability
+            p_cond_del = curr_del_rate / (curr_total_rate + 1e-8)
 
-            # Choose elements to unmask
-            limit = dt * (1 + (cat_noise_level * node_times)) / (1 - node_times + 1e-8)
-            unmask = torch.rand_like(a_1.float()) < limit
-            unmask = unmask & (a == self.atom_mask_index) & xt_mask
+            # Sample the decision
+            is_deletion = torch.rand_like(p_cond_del) < p_cond_del
 
-            # Choose elements to mask
-            mask_prob = dt * cat_noise_level
-            mask = torch.rand_like(a_1.float()) < mask_prob
-            mask = mask & (a != self.atom_mask_index) & xt_mask
-            # Do not mask at the end
-            end_mask = (node_times + dt) >= 1.0
-            mask = mask & (~end_mask)
+            # Assign back to the main masks
+            do_del[do_mod] = is_deletion
+            do_sub[do_mod] = ~is_deletion
 
-            # Apply unmasking and re-masking
-            a[unmask] = a_1[unmask]
-            a[mask] = self.atom_mask_index
-        else:
-            raise NotImplementedError(f"Categorical strategy {self.cat_strategy} not implemented.")
+        # Do substitution
+        a[do_sub] = a_1[do_sub]
+        c[do_sub] = c_1[do_sub]
+
         # 2.5. Update edge types
-        num_edge_classes = e_1.shape[-1]
-
         # Get current edge types (already indices)
-        e_curr = e.long().clone()
-        e_pred = e_1.long().clone()
 
-        # we will deal with only the upper triangle of the edge types and symmetrize them later
-        _, e_curr_triu = get_canonical_upper_triangle_with_index(edge_index, e_curr)
-        edge_index_triu, e_pred_triu = get_canonical_upper_triangle_with_index(
-            edge_index_1, e_pred
+        # we will deal with only the triu edge types and symmetrize later
+        edge_infos = self.edge_aligner.align_edges(
+            source_group=(edge_index, [e, sub_rate_e]),
+            target_group=(edge_index_1, [e_1]),
+        )
+        e_triu, sub_rate_e_triu, e_1_triu = edge_infos["edge_attr"]
+        edge_index_triu, _ = edge_infos["edge_index"]
+
+        p_sub_e = sub_rate_e_triu * dt
+        p_sub_e = p_sub_e.squeeze(-1)
+        do_sub_e = torch.rand_like(p_sub_e) < p_sub_e
+        e_triu[do_sub_e] = e_1_triu[do_sub_e]
+
+        # Finally, symmetrize the edge types
+        # edge_index, e = symmetrize_upper_triangle(edge_index_triu, e_triu)
+        edge_index, e_attrs = self.edge_aligner.symmetrize_edges(edge_index_triu, [e_triu])
+        e = e_attrs[0]
+
+        mol = MoleculeBatch(
+            x=x,
+            a=a,
+            c=c,
+            e=e,
+            edge_index=edge_index,
+            batch=batch_id,
         )
 
-        # Only update edges that exist in edge_index
-        if self.cat_strategy == "uniform-sample":
-            # Get probability of current edge type for valid edges
-            # et_curr_valid = et_new[edge_index[0], edge_index[1]]
-            # print(et_curr_valid)
-
-            # p_e_stay_curr = mol_1_pred.e.gather(1, et_new.unsqueeze(-1)).squeeze(-1)
-            p_e_stay_curr = torch.gather(
-                e_pred_triu, -1, e_curr_triu.unsqueeze(-1)
-            ).squeeze(-1)
-
-            # Compute edge times (average of connected nodes)
-            node_times = t[batch_id]
-            edge_times = (
-                node_times[edge_index_triu[0]] + node_times[edge_index_triu[1]]
-            ) / 2.0
-            edge_times = edge_times.clamp(min=1e-3, max=1.0 - 1e-3)
-            noise = torch.zeros_like(edge_times)
-            noise[edge_times + dt < 1.0] = cat_noise_level
-
-            # Compute step probabilities for valid edges
-            mult = (1 + ((2 * noise) * (num_edge_classes - 1) * edge_times)) / (
-                1 - edge_times
-            )
-            first_term = dt * mult.unsqueeze(-1) * e_pred_triu
-            second_term = dt * noise.unsqueeze(-1) * p_e_stay_curr.unsqueeze(-1)
-            step_probs = (first_term + second_term).clamp(max=1.0)
-
-            # Set diagonal probabilities
-            step_probs.scatter_(1, e_curr_triu.unsqueeze(-1), 0.0)
-            diags = (1.0 - step_probs.sum(dim=-1, keepdim=True)).clamp(min=0.0)
-            step_probs.scatter_(1, e_curr_triu.unsqueeze(-1), diags)
-
-            # Sample new edge types for valid edges
-            et_new_triu = torch.distributions.Categorical(step_probs).sample()
-
-        else:
-            # Get edge times for valid edges
-            num_graphs = t.shape[0]
-            node_times = torch.zeros_like(batch_id, dtype=t.dtype, device=self.device)
-            for graph_id in range(num_graphs):
-                node_times[batch_id == graph_id] = t[graph_id]
-            edge_times = (node_times[edge_index[0]] + node_times[edge_index[1]]) / 2.0
-
-            # Sample predictions for valid edges
-            e_pred_triu = torch.distributions.Categorical(e_pred_triu).sample()
-
-            # Unmask and mask logic for valid edges
-            limit = dt * (1 + (cat_noise_level * edge_times)) / (1 - edge_times + 1e-8)
-            node_alive_mask = xt_mask[edge_index[0]] & xt_mask[edge_index[1]]
-            unmask = (
-                (torch.rand_like(e_pred_triu.float()) < limit)
-                & (e_curr_triu == self.edge_mask_index)
-                & node_alive_mask
-            )
-            mask = (
-                (torch.rand_like(e_curr_triu.float()) < dt * cat_noise_level)
-                & (e_curr_triu != self.edge_mask_index)
-                & node_alive_mask
-                & ((edge_times + dt) < 1.0)
-            )
-
-            et_new_valid = e_curr_triu.clone()
-            et_new_valid[unmask] = e_pred_triu[unmask]
-            et_new_valid[mask] = self.edge_mask_index
-
-            et_new_triu[edge_index[0], edge_index[1]] = et_new_valid
-            et_new_triu[edge_index[1], edge_index[0]] = et_new_valid
-
-        # finally, symmetrize the edge types
-        edge_index, e = symmetrize_upper_triangle(edge_index_triu, et_new_triu)
-
         if self.n_atoms_strategy != "fixed":
-            # 3.1. Sample death process
-            death_mask = self.sample_death_process_gnn(
-                global_death_rate,
-                a_1,
-                xt_mask,
-                batch_id,
-                self.death_token_index,
-                dt,
+            # Build index mapping: original_idx -> post_deletion_idx (or -1 if deleted)
+            N_original = mol.num_nodes
+            keep_mask = ~do_del
+            original_to_postdel = torch.full(
+                (N_original,), -1, dtype=torch.long, device=self.device
+            )
+            kept_indices = torch.where(keep_mask)[0]
+            original_to_postdel[kept_indices] = torch.arange(
+                len(kept_indices), device=self.device
             )
 
-            alive_mask = xt_mask & (~death_mask)
+            # 3. Remove the deleted nodes
+            if do_del.any():
+                mol = filter_nodes(mol, keep_mask)
 
-            # 3.2. Remove dead nodes and combine with new particles
-            # Keep only alive nodes from existing particles
-            x_alive = x[alive_mask]
-            a_alive = a[alive_mask]
-            c_alive = c[alive_mask]
-            batch_id_alive = batch_id[alive_mask]
+            # 4. Add the new insertions
+            # Only insert from nodes that were NOT deleted
+            do_ins_valid = do_ins & keep_mask
+            if do_ins_valid.any():
+                ins_gmm_dict = {
+                    "mu": ins_gmm_preds["mu"][do_ins_valid],
+                    "sigma": ins_gmm_preds["sigma"][do_ins_valid],
+                    "pi": ins_gmm_preds["pi"][do_ins_valid],
+                    "a_probs": ins_gmm_preds["a_probs"][do_ins_valid],
+                    "c_probs": ins_gmm_preds["c_probs"][do_ins_valid],
+                }
 
-            edge_index_alive, e_alive = subgraph(
-                subset=alive_mask,
-                edge_index=edge_index,
-                edge_attr=e,
-                relabel_nodes=True,
-                num_nodes=x.shape[0],
-            )
-
-            mol_t_alive = MoleculeBatch(
-                x=x_alive,
-                a=a_alive,
-                c=c_alive,
-                e=e_alive,
-                edge_index=edge_index_alive,
-                batch=batch_id_alive,
-            )
-
-            # 4. Sample birth process
-            new_atoms = self.sample_birth_process_gnn(
-                birth_rate,
-                birth_gmm_dict,
-                batch_id,
-                dt,
-                N_types=a_1.shape[-1],
-            )
-
-            # Combine alive nodes with new particles
-            if new_atoms.num_nodes > 0:
-                # adjust which edge distribution to sample from
-                if (
-                    self.cat_strategy == "uniform-sample"
-                    and self.edge_type_distribution is not None
-                ):
-                    # Sample from edge_type_distribution
-                    edge_dist = torch.distributions.Categorical(
-                        self.edge_type_distribution.to(self.device)
-                    )
-                else:
-                    edge_dist = torch.zeros(len(self.edge_tokens))
-                    edge_dist[self.edge_mask_index] = 1.0
-
-                # add the new atoms to the existing molecules
-                mol_t_final = join_molecule_with_atoms(
-                    mol_t_alive, new_atoms, edge_dist
+                new_atoms = self.sample_insertions(
+                    ins_gmm_dict,
+                    len(self.vocab.atom_tokens),
+                    len(self.vocab.charge_tokens),
                 )
 
-            else:
-                mol_t_final = mol_t_alive
+                new_atoms.batch = batch_id[do_ins_valid]
 
-        else:
-            # No death or birth process, just movement
-            mol_t_final = MoleculeBatch(
-                x=x,
-                a=a,
-                c=c,
-                e=e,
-                edge_index=edge_index,
-                batch=batch_id,
-            )
+                # Determine fallback edge distribution
+                if (
+                    self.cat_strategy == "uniform-sample"
+                    and self.distributions.edge_type_distribution is not None
+                ):
+                    edge_dist = self.distributions.edge_type_distribution.to(
+                        self.device
+                    )
+                else:
+                    edge_dist = torch.zeros(len(self.vocab.edge_tokens))
+                    edge_dist[self.edge_mask_index] = 1.0
 
-        return mol_t_final
+                # Predict edges for insertions if head is available
+                ins_edge_logits = None
+                ins_edge_spawn_idx = None
+                ins_edge_target_idx = None
+
+                if ins_edge_head is not None and h_latent is not None:
+                    # Predict using original indices (h_latent uses original indexing)
+                    orig_spawn_idx, orig_target_idx, ins_edge_logits = (
+                        ins_edge_head.predict_edges_for_insertion(
+                            h=h_latent,
+                            x=x_1,
+                            gmm_dict=ins_gmm_preds,
+                            batch=batch_id,
+                            insertion_mask=do_ins_valid,
+                        )
+                    )
+
+                    if ins_edge_logits is not None and ins_edge_logits.numel() > 0:
+                        # Remap indices from original to post-deletion space
+                        ins_edge_spawn_idx = original_to_postdel[orig_spawn_idx]
+                        ins_edge_target_idx = original_to_postdel[orig_target_idx]
+
+                        # Filter out edges where either endpoint was deleted
+                        valid_edges = (ins_edge_spawn_idx >= 0) & (
+                            ins_edge_target_idx >= 0
+                        )
+                        if valid_edges.any():
+                            ins_edge_spawn_idx = ins_edge_spawn_idx[valid_edges]
+                            ins_edge_target_idx = ins_edge_target_idx[valid_edges]
+                            ins_edge_logits = ins_edge_logits[valid_edges]
+                        else:
+                            ins_edge_logits = None
+
+                # Check if we have predicted edge logits for insertions
+                use_predicted_edges = (
+                    ins_edge_logits is not None
+                    and ins_edge_spawn_idx is not None
+                    and ins_edge_target_idx is not None
+                    and ins_edge_logits.numel() > 0
+                )
+
+                if use_predicted_edges:
+                    # Use predicted edges from InsertionEdgeHead
+                    # Now indices are in post-deletion space
+                    mol = join_molecules_with_predicted_edges(
+                        mol=mol,
+                        new_atoms=new_atoms,
+                        ins_edge_logits=ins_edge_logits,
+                        spawn_node_idx=ins_edge_spawn_idx,
+                        target_node_idx=ins_edge_target_idx,
+                        fallback_edge_dist=edge_dist,
+                    )
+                else:
+                    # Fall back to random edge sampling
+                    mol = join_molecules_with_atoms(mol, new_atoms, edge_dist)
+
+        return mol

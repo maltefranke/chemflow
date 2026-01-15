@@ -229,7 +229,7 @@ def sample_from_gmm(gmm_params, num_samples, K=10, D=1):
     return mixture_weights, spatial_dist, type_dist"""
 
 
-def get_typed_gmm_components(gmm_output, D=3):
+def get_typed_gmm_components(gmm_output):
     """
     Create GMM component distributions from the pre-computed equivariant output dictionary.
 
@@ -252,14 +252,16 @@ def get_typed_gmm_components(gmm_output, D=3):
     mu = gmm_output["mu"]  # [B, K, D]
     sigma = gmm_output["sigma"]  # [B, K]
     pi = gmm_output["pi"]  # [B, K]
-    type_probs = gmm_output["types"]  # [B, K, T]
+    a_probs = gmm_output["a_probs"]  # [B, K, T]
+    c_probs = gmm_output["c_probs"]  # [B, K, T]
 
     # If the input was unbatched (K, D), add batch dim to make it (1, K, D)
     if mu.dim() == 2:
         mu = mu.unsqueeze(0)
         sigma = sigma.unsqueeze(0)
         pi = pi.unsqueeze(0)
-        type_probs = type_probs.unsqueeze(0)
+        a_probs = a_probs.unsqueeze(0)
+        c_probs = c_probs.unsqueeze(0)
 
     # 2. Reshape for Broadcasting: (B, ...) -> (B, 1, ...)
     # This prepares the distributions to be evaluated against N_samples
@@ -280,13 +282,14 @@ def get_typed_gmm_components(gmm_output, D=3):
     sigma_expanded = sigma.unsqueeze(1).unsqueeze(-1)
 
     # Create Normal [B, 1, K, D] -> Wrap in Independent to sum log-probs over D
-    spatial_dist = Independent(Normal(mu_expanded, sigma_expanded), 1)
+    x_dist = Independent(Normal(mu_expanded, sigma_expanded), 1)
 
     # --- Type Distribution ---
     # Shape: [B, K, T] -> [B, 1, K, T]
-    type_dist = Categorical(probs=type_probs.unsqueeze(1))
+    a_dist = Categorical(probs=a_probs.unsqueeze(1))
+    c_dist = Categorical(probs=c_probs.unsqueeze(1))
 
-    return mixture_weights, spatial_dist, type_dist
+    return mixture_weights, x_dist, a_dist, c_dist
 
 
 def compute_equivariant_gmm_old(gmm_pred, xt, batch_id, K, num_tokens=0):
@@ -378,139 +381,78 @@ def compute_equivariant_gmm_old(gmm_pred, xt, batch_id, K, num_tokens=0):
     return output
 
 
-def compute_equivariant_gmm(gmm_pred, xt, batch_id, K, num_tokens=0):
+def compute_equivariant_gmm(gmm_pred, xt, K, D, N_a, N_c):
     """
     Decodes GMM parameters using the Hybrid (2K) approach.
 
     Args:
         gmm_pred: [N, Output_Dim] Raw logits from GMMHead.
         xt:       [N, 3]          Equivariant node coordinates.
-        batch_id: [N]             Graph assignment index.
         K:        int             Number of Gaussians.
-        num_tokens: int           Number of discrete types.
+        N_a:      int           Number of discrete atom types.
+        N_c:      int           Number of discrete charge types.
 
     Returns:
         dict: {
+            "pi":    [B, K],    # Invariant Mixing Weights
             "mu":    [B, K, 3], # Equivariant Means
             "sigma": [B, K],    # Invariant Variances (Isotropic)
-            "pi":    [B, K],    # Invariant Mixing Weights
-            "types": [B, K, T]  # (Optional) Invariant Type Probs
+            "a_probs": [B, K, N_a],  # (Optional) Invariant Atom Type Probs
+            "c_probs": [B, K, N_c],  # (Optional) Invariant Charge Type Probs
         }
     """
-    device = xt.device
-    num_graphs = batch_id.max().item() + 1
     N = xt.shape[0]
 
     # --- 1. Slice Inputs ---
-    # First K: Assignment Logits (Where is the node?)
-    # Second K: Variance Logits (How spread out is the cluster?)
-    assign_logits = gmm_pred[:, :K]
+    # First K: Mixture Logits (K)
+    pi = gmm_pred[:, :K]
+    pi = F.softmax(pi, dim=-1)
+
+    # Next K: Variances
     var_logits = gmm_pred[:, K : 2 * K]
-
-    # --- 2. Compute Assignments (w) ---
-    # w_ik: Probability node i belongs to component k
-    # Softmax implies competition: a node distributes its mass among K clusters.
-    w = F.softmax(assign_logits, dim=-1)  # [N, K]
-
-    # Calculate total mass per cluster per graph
-    # w_sum: [B, K]
-    w_sum = torch.zeros(num_graphs, K, device=device)
-    w_sum.index_add_(0, batch_id, w)
-
-    # Add epsilon to prevent division by zero in empty clusters
-    denominator = w_sum + 1e-6
-
-    # --- 3. Mixing Weights (Pi) ---
-    # pi = (Total mass in cluster) / (Total nodes in graph)
-
-    # Get graph sizes: [B, 1]
-    graph_sizes = torch.bincount(batch_id, minlength=num_graphs).unsqueeze(-1).float()
-
-    # [B, K]
-    pi = w_sum / (graph_sizes + 1e-6)
-
-    # --- 4. Means (Mu) - Translation & Rotation Equivariant ---
-    # Weighted average of coordinates: sum(w * x) / sum(w)
-
-    # xt: [N, 3] -> [N, 1, 3]
-    # w:  [N, K] -> [N, K, 1]
-    # weighted_pos: [N, K, 3]
-    weighted_pos = xt.unsqueeze(1) * w.unsqueeze(-1)
-
-    # Flatten to [N, K*3] for index_add_
-    flat_weighted_pos = weighted_pos.view(N, -1)
-
-    flat_mu_sum = torch.zeros(num_graphs, K * 3, device=device)
-    flat_mu_sum.index_add_(0, batch_id, flat_weighted_pos)
-
-    # Reshape back to [B, K, 3]
-    mu_sum = flat_mu_sum.view(num_graphs, K, 3)
-
-    # Divide by total weight
-    # [B, K, 3] / [B, K, 1]
-    mu = mu_sum / denominator.unsqueeze(-1)
-
-    # --- 5. Variances (Sigma) - Invariant ---
-    # Weighted average of predicted variances.
-    # Logic: If node i is strongly in cluster k, its prediction for sigma_k matters more.
-
     # Enforce positivity on raw logits
     sigma_per_node = F.softplus(var_logits)  # [N, K]
 
-    # Weight by assignment probability
-    weighted_sigma = w * sigma_per_node  # [N, K]
+    # Next K*D: Handle the spatial mu
+    pred_mu = gmm_pred[:, 2 * K : K * (2 + D)]
+    pred_mu = pred_mu.view(N, K, D)
+    mu_per_node = xt.unsqueeze(1) + pred_mu
 
-    sigma_sum = torch.zeros(num_graphs, K, device=device)
-    sigma_sum.index_add_(0, batch_id, weighted_sigma)
+    # Handle the types
+    # Next K*N_a: Atom types
+    raw_a_probs = gmm_pred[:, K * (2 + D) : K * (2 + D + N_a)]
+    # Next K*N_c: Charge types
+    raw_c_probs = gmm_pred[:, K * (2 + D + N_a) : K * (2 + D + N_a + N_c)]
 
-    # [B, K]
-    sigma = sigma_sum / denominator
+    # Reshape: [N, K, T]
+    a_probs_per_node = raw_a_probs.view(N, K, N_a)
+    c_probs_per_node = raw_c_probs.view(N, K, N_c)
 
-    # --- 6. Types (Optional) ---
-    type_probs = None
-    if num_tokens > 0:
-        # Slice the remaining part
-        raw_types = gmm_pred[:, 2 * K : 2 * K + (K * num_tokens)]
+    # Softmax over types -> probs per node
+    node_a_probs = F.softmax(a_probs_per_node, dim=-1)
+    node_c_probs = F.softmax(c_probs_per_node, dim=-1)
 
-        # Reshape: [N, K, T]
-        type_logits_per_node = raw_types.view(N, K, num_tokens)
-
-        # Softmax over types -> probs per node
-        node_type_probs = F.softmax(type_logits_per_node, dim=-1)
-
-        # Weight by assignment w: [N, K, 1] * [N, K, T] -> [N, K, T]
-        weighted_types = w.unsqueeze(-1) * node_type_probs
-
-        # Sum over graph
-        flat_types = weighted_types.view(N, -1)  # [N, K*T]
-        flat_types_sum = torch.zeros(num_graphs, K * num_tokens, device=device)
-        flat_types_sum.index_add_(0, batch_id, flat_types)
-
-        # Normalize
-        type_probs = flat_types_sum.view(
-            num_graphs, K, num_tokens
-        ) / denominator.unsqueeze(-1)
-
-    # --- 7. Output ---
+    # Return the output
     output = {
-        "mu": mu,
-        "sigma": sigma,
         "pi": pi,
+        "mu": mu_per_node,
+        "sigma": sigma_per_node,
+        "a_probs": node_a_probs,
+        "c_probs": node_c_probs,
     }
-
-    if type_probs is not None:
-        output["types"] = type_probs
 
     return output
 
 
 def interpolate_typed_gmm(
-    p_x_1,
-    p_c_0,
-    p_c_1,
+    mu1,
+    p_a0,
+    p_a1,
+    p_c0,
+    p_c1,
     t,
     num_samples=20,
-    sigma=0.2,
+    sigma=1.0,
 ):
     """
     Draws interpolated samples (x_t, c_t) given targets (x_1, c_1).
@@ -521,48 +463,56 @@ def interpolate_typed_gmm(
     2. The type components are p_t(c | c_1) = (1-t)*p_0(c) + t*p_1(c)
 
     Args:
-        means (torch.Tensor): The target spatial locations (x_1).
+        mu1 (torch.Tensor): The target spatial locations (x_1).
             Shape: (N, D)
-        types (torch.Tensor): The target discrete types (c_1).
-            Shape: (N,)
+        p_a0 (torch.Tensor): The empirical atom types distribution.
+            Shape: (N, N_types)
+        p_a1 (torch.Tensor): The target atom types (a_1).
+            Shape: (N, N_types)
+        p_c0 (torch.Tensor): The empirical charge types distribution.
+            Shape: (N, N_types)
+        p_c1 (torch.Tensor): The target charge types (c_1).
+            Shape: (N, N_types)
         t (torch.Tensor): A tensor containing a single time-step value.
-        N_types (int): The total number of discrete types.
-        sigma (float): Base sigma value for spatial noise.
         num_samples (int): The number of samples to draw (M).
+        sigma (float): Base sigma value for spatial noise.
 
     Returns:
         tuple:
             - sampled_locations (torch.Tensor): Shape (num_samples, D)
             - sampled_types (torch.Tensor): Shape (num_samples,)
     """
-    N, D = p_x_1.shape
+    N, D = mu1.shape
 
     # Ensure t is a scalar
     t_scalar = t.item() if t.numel() == 1 else t
 
     # --- 1. Define Mixture Weights (Uniform) ---
     # We will pick one of the N target pairs uniformly to sample from.
-    mixture_weights = Categorical(probs=torch.ones(N, device=p_x_1.device))
+    mixture_weights = Categorical(probs=torch.ones(N, device=mu1.device))
 
     # --- 2. Define Spatial Components p(x|m) ---
     # Calculate the time-dependent sigma for all components
     # This is the standard deviation sigma(t)
     sigma_val = sigma * (1 - t_scalar) + 1e-6
-    sigmas = sigma_val * torch.ones_like(p_x_1)
+    sigmas = sigma_val * torch.ones_like(mu1)
 
     # The N spatial distributions are N(x_1, sigma(t)^2)
-    spatial_components = Independent(Normal(p_x_1, sigmas), 1)
+    spatial_components = Independent(Normal(mu1, sigmas), 1)
 
     # --- 3. Define Type Components p(c|m) ---
     # Interpolate the probabilities: p_t = (1-t)*p0 + t*p1
     # Shapes: (1, N_types) + (N, N_types) -> (N, N_types)
-    p_t_probs = (1 - t_scalar) * p_c_0 + t_scalar * p_c_1
+    p_at_probs = (1 - t_scalar) * p_a0 + t_scalar * p_a1
+    p_ct_probs = (1 - t_scalar) * p_c0 + t_scalar * p_c1
 
     # Renormalize just in case of float precision issues
-    p_t_probs = p_t_probs / torch.sum(p_t_probs, dim=-1, keepdim=True)
+    p_at_probs = p_at_probs / torch.sum(p_at_probs, dim=-1, keepdim=True)
+    p_ct_probs = p_ct_probs / torch.sum(p_ct_probs, dim=-1, keepdim=True)
 
     # The N type distributions
-    type_components = Categorical(probs=p_t_probs)
+    a_type_components = Categorical(probs=p_at_probs)
+    c_type_components = Categorical(probs=p_ct_probs)
 
     # --- 4. Manually Sample from the Joint Mixture ---
     # We must sample manually to link the spatial and type samples.
@@ -574,7 +524,7 @@ def interpolate_typed_gmm(
 
     # b. Sample locations from the chosen spatial components
     # Gather the means and sigmas for the chosen components
-    chosen_means = p_x_1[chosen_indices]  # Shape: (num_samples, D)
+    chosen_means = mu1[chosen_indices]  # Shape: (num_samples, D)
     chosen_sigmas = sigmas[chosen_indices]  # Shape: (num_samples, D)
 
     # Sample locations
@@ -582,32 +532,39 @@ def interpolate_typed_gmm(
 
     # c. Sample types from the chosen type components
     # Gather the probability distributions for the chosen components
-    chosen_type_probs = p_t_probs[chosen_indices]  # Shape: (num_samples, N_types)
+    chosen_at_probs = p_at_probs[chosen_indices]  # Shape: (num_samples, N_types)
+    chosen_ct_probs = p_ct_probs[chosen_indices]  # Shape: (num_samples, N_types)
 
     # Sample types
-    sampled_types = Categorical(probs=chosen_type_probs).sample()
-    sampled_types = sampled_types.view(-1)
+    sampled_at = Categorical(probs=chosen_at_probs).sample()
+    sampled_ct = Categorical(probs=chosen_ct_probs).sample()
 
-    return sampled_locations, sampled_types
+    sampled_at = sampled_at.view(-1)
+    sampled_ct = sampled_ct.view(-1)
+
+    return sampled_locations, sampled_at, sampled_ct, chosen_indices
 
 
-def get_typed_gmm_parameters_shape(K, D, N_types):
+def get_typed_gmm_parameters_shape(K, D, N_a, N_c):
     """
     Get the expected shape of typed GMM parameters.
 
     Args:
         K (int): Number of GMM components.
         D (int): Dimension of the data.
-        N_types (int): Number of discrete types.
+        N_a (int): Number of discrete atom types.
+        N_c (int): Number of discrete charge types.
 
     Returns:
-        int: Total number of parameters (K + 2*K*D + K*N_types)
+        int: Total number of parameters (K + 2*K*D + K*N_a + K*N_c)
     """
     # K (mixture weights) + K*D (means) + K*D (log_vars) + K*N_types (type_logits)
-    return K + 2 * K * D + K * N_types
+    return K + 2 * K * D + K * N_a + K * N_c
 
 
-def sample_from_typed_gmm(gmm_params, num_samples, K=10, D=1, N_types=4):
+def sample_from_typed_gmm(
+    gmm_params, num_samples, K=10, D=1, N_a=4, N_c=4, squeeze_output=False
+):
     """
     Sample from the joint GMM created from predicted parameters.
 
@@ -623,29 +580,19 @@ def sample_from_typed_gmm(gmm_params, num_samples, K=10, D=1, N_types=4):
         num_samples (int): Number of samples to draw.
         K (int): Number of GMM components.
         D (int): Dimension of the data.
-        N_types (int): Number of discrete types.
+        N_a (int): Number of discrete atom types.
+        N_c (int): Number of discrete charge types.
 
     Returns:
         tuple:
             - sampled_locations (torch.Tensor): Shape (num_samples, D) or (B, num_samples, D)
             - sampled_types (torch.Tensor): Shape (num_samples,) or (B, num_samples)
     """
-
-    # --- 0. Handle non-batched input ---
-    squeeze_output = False
-    if gmm_params.dim() == 1:
-        gmm_params = gmm_params.unsqueeze(0)
-        squeeze_output = True
-
-    B = gmm_params.shape[0]
-
     # --- 1. Get GMM Distributions ---
     # mixture_weights: batch_shape=[B, 1]
     # spatial_dist:    batch_shape=[B, 1, K]
     # type_dist:       batch_shape=[B, 1, K]
-    mixture_weights, spatial_dist, type_dist = get_typed_gmm_components(
-        gmm_params, K, D, N_types
-    )
+    mixture_weights, x_dist, a_dist, c_dist = get_typed_gmm_components(gmm_params)
 
     # --- 2. Sample Component Indices ---
     # mixture_weights.sample() prepends sample_shape to batch_shape
@@ -659,10 +606,11 @@ def sample_from_typed_gmm(gmm_params, num_samples, K=10, D=1, N_types=4):
 
     # Get all component parameters, squeezing out the '1' dim
     # (B, 1, K, D) -> (B, K, D)
-    means_all = spatial_dist.base_dist.loc.squeeze(1)
-    scales_all = spatial_dist.base_dist.scale.squeeze(1)
+    means_all = x_dist.base_dist.loc.squeeze(1)
+    scales_all = x_dist.base_dist.scale.squeeze(1)
     # (B, 1, K, N_types) -> (B, K, N_types)
-    logits_all = type_dist.logits.squeeze(1)
+    logits_all_a = a_dist.logits.squeeze(1)
+    logits_all_c = c_dist.logits.squeeze(1)
 
     # Create expanded indices for gathering
     # (B, num_samples) -> (B, num_samples, 1)
@@ -671,27 +619,31 @@ def sample_from_typed_gmm(gmm_params, num_samples, K=10, D=1, N_types=4):
     # (B, num_samples, 1) -> (B, num_samples, D)
     idx_locs = idx.expand(-1, -1, D)
     # (B, num_samples, 1) -> (B, num_samples, N_types)
-    idx_types = idx.expand(-1, -1, N_types)
+    idx_a = idx.expand(-1, -1, N_a)
+    idx_c = idx.expand(-1, -1, N_c)
 
     # Gather the parameters for the sampled components
     # We gather from dim 1 (the K dim)
     # torch.gather(input, dim, index)
     chosen_means = torch.gather(means_all, 1, idx_locs)
     chosen_scales = torch.gather(scales_all, 1, idx_locs)
-    chosen_logits = torch.gather(logits_all, 1, idx_types)
+    chosen_logits_a = torch.gather(logits_all_a, 1, idx_a)
+    chosen_logits_c = torch.gather(logits_all_c, 1, idx_c)
 
     # --- 4. Sample from Chosen Components ---
     # Sample locations: x ~ p(x|m*)
     # Shape: (B, num_samples, D)
-    sampled_locations = Normal(chosen_means, chosen_scales).sample()
+    sampled_x = Normal(chosen_means, chosen_scales).sample()
 
     # Sample types: c ~ p(c|m*)
     # Shape: (B, num_samples)
-    sampled_types = Categorical(logits=chosen_logits).sample()
+    sampled_a = Categorical(logits=chosen_logits_a).sample()
+    sampled_c = Categorical(logits=chosen_logits_c).sample()
 
     # --- 5. Handle non-batched output ---
     if squeeze_output:
-        sampled_locations = sampled_locations.squeeze(0)
-        sampled_types = sampled_types.squeeze(0)
+        sampled_x = sampled_x.squeeze(0)
+        sampled_a = sampled_a.squeeze(0)
+        sampled_c = sampled_c.squeeze(0)
 
-    return sampled_locations, sampled_types
+    return sampled_x, sampled_a, sampled_c

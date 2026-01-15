@@ -2,6 +2,6 @@
 project: "chemflow"
 name: "base"
 save_dir: "logs"
-offline: False
+offline: true
 
     

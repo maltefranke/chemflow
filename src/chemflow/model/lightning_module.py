@@ -3,81 +3,93 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
 import hydra
-from chemflow.losses import typed_gmm_loss, rate_loss
+from chemflow.losses import typed_gmm_loss
 from chemflow.losses import gmm_loss as untyped_gmm_loss
-from torch_geometric.nn import knn_graph
 
-
-from chemflow.flow_matching.integration import Integrator
 from chemflow.utils import (
     token_to_index,
     compute_token_weights,
-    get_canonical_upper_triangle_with_index,
-    symmetrize_upper_triangle,
+    EdgeAligner,
 )
 from external_code.egnn import unsorted_segment_mean
-from chemflow.flow_matching.interpolation import Interpolator
-from chemflow.flow_matching.gmm import compute_equivariant_gmm
 
-from chemflow.dataset.molecule_data import MoleculeData, PointCloud, MoleculeBatch
+from chemflow.dataset.molecule_data import MoleculeBatch
+from chemflow.dataset.vocab import Vocab, Distributions
+from chemflow.metrics import calc_metrics_, init_metrics
+from lightning.pytorch.utilities import grad_norm
 
 
-class LightningModule(pl.LightningModule):
+class LightningModuleRates(pl.LightningModule):
     def __init__(
         self,
         model: DictConfig = None,
+        integrator: DictConfig = None,
         loss_weights: DictConfig = None,
         optimizer_config: DictConfig = None,
-        weight_alpha: float = 1.0,
-        k_nn_edges: int = 20,
-        N_samples: int = 20,
-        K: int = 10,
-        D: int = 3,
+        gmm_params: DictConfig = None,
         n_atoms_strategy: str = "fixed",
-        cat_strategy: str = "uniform-sample",  # "mask" or "uniform-sample"
-        type_loss_token_weights: str = "training",  # "uniform" or "training"
-        num_integration_steps: int = 100,
-        cat_noise_level: float = 0.0,
-        coord_noise_level: float = 0.0,
+        type_loss_token_weights: str = "uniform",  # "uniform" or "training"
+        noise_params: DictConfig = None,
+        cat_weighting: DictConfig = None,
+        time_dist: DictConfig = None,
+        vocab: Vocab = None,
+        distributions: Distributions = None,
     ):
         super().__init__()
 
-        # Will be set via setter method
-        self.atom_tokens = None
-        self.edge_tokens = None
-        self.charge_tokens = None
-        self.atom_mask_index = None
-        self.death_token_index = None
-        self.interpolator = None
-        self.integrator = None
+        self.vocab = vocab
+        self.distributions = distributions
 
-        self.weight_alpha = weight_alpha
+        self.cat_weighting = cat_weighting
 
-        self.cat_strategy = cat_strategy
-        self.N_samples = N_samples
-        self.k_nn_edges = k_nn_edges
-        self.K = K
-        self.D = D
+        self.gmm_params = gmm_params
         self.n_atoms_strategy = n_atoms_strategy
-        self.cat_strategy = cat_strategy
         self.type_loss_token_weights = type_loss_token_weights
-        self.cat_noise_level = cat_noise_level
-        self.num_integration_steps = num_integration_steps
-        self.coord_noise_level = coord_noise_level
-        self.time_dist = torch.distributions.Uniform(0.0, 1.0)
+
+        if self.cat_weighting.cat_strategy == "mask":
+            self.atom_mask_index = token_to_index(self.vocab.atom_tokens, "<MASK>")
+            self.edge_mask_index = token_to_index(self.vocab.edge_tokens, "<MASK>")
+        else:
+            self.atom_mask_index = None
+            self.edge_mask_index = None
+
+        if time_dist is None:
+            time_dist = DictConfig(
+                {
+                    "_target_": "torch.distributions.Uniform",
+                    "low": 0.0,
+                    "high": 1.0,
+                }
+            )
+        self.time_dist = hydra.utils.instantiate(time_dist)
+
+        if noise_params is None:
+            noise_params = DictConfig(
+                {
+                    "cat_noise_level": 0.0,
+                    "coord_noise_level": 0.0,
+                }
+            )
+        self.noise_params = noise_params
 
         # Set default loss weights if not provided
         if loss_weights is None:
             loss_weights = DictConfig(
                 {
-                    "a_loss": 1.0,
-                    "x_loss": 1.0,
-                    "gmm_loss": 1.0,
-                    "death_rate_loss": 1.0,
-                    "birth_rate_loss": 1.0,
+                    "l_x": 1.0,
+                    "l_ins": 1.0,
+                    "l_del": 1.0,
+                    "l_sub_rate_a": 1.0,
+                    "l_sub_class_a": 1.0,
+                    "l_sub_rate_c": 1.0,
+                    "l_sub_class_c": 1.0,
+                    "l_sub_rate_e": 1.0,
+                    "l_sub_class_e": 1.0,
                 }
             )
-        self.loss_weights = loss_weights
+        # register the loss weights as buffers
+        for key, value in loss_weights.items():
+            self.register_buffer(key, torch.tensor(value))
 
         # Set default optimizer config if not provided
         if optimizer_config is None:
@@ -98,8 +110,53 @@ class LightningModule(pl.LightningModule):
             )
         self.optimizer_config = optimizer_config
 
+        self.integrator = hydra.utils.instantiate(
+            integrator, distributions=self.distributions
+        )
+
+        # Always compute token distribution weights for weighted cross-entropy loss
+        atom_special_tokens = []
+        if self.cat_weighting.cat_strategy == "mask":
+            atom_special_tokens.append("<MASK>")
+
+        atom_type_weights = compute_token_weights(
+            token_list=self.vocab.atom_tokens,
+            distribution=self.distributions.atom_type_distribution,
+            special_token_names=atom_special_tokens,
+            weight_alpha=self.cat_weighting.weight_alpha,
+            type_loss_token_weights=self.type_loss_token_weights,
+        )
+        self.register_buffer("atom_type_weights", atom_type_weights)
+
+        # Compute edge token distribution weights for weighted cross-entropy loss
+        edge_special_tokens = ["<NO_BOND>"]
+        if self.cat_weighting.cat_strategy == "mask":
+            edge_special_tokens.append("<MASK>")
+
+        edge_weights = compute_token_weights(
+            token_list=self.vocab.edge_tokens,
+            distribution=self.distributions.edge_type_distribution,
+            special_token_names=edge_special_tokens,
+            weight_alpha=self.cat_weighting.weight_alpha,
+            type_loss_token_weights=self.type_loss_token_weights,
+        )
+        self.register_buffer("edge_token_weights", edge_weights)
+
+        charge_weights = compute_token_weights(
+            token_list=self.vocab.charge_tokens,
+            distribution=self.distributions.charge_type_distribution,
+            special_token_names=[],  # no special tokens for charges
+            weight_alpha=self.cat_weighting.weight_alpha,
+            type_loss_token_weights=self.type_loss_token_weights,
+        )
+        self.register_buffer("charge_token_weights", charge_weights)
+
+        self.metrics, self.stability_metrics = init_metrics()
+
         self.save_hyperparameters()
         self.model = hydra.utils.instantiate(model)
+
+        self.edge_aligner = EdgeAligner()
 
         self.is_compiled = False
 
@@ -110,87 +167,6 @@ class LightningModule(pl.LightningModule):
         print("Compiling model...")
         self.model = torch.compile(self.model, dynamic=True)
         self.is_compiled = True
-
-    def set_tokens_and_distribution(
-        self,
-        atom_tokens: list[str],
-        edge_tokens: list[str],
-        charge_tokens: list[str],
-        atom_type_distribution: torch.Tensor,
-        edge_type_distribution: torch.Tensor,
-        charge_type_distribution: torch.Tensor,
-    ):
-        """Set tokens and distributions after initialization."""
-        self.atom_tokens = atom_tokens
-        self.edge_tokens = edge_tokens
-        self.charge_tokens = charge_tokens
-
-        if self.n_atoms_strategy != "fixed":
-            self.atom_death_token_index = token_to_index(self.atom_tokens, "<DEATH>")
-        if self.cat_strategy == "mask":
-            self.atom_mask_index = token_to_index(self.atom_tokens, "<MASK>")
-            self.edge_mask_index = token_to_index(self.edge_tokens, "<MASK>")
-
-        self.interpolator = Interpolator(
-            self.atom_tokens,
-            self.edge_tokens,
-            self.charge_tokens,
-            atom_type_distribution.to(self.device),
-            edge_type_distribution.to(self.device),
-            cat_strategy=self.cat_strategy,
-            n_atoms_strategy=self.n_atoms_strategy,
-            N_samples=self.N_samples,
-        )
-        self.integrator = Integrator(
-            self.atom_tokens,
-            edge_tokens=self.edge_tokens,
-            edge_type_distribution=edge_type_distribution.to(
-                "cuda" if torch.cuda.is_available() else "cpu"
-            ),
-            K=self.K,
-            D=self.D,
-            cat_strategy=self.cat_strategy,
-            n_atoms_strategy=self.n_atoms_strategy,
-            device="cuda" if torch.cuda.is_available() else "cpu",
-        )
-        # Always compute token distribution weights for weighted cross-entropy loss
-        atom_special_tokens = []
-        if self.cat_strategy == "mask":
-            atom_special_tokens.append("<MASK>")
-        if self.n_atoms_strategy != "fixed":
-            atom_special_tokens.append("<DEATH>")
-
-        atom_type_weights = compute_token_weights(
-            token_list=self.atom_tokens,
-            distribution=atom_type_distribution,
-            special_token_names=atom_special_tokens,
-            weight_alpha=self.weight_alpha,
-            type_loss_token_weights=self.type_loss_token_weights,
-        )
-        self.register_buffer("atom_type_weights", atom_type_weights)
-
-        # Compute edge token distribution weights for weighted cross-entropy loss
-        edge_special_tokens = ["<NO_BOND>"]
-        if self.cat_strategy == "mask":
-            edge_special_tokens.append("<MASK>")
-
-        edge_weights = compute_token_weights(
-            token_list=self.edge_tokens,
-            distribution=edge_type_distribution,
-            special_token_names=edge_special_tokens,
-            weight_alpha=self.weight_alpha,
-            type_loss_token_weights=self.type_loss_token_weights,
-        )
-        self.register_buffer("edge_token_weights", edge_weights)
-
-        charge_weights = compute_token_weights(
-            token_list=self.charge_tokens,
-            distribution=charge_type_distribution,
-            special_token_names=[],  # no special tokens for charges
-            weight_alpha=self.weight_alpha,
-            type_loss_token_weights=self.type_loss_token_weights,
-        )
-        self.register_buffer("charge_token_weights", charge_weights)
 
     def forward(self, x):
         # Define the forward pass of your model here
@@ -214,37 +190,71 @@ class LightningModule(pl.LightningModule):
             )
         return loss
 
+    def edit_flow_loss(
+        self,
+        rate_pred,
+        target_rate,
+        batch,
+        num_graphs,
+        class_pred=None,
+        class_target=None,
+        class_weights=None,
+    ):
+        # EditFlow loss (eq. 23 in the paper):
+        # L = sum(x != x_t)[u_t(x|x_t)]
+        #   + sum(i=0 to N_nodes)[1{is_different} * log(u_t(ins/del/sub|x_t))]
+
+        # Rate loss (EditFlow's term 1 in eq. 23)
+        # Intuitively, we want to do as few edits as possible
+
+        # Correct edits loss (EditFlows, term 2 in eq. 23)
+        # Intuitively, we want to do as many correct edits as possible
+        # u_t(insert) = lambda_insert * Q_insert
+        # <--> log[u_t(insert)] = log[lambda_insert * Q_insert]
+        # <--> log[u_t(insert)] = log[lambda_insert] + log[Q_insert]
+        # similar for delete and substitute
+
+        # This simiplies to a simple poisson nll loss and a cross entropy loss term
+        # Loss is L = sum(lambda_pred - weight * log(lambda_pred)) + sum(weight * log(Q_target))
+        #           = sum(poisson_nll(lambda_pred, weight)) + sum(weight * cross_entropy(class_pred, class_target))
+        # where weight is the target rate
+
+        # NOTE: target rate must also include 0 rates!
+        # This will automatically make term 2 zero for nodes that are not modified
+        rate_loss = F.poisson_nll_loss(
+            rate_pred.view(-1),
+            target_rate.view(-1),
+            log_input=False,
+            reduction="none",
+        )
+        class_loss = torch.tensor(0.0, device=self.device)
+        if class_pred is not None and class_target is not None:
+            class_loss = target_rate.view(-1) * F.cross_entropy(
+                class_pred,
+                class_target,
+                weight=class_weights,
+                reduction="none",
+            )
+        loss = rate_loss + class_loss
+
+        # NOTE: first normalize by number of nodes / graphs
+        # Otherwise, nodes with more atoms will have more weight by design
+        loss = unsorted_segment_mean(loss.view(-1, 1), batch, num_graphs)
+
+        # then take the mean
+        return loss.mean()
+
     def shared_step(self, batch, batch_idx):
         self.model.set_training()
         # Define the training step logic here
-        if self.atom_tokens is None:
+        if self.vocab.atom_tokens is None:
             raise ValueError(
-                "atom_tokens must be set before training. "
-                "Call set_tokens_and_distribution() first."
+                "vocab.atom_tokens must be set before training. Call set_vocab() first."
             )
 
-        samples_batched, targets_batched = batch
+        mols_t, mols_1, ins_targets, t = batch
 
-        batch_size = targets_batched.batch_size
-
-        # interpolate
-        t = self.time_dist.sample((batch_size,)).to(self.device)
-        mols_t, targets = self.interpolator.interpolate_different_size(
-            samples_batched,
-            targets_batched,
-            t,
-        )
-
-        # TODO make choice flexible
-        # build kNN graph
-        # edge_index = knn_graph(xt, k=self.k_nn_edges, batch=xt_batch_id)
-
-        # build a fully connected graph per batch
-        # edge_index = build_fully_connected_edge_index(xt_batch_id)
-
-        # edge_type_ids = et[edge_index[0], edge_index[1]]
-
-        # random self-conditioning
+        # randomized self-conditioning with p = 0.5 during training
         is_random_self_conditioning = (torch.rand(1) > 0.5).item()
 
         preds = self.model(
@@ -255,129 +265,180 @@ class LightningModule(pl.LightningModule):
 
         a_pred = preds["atom_type_head"]
         x_pred = preds["pos_head"]
-        edge_type_pred = preds["edge_type_head"]
-        gmm_pred = preds["gmm_head"]
-        charge_pred = preds["charge_head"]
+        e_pred = preds["edge_type_head"]
+        c_pred = preds["charge_head"]
 
-        gmm_dict = compute_equivariant_gmm(
-            gmm_pred,
-            mols_t.x,
+        gmm_pred_dict = preds["gmm_head"]
+
+        ins_rate_pred = preds["ins_rate_head"]
+        del_rate_pred = preds["del_rate_head"]
+        sub_rate_pred_a = preds["sub_rate_a_head"]
+        sub_rate_pred_c = preds["sub_rate_c_head"]
+        sub_rate_pred_e = preds["sub_rate_e_head"]
+
+        # 1. Handle substitutions
+
+        #### Handle atom type substitutions
+        # Mask indicating which nodes need to be substituted
+        sub_loss_a = self.edit_flow_loss(
+            sub_rate_pred_a,
+            mols_t.lambda_a_sub,
             mols_t.batch,
-            self.K,
-            len(self.atom_tokens) if self.cat_strategy == "uniform-sample" else 0,
+            mols_t.num_graphs,
+            a_pred,
+            mols_1.a,
+            class_weights=self.atom_type_weights,
         )
+        self.log("sub_loss_a", sub_loss_a, prog_bar=False, logger=True)
 
-        net_rate_pred = preds["net_rate_head"]
-        death_rate_pred = F.relu(-net_rate_pred)
-        birth_rate_pred = F.relu(net_rate_pred)
-
-        # Calculate losses
-        # only do class prediction on non-mask tokens
-        if self.atom_type_weights is None:
-            raise ValueError(
-                "atom_type_weights must be set before training. "
-                "Call set_tokens_and_distribution() first."
-            )
-
-        if self.cat_strategy == "mask":
-            # predict final class only for mask tokens
-            mask = targets["mols_1"].a != self.atom_mask_index
-        else:
-            # predict final class for all tokens
-            mask = torch.ones_like(targets["mols_1"].a, dtype=torch.bool)
-
-        if mask.sum() > 0:
-            # Always use weighted cross-entropy loss
-            a_loss = F.cross_entropy(
-                a_pred[mask],
-                targets["mols_1"].a[mask],
-                weight=self.atom_type_weights,
-            )
-        else:
-            # all tokens are correct, so no loss
-            a_loss = torch.tensor(0.0, device=self.device)
-
-        if self.edge_token_weights is None:
-            raise ValueError(
-                "edge_token_weights must be set before training. "
-                "Call set_tokens_and_distribution() first."
-            )
-
-        edge_index_pred, e_pred_triu = get_canonical_upper_triangle_with_index(
-            mols_t.edge_index, edge_type_pred
+        sub_loss_c = self.edit_flow_loss(
+            sub_rate_pred_c,
+            mols_t.lambda_c_sub,
+            mols_t.batch,
+            mols_t.num_graphs,
+            c_pred,
+            mols_1.c,
+            class_weights=self.charge_token_weights,
         )
-        edge_index_target, e_target_triu = get_canonical_upper_triangle_with_index(
-            targets["mols_1"].edge_index, targets["mols_1"].e
-        )
+        self.log("sub_loss_c", sub_loss_c, prog_bar=False, logger=True)
 
-        assert torch.all(edge_index_pred == edge_index_target), (
-            "The edge indices must be the same."
+        #### Handle edge type substitutions
+        edge_infos = self.edge_aligner.align_edges(
+            source_group=(mols_t.edge_index, [e_pred, sub_rate_pred_e]),
+            target_group=(mols_1.edge_index, [mols_1.e, mols_t.lambda_e_sub]),
         )
+        e_batch_triu = mols_t.batch[edge_infos["edge_index"][0][0]]
+        e_pred_triu, sub_rate_pred_e_triu = edge_infos["edge_attr"][:2]
+        e_target_triu, sub_rate_target_e_triu = edge_infos["edge_attr"][2:]
 
-        e_loss = F.cross_entropy(
+        sub_loss_e = self.edit_flow_loss(
+            sub_rate_pred_e_triu,
+            sub_rate_target_e_triu,
+            e_batch_triu,
+            mols_t.num_graphs,
             e_pred_triu,
             e_target_triu,
-            weight=self.edge_token_weights,
+            class_weights=self.edge_token_weights,
         )
+        self.log("sub_loss_e", sub_loss_e, prog_bar=False, logger=True)
 
-        c_loss = F.cross_entropy(
-            charge_pred,
-            targets["mols_1"].c,
-            weight=self.charge_token_weights,
-        )
+        sub_loss = sub_loss_a + sub_loss_c + sub_loss_e
+        self.log("sub_loss", sub_loss, prog_bar=False, logger=True)
 
-        x_loss = F.mse_loss(x_pred, targets["mols_1"].x)
-
-        # TODO must add charges here later
-        if self.cat_strategy == "uniform-sample":
-            gmm_loss = typed_gmm_loss(
-                gmm_dict,
-                targets["atoms_to_birth"].x,
-                targets["atoms_to_birth"].a,
-                targets["atoms_to_birth"].batch,
+        del_loss = torch.tensor(0.0, device=self.device)
+        ins_loss = torch.tensor(0.0, device=self.device)
+        if self.n_atoms_strategy != "fixed":
+            # 2. Handle deletions (no class changes here!)
+            del_loss = self.edit_flow_loss(
+                del_rate_pred, mols_t.lambda_del, mols_t.batch, mols_t.num_graphs
             )
-        else:
-            gmm_loss = untyped_gmm_loss(
-                gmm_dict,
-                targets["atoms_to_birth"].x,
-                targets["atoms_to_birth"].a,
-                targets["atoms_to_birth"].batch,
+            self.log("del_loss", del_loss, prog_bar=False, logger=True)
+
+            # 3. Handle insertions
+            # mask indicating which nodes are focal for insertion
+            ins_loss_rate = self.edit_flow_loss(
+                ins_rate_pred, mols_t.lambda_ins, mols_t.batch, mols_t.num_graphs
             )
+            self.log("ins_loss_rate", ins_loss_rate, prog_bar=False, logger=True)
 
-        death_rate_loss = rate_loss(death_rate_pred, targets["death_rate_target"])
+            ins_loss_gmm = torch.tensor(0.0, device=self.device)
+            ins_loss_e = torch.tensor(0.0, device=self.device)
 
-        birth_rate_loss = rate_loss(birth_rate_pred, targets["birth_rate_target"])
+            if ins_targets.spawn_node_idx.numel() > 0:
+                # spawn_node_idx: indices of nodes in mol_t that spawn/predict each insertion
+                spawn_node_idx = ins_targets.spawn_node_idx
 
-        loss = (
-            self.loss_weights.a_loss * a_loss
-            + self.loss_weights.x_loss * x_loss
-            + self.loss_weights.e_loss * e_loss
-            + self.loss_weights.c_loss * c_loss
-            + self.loss_weights.gmm_loss * gmm_loss
-            + self.loss_weights.death_rate_loss * death_rate_loss
-            + self.loss_weights.birth_rate_loss * birth_rate_loss
-        )
-        self.log("loss", loss, prog_bar=False, logger=True, batch_size=batch_size)
-        self.log("a_loss", a_loss, prog_bar=False, logger=True, batch_size=batch_size)
-        self.log("x_loss", x_loss, prog_bar=False, logger=True, batch_size=batch_size)
-        self.log("e_loss", e_loss, prog_bar=False, logger=True, batch_size=batch_size)
-        self.log(
-            "gmm_loss", gmm_loss, prog_bar=False, logger=True, batch_size=batch_size
-        )
-        self.log(
-            "death_rate_loss",
-            death_rate_loss,
-            prog_bar=False,
-            logger=True,
-            batch_size=batch_size,
-        )
-        self.log(
-            "birth_rate_loss",
-            birth_rate_loss,
-            prog_bar=False,
-            logger=True,
-            batch_size=batch_size,
-        )
+                gmm_dict_pred = {
+                    "mu": gmm_pred_dict["mu"][spawn_node_idx],
+                    "sigma": gmm_pred_dict["sigma"][spawn_node_idx],
+                    "pi": gmm_pred_dict["pi"][spawn_node_idx],
+                    "a_probs": gmm_pred_dict["a_probs"][spawn_node_idx],
+                    "c_probs": gmm_pred_dict["c_probs"][spawn_node_idx],
+                }
+
+                # TODO we must take the NLL for the closest nodes only
+                if self.cat_weighting.cat_strategy == "uniform-sample":
+                    gmm_loss = typed_gmm_loss(
+                        gmm_dict_pred,
+                        ins_targets.x,
+                        ins_targets.a,
+                        ins_targets.c,
+                        ins_targets.batch,
+                        reduction="none",
+                    )
+                else:
+                    raise ValueError("Untyped GMM loss is not implemented yet.")
+                    gmm_loss = untyped_gmm_loss(
+                        gmm_dict_pred,
+                        ins_targets.x,
+                        ins_targets.batch,
+                    )
+
+                # weight the gmm loss by the target rate
+                gmm_loss = gmm_loss.view(-1) * mols_t.lambda_ins[spawn_node_idx]
+
+                # reduce the loss
+                ins_loss_gmm = unsorted_segment_mean(
+                    gmm_loss.view(-1, 1),
+                    mols_t.batch[spawn_node_idx],
+                    mols_t.num_graphs,
+                )
+
+                ins_loss_gmm = ins_loss_gmm.mean()
+                self.log("ins_loss_gmm", ins_loss_gmm, prog_bar=False, logger=True)
+
+            # Compute insertion edge loss if available
+
+            # Validate indices are within bounds
+            n_nodes = mols_t.num_nodes
+            spawn_idx = ins_targets.ins_edge_spawn_idx
+            target_idx = ins_targets.ins_edge_target_idx
+
+            if spawn_idx.max() < n_nodes and target_idx.max() < n_nodes:
+                # Get edge predictions using the insertion edge head
+                ins_edge_logits = self.model.predict_insertion_edges(
+                    out_dict=preds,
+                    batch=mols_t.batch,
+                    spawn_node_idx=spawn_idx,
+                    target_node_idx=target_idx,
+                )
+                if ins_edge_logits is not None and ins_edge_logits.numel() > 0:
+                    ins_edge_weights = mols_t.lambda_ins[spawn_idx]
+
+                    ins_loss_e = F.cross_entropy(
+                        ins_edge_logits,
+                        ins_targets.ins_edge_types,
+                        weight=self.edge_token_weights,
+                        reduction="none",
+                    )
+
+                    # weight the loss by the target rate
+                    ins_loss_e = ins_loss_e * ins_edge_weights
+
+                    # reduce the loss
+                    ins_loss_e = unsorted_segment_mean(
+                        ins_loss_e.view(-1, 1),
+                        mols_t.batch[spawn_idx],
+                        mols_t.num_graphs,
+                    )
+                    ins_loss_e = ins_loss_e.mean()
+                    self.log("ins_loss_e", ins_loss_e, prog_bar=False, logger=True)
+
+            ins_loss = ins_loss_rate + ins_loss_gmm + ins_loss_e
+            self.log("ins_loss", ins_loss, prog_bar=False, logger=True)
+
+        # 4. Combine the edit losses
+        edit_flow_loss = sub_loss + del_loss + ins_loss
+        self.log("edit_flow_loss", edit_flow_loss, prog_bar=False, logger=True)
+
+        # 5. Calculate the flow matching loss
+        x_loss = F.mse_loss(x_pred, mols_1.x)
+        x_loss = x_loss * self.l_x
+        self.log("x_loss", x_loss, prog_bar=False, logger=True)
+
+        # 6. Combine the EditFlow loss and the flow matching loss
+        loss = edit_flow_loss + x_loss
+
         loss = self.safe_loss(loss)
 
         return loss
@@ -388,25 +449,45 @@ class LightningModule(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        # Define the validation step logic here
-        loss = self.shared_step(batch, batch_idx)
-        # Log val_loss at epoch level for ReduceLROnPlateau scheduler
-        self.log(
-            "val_loss",
-            loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-            batch_size=batch[0].batch_size,
-        )
-        return loss
+        return
+        batched_mols = self.sample(batch, batch_idx, return_traj=False)
+
+        # List of MoleculeData objects
+        mols = batched_mols.to_data_list()
+
+        # List of RDKit molecules or None
+        rdkit_mols = [
+            mol.to_rdkit_mol(
+                self.vocab.atom_tokens, self.vocab.edge_tokens, self.vocab.charge_tokens
+            )
+            for mol in mols
+        ]
+        eval_metrics = calc_metrics_(rdkit_mols, self.metrics)
+        print(eval_metrics)
+
+        for key, value in eval_metrics.items():
+            self.log(
+                f"val_{key}",
+                value,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                batch_size=len(mols),
+            )
+
+        return eval_metrics
+
+        return
 
     def test_step(self, batch, batch_idx):
         # Define the test step logic here
         pass
 
     def predict_step(self, batch, batch_idx):
+        return self.sample(batch, batch_idx, return_traj=True)
+
+    def sample(self, batch, batch_idx, return_traj: bool = False):
         """
         Inference step for flow matching.
 
@@ -418,31 +499,22 @@ class LightningModule(pl.LightningModule):
             Dictionary containing final samples
         """
         self.model.set_inference()
-        if self.atom_tokens is None:
+        if self.vocab.atom_tokens is None:
             raise ValueError(
-                "tokens must be set before prediction. "
-                "Call set_tokens_and_distribution() first."
+                "vocab.atom_tokens must be set before prediction. "
+                "Call set_vocab() first."
             )
-
-        # For inference, we start from noise and integrate forward from t=0 to t=1
-        # For now, assume batch contains batch_size or we use a default
-        # In practice, you might want to pass initial conditions or use a prior
 
         # Get batch size from the batch (assuming it's similar to training)
         mol_t, _ = batch
 
         batch_size = mol_t.batch_size
-        batch_id = mol_t.batch
 
         _ = mol_t.remove_com()
 
-        # Time parameters
-        num_steps = self.num_integration_steps
-        dt = 1.0 / num_steps
-        t = torch.zeros(batch_size, device=self.device)  # Start at t=0
-
-        # Hyperparameters
-        cat_noise_level = self.cat_noise_level
+        # Start at t=0
+        t = torch.zeros(batch_size, device=self.device)
+        step_sizes = self.integrator.get_time_steps()
 
         # Trajectory storage
         mol_traj = [mol_t.clone()]
@@ -451,12 +523,8 @@ class LightningModule(pl.LightningModule):
         preds = None
 
         # Integration loop: integrate from t=0 to t=1
-        for _ in range(num_steps):
-            # TODO make choice flexible
-            # Build kNN graph
-            # edge_index = knn_graph(xt, k=self.k_nn_edges, batch=batch_id)
-            # edge_index = build_fully_connected_edge_index(batch_id)
-            # edge_type_ids = et[edge_index[0], edge_index[1]]
+        for step_size in step_sizes:
+            batch_id = mol_t.batch
 
             # Get model predictions
             preds = self.model(
@@ -470,13 +538,17 @@ class LightningModule(pl.LightningModule):
 
             a_pred = preds["atom_type_head"]  # (N_total, num_classes)
             a_pred = F.softmax(a_pred, dim=-1)
+            a_pred = torch.distributions.Categorical(probs=a_pred).sample()
 
             c_pred = preds["charge_head"]  # (N_total, num_classes)
             c_pred = F.softmax(c_pred, dim=-1)
+            c_pred = torch.distributions.Categorical(probs=c_pred).sample()
 
-            # get only triu part of the edge types
+            # NOTE: predictions are for full adj matrix.
+            # NOTE: Will take triu and resymmetrize in integration step
             e_pred = preds["edge_type_head"]
             e_pred = F.softmax(e_pred, dim=-1)
+            e_pred = torch.distributions.Categorical(probs=e_pred).sample()
 
             mol_1_pred = MoleculeBatch(
                 x=x1_pred,
@@ -487,36 +559,37 @@ class LightningModule(pl.LightningModule):
                 batch=batch_id.clone(),
             )
 
-            # (num_graphs, K + 2*K*D + K*N_types)
-            gmm_pred = preds["gmm_head"]
-            gmm_dict = compute_equivariant_gmm(
-                gmm_pred,
-                mol_1_pred.x,
-                mol_1_pred.batch,
-                self.K,
-                len(self.atom_tokens) if self.cat_strategy == "uniform-sample" else 0,
-            )
+            gmm_dict_pred = preds["gmm_head"]
 
             # Process rates
-            net_rate_pred = preds["net_rate_head"]  # (num_graphs, 1)
+            ins_rate_pred = preds["ins_rate_head"]
+            del_rate_pred = preds["del_rate_head"]
+            sub_rate_pred_a = preds["sub_rate_a_head"]
+            sub_rate_pred_c = preds["sub_rate_c_head"]
+            sub_rate_pred_e = preds["sub_rate_e_head"]
+
             # if we fix the number of atoms, we will not use the jump process
             if self.n_atoms_strategy == "fixed":
-                death_rate = torch.zeros_like(net_rate_pred).squeeze(-1)
-                birth_rate = torch.zeros_like(net_rate_pred).squeeze(-1)
-            else:
-                death_rate = F.relu(-net_rate_pred).squeeze(-1)  # (num_graphs,)
-                birth_rate = F.relu(net_rate_pred).squeeze(-1)  # (num_graphs,)
+                ins_rate_pred = torch.zeros_like(ins_rate_pred)
+                del_rate_pred = torch.zeros_like(del_rate_pred)
 
-            # Integrate one step
+            # Get insertion edge head if available
+            ins_edge_head = getattr(self.model, "ins_edge_head", None)
+
+            # Integrate one step (edge prediction happens inside if head is provided)
             mol_t = self.integrator.integrate_step_gnn(
-                mol_t=mol_t,
-                mol_1_pred=mol_1_pred,
-                global_death_rate=death_rate,
-                birth_rate=birth_rate,
-                birth_gmm_dict=gmm_dict,
+                mol_t=mol_t.clone(),
+                mol_1_pred=mol_1_pred.clone(),
+                sub_rate_a=sub_rate_pred_a,
+                sub_rate_c=sub_rate_pred_c,
+                sub_rate_e=sub_rate_pred_e,
+                del_rate=del_rate_pred,
+                ins_rate=ins_rate_pred,
+                ins_gmm_preds=gmm_dict_pred,
                 t=t,
-                dt=dt,
-                cat_noise_level=cat_noise_level,
+                dt=step_size,
+                h_latent=preds.get("h_latent"),
+                ins_edge_head=ins_edge_head,
             )
 
             # remove mean from xt for each batch
@@ -524,21 +597,29 @@ class LightningModule(pl.LightningModule):
 
             # Update time forward
             # Number of graphs stays constant (batch_size)
-            t = t + dt
+            t = t + step_size
 
-            # Save  state to trajectory
-            mol_traj.append(mol_t.clone())
+            if torch.all(t >= 1.0):
+                # save final predicted state to trajectory
+                mol_traj.append(mol_1_pred.clone())
+            else:
+                # Save  state to trajectory
+                mol_traj.append(mol_t.clone())
 
-        # rectify the trajectory such that we get a traj for each molecule
-        traj_lists = [mol_traj_i.to_data_list() for mol_traj_i in mol_traj]
+        if return_traj:
+            # rectify the trajectory such that we get a traj for each molecule
+            traj_lists = [mol_traj_i.to_data_list() for mol_traj_i in mol_traj]
 
-        traj_per_mol = [[] for _ in range(batch_size)]
-        for i in range(batch_size):
-            for mol_t in traj_lists:
-                traj_per_mol[i].append(mol_t[i])
+            traj_per_mol = [[] for _ in range(batch_size)]
+            for i in range(batch_size):
+                for mol_t in traj_lists:
+                    traj_per_mol[i].append(mol_t[i])
 
-        # Return results
-        return traj_per_mol
+            # Return results
+            return traj_per_mol
+
+        else:
+            return mol_traj[-1].clone()
 
     def configure_optimizers(self):
         # Instantiate optimizer from config
@@ -564,6 +645,12 @@ class LightningModule(pl.LightningModule):
             },
             "monitor": self.optimizer_config.monitor,
         }
+
+    def on_before_optimizer_step(self, optimizer):
+        # Compute the 2-norm for each layer
+        # If using mixed precision, the gradients are already unscaled here
+        norms = grad_norm(self, norm_type=2)
+        self.log_dict(norms)
 
     def optimizer_step(
         self,
@@ -616,6 +703,6 @@ class LightningModule(pl.LightningModule):
 
 if __name__ == "__main__":
     # Instantiate the LightningModule and run the training loop
-    model = LightningModule()
+    model = LightningModuleRates()
     trainer = pl.Trainer()
     trainer.fit(model)
