@@ -281,7 +281,7 @@ class Integrator:
             a_pred = torch.distributions.Categorical(a_step_probs).sample()
             a = a_pred
 
-        else:
+        elif self.cat_strategy == "mask":
             # Get time for each node (expand t to match nodes)
             num_graphs = t.shape[0]
             node_times = torch.zeros_like(batch_id, dtype=t.dtype, device=self.device)
@@ -305,7 +305,8 @@ class Integrator:
             # Apply unmasking and re-masking
             a[unmask] = a_1[unmask]
             a[mask] = self.atom_mask_index
-
+        else:
+            raise NotImplementedError(f"Categorical strategy {self.cat_strategy} not implemented.")
         # 2.5. Update edge types
         num_edge_classes = e_1.shape[-1]
 
