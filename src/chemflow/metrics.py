@@ -8,67 +8,19 @@ from rdkit import Chem
 from torchmetrics import Metric
 from torchmetrics import MetricCollection
 
-import chemflow.rdkit as smolRD
-
-ALLOWED_VALENCIES = {
-    "H": {0: 1, 1: 0, -1: 0},
-    "C": {0: [3, 4], 1: 3, -1: 3},
-    "N": {
-        0: [2, 3],
-        1: [2, 3, 4],
-        -1: 2,
-    },  # In QM9, N+ seems to be present in the form NH+ and NH2+
-    "O": {0: 2, 1: 3, -1: 1},
-    "F": {0: 1, -1: 0},
-    "B": 3,
-    "Al": 3,
-    "Si": 4,
-    "P": {0: [3, 5], 1: 4},
-    "S": {0: [2, 6], 1: [2, 3], 2: 4, 3: 5, -1: 3},
-    "Cl": 1,
-    "As": 3,
-    "Br": {0: 1, 1: 2},
-    "I": 1,
-    "Hg": [1, 2],
-    "Bi": [3, 5],
-    "Se": [2, 4, 6],
-}
-
+from chemflow import rdkit as chemflowRD
 
 def calc_atom_stabilities(mol):
-    stabilities = []
+    problems = Chem.DetectChemistryProblems(mol)
 
-    for atom in mol.GetAtoms():
-        atom_type = atom.GetSymbol()
-        valence = atom.GetExplicitValence()
-        charge = atom.GetFormalCharge()
+    # Number of atoms involved in problems
+    stabilities = [False] * mol.GetNumAtoms()
 
-        if atom_type not in ALLOWED_VALENCIES:
-            stabilities.append(False)
-            continue
-
-        allowed = ALLOWED_VALENCIES[atom_type]
-        atom_stable = _is_valid_valence(valence, allowed, charge)
-        stabilities.append(atom_stable)
+    for p in problems:
+        if hasattr(p, "GetAtomIdx"):
+            stabilities[p.GetAtomIdx()] = True
 
     return stabilities
-
-
-def _is_valid_valence(valence, allowed, charge):
-    if isinstance(allowed, int):
-        valid = allowed == valence
-
-    elif isinstance(allowed, list):
-        valid = valence in allowed
-
-    elif isinstance(allowed, dict):
-        allowed = allowed.get(charge)
-        if allowed is None:
-            return False
-
-        valid = _is_valid_valence(valence, allowed, charge)
-
-    return valid
 
 
 def _is_valid_float(num):
@@ -147,7 +99,7 @@ class Validity(GenerativeMetric):
 
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
         is_valid = [
-            smolRD.mol_is_valid(mol, connected=self.connected)
+            chemflowRD.mol_is_valid(mol)
             for mol in mols
             if mol is not None
         ]
@@ -171,7 +123,7 @@ class Uniqueness(GenerativeMetric):
 
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
         smiles = [
-            smolRD.smiles_from_mol(mol, canonical=True)
+            Chem.MolToSmiles(mol, canonical=True)
             for mol in mols
             if mol is not None
         ]
@@ -192,7 +144,7 @@ class Novelty(GenerativeMetric):
         executor = ProcessPoolExecutor(max_workers=n_workers)
 
         futures = [
-            executor.submit(smolRD.smiles_from_mol, mol, canonical=True)
+            executor.submit(chemflowRD.smiles_from_mol, mol, canonical=True)
             for mol in existing_mols
         ]
         smiles = [future.result() for future in futures]
@@ -207,7 +159,7 @@ class Novelty(GenerativeMetric):
 
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
         smiles = [
-            smolRD.smiles_from_mol(mol, canonical=True)
+            chemflowRD.smiles_from_mol(mol, canonical=True)
             for mol in mols
             if mol is not None
         ]
@@ -234,9 +186,9 @@ class EnergyValidity(GenerativeMetric):
         num_mols = len(mols)
 
         if self.optimise:
-            mols = [smolRD.optimise_mol(mol) for mol in mols if mol is not None]
+            mols = [chemflowRD.optimise_mol(mol) for mol in mols if mol is not None]
 
-        energies = [smolRD.calc_energy(mol) for mol in mols if mol is not None]
+        energies = [chemflowRD.calc_energy(mol) for mol in mols if mol is not None]
         valid_energies = [energy for energy in energies if _is_valid_float(energy)]
 
         self.n_valid += len(valid_energies)
@@ -269,10 +221,10 @@ class AverageEnergy(GenerativeMetric):
 
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
         if self.optimise:
-            mols = [smolRD.optimise_mol(mol) for mol in mols if mol is not None]
+            mols = [chemflowRD.optimise_mol(mol) for mol in mols if mol is not None]
 
         energies = [
-            smolRD.calc_energy(mol, per_atom=self.per_atom)
+            chemflowRD.calc_energy(mol, per_atom=self.per_atom)
             for mol in mols
             if mol is not None
         ]
@@ -284,6 +236,7 @@ class AverageEnergy(GenerativeMetric):
     def compute(self) -> torch.Tensor:
         return self.energy / self.n_valid_energies
 
+# TODO: Add xTB as level of theory option and add forces as a metric
 
 class AverageStrainEnergy(GenerativeMetric):
     """
@@ -313,12 +266,12 @@ class AverageStrainEnergy(GenerativeMetric):
 
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
         opt_mols = [
-            (idx, smolRD.optimise_mol(mol))
+            (idx, chemflowRD.optimise_mol(mol))
             for idx, mol in list(enumerate(mols))
             if mol is not None
         ]
         energies = [
-            (idx, smolRD.calc_energy(mol, per_atom=self.per_atom))
+            (idx, chemflowRD.calc_energy(mol, per_atom=self.per_atom))
             for idx, mol in opt_mols
             if mol is not None
         ]
@@ -329,7 +282,7 @@ class AverageStrainEnergy(GenerativeMetric):
 
         valid_indices, valid_energies = tuple(zip(*valids))
         original_energies = [
-            smolRD.calc_energy(mols[idx], per_atom=self.per_atom)
+            chemflowRD.calc_energy(mols[idx], per_atom=self.per_atom)
             for idx in valid_indices
         ]
         energy_diffs = [
@@ -361,7 +314,7 @@ class AverageOptRmsd(GenerativeMetric):
 
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
         valids = [
-            (idx, smolRD.optimise_mol(mol))
+            (idx, chemflowRD.optimise_mol(mol))
             for idx, mol in list(enumerate(mols))
             if mol is not None
         ]
@@ -373,7 +326,7 @@ class AverageOptRmsd(GenerativeMetric):
         valid_indices, opt_mols = tuple(zip(*valids))
         original_mols = [mols[idx] for idx in valid_indices]
         rmsds = [
-            smolRD.conf_distance(mol1, mol2)
+            chemflowRD.conf_distance(mol1, mol2)
             for mol1, mol2 in zip(original_mols, opt_mols)
         ]
 
@@ -384,73 +337,13 @@ class AverageOptRmsd(GenerativeMetric):
         return self.total_rmsd / self.n_valid
 
 
-class MolecularAccuracy(PairMetric):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-        self.add_state("n_correct", default=torch.tensor(0), dist_reduce_fx="sum")
-        self.add_state("total", default=torch.tensor(0), dist_reduce_fx="sum")
-
-    def update(
-        self, predicted: list[Chem.rdchem.Mol], actual: list[Chem.rdchem.Mol]
-    ) -> None:
-        predicted_smiles = [
-            smolRD.smiles_from_mol(pred, canonical=True) for pred in predicted
-        ]
-        actual_smiles = [smolRD.smiles_from_mol(act, canonical=True) for act in actual]
-        matches = [
-            pred == act
-            for pred, act in zip(predicted_smiles, actual_smiles)
-            if act is not None
-        ]
-
-        self.n_correct += sum(matches)
-        self.total += len(matches)
-
-    def compute(self) -> torch.Tensor:
-        return self.n_correct.float() / self.total
-
-
-class MolecularPairRMSD(PairMetric):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-        self.add_state("total_rmsd", default=torch.tensor(0.0), dist_reduce_fx="sum")
-        self.add_state("n_valid", default=torch.tensor(0), dist_reduce_fx="sum")
-
-    def update(
-        self, predicted: list[Chem.rdchem.Mol], actual: list[Chem.rdchem.Mol]
-    ) -> None:
-        valid_pairs = [
-            (pred, act)
-            for pred, act in zip(predicted, actual)
-            if pred is not None and act is not None
-        ]
-        rmsds = [smolRD.conf_distance(pred, act) for pred, act in valid_pairs]
-        rmsds = [rmsd for rmsd in rmsds if rmsd is not None]
-
-        self.total_rmsd += sum(rmsds)
-        self.n_valid += len(rmsds)
-
-    def compute(self) -> torch.tensor:
-        return self.total_rmsd / self.n_valid
-
-
-def init_metrics(data_path=None, model=None):
-    # Load the train data separately from the DM, just to access the list of train SMILES
-    # train_path = Path(data_path) / "train.smol"
-    # train_dataset = GeometricDataset.load(train_path)
-    # train_smiles = [mol.str_id for mol in train_dataset]
-
-    # print("Creating RDKit mols from training SMILES...")
-    # train_mols = model.builder.mols_from_smiles(train_smiles, explicit_hs=True)
-    # train_mols = [mol for mol in train_mols if mol is not None]
+def init_metrics(train_mols=None):
 
     metrics = {
         "validity": Validity(),
         "connected-validity": Validity(connected=True),
         "uniqueness": Uniqueness(),
-        # "novelty": Novelty(train_mols),
+        "novelty": Novelty(train_mols),
         "energy-validity": EnergyValidity(),
         "opt-energy-validity": EnergyValidity(optimise=True),
         "energy": AverageEnergy(),

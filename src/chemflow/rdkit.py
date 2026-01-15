@@ -7,7 +7,8 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from scipy.spatial.transform import Rotation
-
+from rdkit.Chem.Descriptors import NumRadicalElectrons
+from rdkit.Chem.rdDetermineBonds import DetermineBonds
 ArrT = np.ndarray
 
 
@@ -102,40 +103,33 @@ def _check_dim_shape(arr, dim, allowed, name="object"):
 # *************************************************************************************************
 
 
-def mol_is_valid(
-    mol: Chem.rdchem.Mol, with_hs: bool = True, connected: bool = True
-) -> bool:
-    """Whether the mol can be sanitised and, optionally, whether it's fully connected
+def mol_is_valid(mol: Chem.Mol, allow_radical: bool = False):
 
-    Args:
-        mol (Chem.Mol): RDKit molecule to check
-        with_hs (bool): Whether to check validity including hydrogens (if they are in the input mol), default True
-        connected (bool): Whether to also assert that the mol must not have disconnected atoms, default True
+    for a in mol.GetAtoms():
+        a.SetNoImplicit(True)
+        if a.HasProp("_MolFileHCount"):
+            a.ClearProp("_MolFileHCount")
 
-    Returns:
-        bool: Whether the mol is valid
-    """
+    flags = Chem.SanitizeFlags.SANITIZE_ALL & ~Chem.SanitizeFlags.SANITIZE_ADJUSTHS
 
-    if mol is None:
+    # Full sanitization minus ADJUSTHS
+    err = Chem.SanitizeMol(
+        mol,
+        sanitizeOps=flags,
+        catchErrors=True,
+    )
+
+    if err:  # nonzero bitmask means some step failed
         return False
-
-    mol_copy = Chem.Mol(mol)
-    if not with_hs:
-        mol_copy = Chem.RemoveAllHs(mol_copy)
-
-    try:
-        AllChem.SanitizeMol(mol_copy)
-    except Exception:
+    elif len(Chem.GetMolFrags(mol)) > 1:
         return False
-
-    n_frags = len(AllChem.GetMolFrags(mol_copy))
-    if connected and n_frags != 1:
+    elif not allow_radical and NumRadicalElectrons(mol) != 0:
         return False
+    else:
+        return True
 
-    return True
 
-
-def calc_energy(mol: Chem.rdchem.Mol, per_atom: bool = False) -> float:
+def calc_energy(mol: Chem.Mol, per_atom: bool = False, level: str = "MMFF94") -> float:
     """Calculate the energy for an RDKit molecule using the MMFF forcefield
 
     The energy is only calculated for the first (0th index) conformer within the molecule. The molecule is copied so
@@ -152,17 +146,18 @@ def calc_energy(mol: Chem.rdchem.Mol, per_atom: bool = False) -> float:
     mol_copy = Chem.Mol(mol)
 
     try:
-        mmff_props = AllChem.MMFFGetMoleculeProperties(mol_copy, mmffVariant="MMFF94")
-        ff = AllChem.MMFFGetMoleculeForceField(mol_copy, mmff_props, confId=0)
-        energy = ff.CalcEnergy()
-        energy = energy / mol.GetNumAtoms() if per_atom else energy
+        if level == "MMFF94":
+            mmff_props = AllChem.MMFFGetMoleculeProperties(mol_copy, mmffVariant="MMFF94")
+            ff = AllChem.MMFFGetMoleculeForceField(mol_copy, mmff_props, confId=0)
+            energy = ff.CalcEnergy()
+            energy = energy / mol.GetNumAtoms() if per_atom else energy
     except Exception:
         energy = None
 
     return energy
 
 
-def optimise_mol(mol: Chem.rdchem.Mol, max_iters: int = 1000) -> Chem.rdchem.Mol:
+def optimise_mol(mol: Chem.rdchem.Mol, level: str = "MMFF94", max_iters: int = 1000) -> Chem.rdchem.Mol:
     """Optimise the conformation of an RDKit molecule
 
     Only the first (0th index) conformer within the molecule is optimised. The molecule is copied so the original
@@ -179,7 +174,8 @@ def optimise_mol(mol: Chem.rdchem.Mol, max_iters: int = 1000) -> Chem.rdchem.Mol
 
     mol_copy = Chem.Mol(mol)
     try:
-        AllChem.MMFFOptimizeMolecule(mol_copy, maxIters=max_iters)
+        if level == "MMFF94":
+            AllChem.MMFFOptimizeMolecule(mol_copy, maxIters=max_iters)
     except Exception:
         return None
 
@@ -223,7 +219,6 @@ def conf_distance(
     return rmsd
 
 
-# TODO could allow more args
 def smiles_from_mol(
     mol: Chem.rdchem.Mol, canonical: bool = True, explicit_hs: bool = False
 ) -> Union[str, None]:
@@ -245,6 +240,8 @@ def smiles_from_mol(
 
     if explicit_hs:
         mol = Chem.AddHs(mol)
+    else:
+        mol = Chem.RemoveHs(mol)
 
     try:
         smiles = Chem.MolToSmiles(mol, canonical=canonical)
@@ -255,7 +252,7 @@ def smiles_from_mol(
 
 
 def mol_from_smiles(
-    smiles: str, explicit_hs: bool = False
+    smiles: str, explicit_hs: bool = True
 ) -> Union[Chem.rdchem.Mol, None]:
     """Create a RDKit molecule from a SMILES string
 
@@ -380,24 +377,10 @@ def mol_from_atoms(
 
 
 def _infer_bonds(mol: Chem.rdchem.Mol):
-    coords = mol.GetConformer().GetPositions().tolist()
-    coord_strs = ["\t".join([f"{c:.6f}" for c in cs]) for cs in coords]
-    atom_symbols = [atom.GetSymbol() for atom in mol.GetAtoms()]
-
-    xyz_str_header = f"{str(mol.GetNumAtoms())}\n\n"
-    xyz_strs = [
-        f"{str(atom)}\t{coord_str}" for coord_str, atom in zip(coord_strs, atom_symbols)
-    ]
-    xyz_str = xyz_str_header + "\n".join(xyz_strs)
-
+    """Infer bonds for a molecule using Rdkit"""
+    mol = Chem.Mol(mol)
     try:
-        pybel_mol = pybel.readstring("xyz", xyz_str)
+        DetermineBonds(mol)
     except Exception:
-        pybel_mol = None
-
-    if pybel_mol is None:
         return None
-
-    mol_str = pybel_mol.write("mol")
-    mol = Chem.MolFromMolBlock(mol_str, removeHs=False, sanitize=True)
     return mol
