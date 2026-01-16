@@ -10,6 +10,7 @@ from chemflow.utils import (
     token_to_index,
     z_to_atom_types,
 )
+from chemflow.dataset.vocab import Vocab, Distributions
 
 
 class Preprocessing:
@@ -26,9 +27,8 @@ class Preprocessing:
 
     # Special tokens that must always be present
     MASK_TOKEN = "<MASK>"
-    DEATH_TOKEN = "<DEATH>"
     NO_BOND_TOKEN = "<NO_BOND>"
-    SPECIAL_TOKENS = [MASK_TOKEN, DEATH_TOKEN]
+    SPECIAL_TOKENS = [MASK_TOKEN]
     EDGE_SPECIAL_TOKENS = [MASK_TOKEN, NO_BOND_TOKEN]
 
     def __init__(
@@ -76,29 +76,16 @@ class Preprocessing:
         self.distributions_path = distributions_path
 
         # Load or compute tokens (both computed together if either is missing)
-        atom_tokens, edge_tokens, charge_tokens = self._load_or_compute_tokens()
-        self.atom_tokens = atom_tokens
-        self.edge_tokens = edge_tokens
-        self.charge_tokens = charge_tokens
+        self.vocab = self._load_or_compute_tokens()
+        self.distributions = self._load_or_compute_distributions()
 
-        # Will be computed in compute_distributions
-        self.atom_type_distribution = None
-        self.edge_type_distribution = None
-        self.charge_type_distribution = None
-        self.n_atoms_distribution = None
-        self.coordinate_std = None
-        self.distributions = None
-
-        # Load or compute distributions
-        self._load_or_compute_distributions()
-
-    def _load_or_compute_tokens(self) -> tuple[list[str], list[str]]:
+    def _load_or_compute_tokens(self) -> Vocab:
         """
         Load tokens from files if they exist,
         otherwise compute both from data in a single loop and save.
 
         Returns:
-            Tuple of (tokens)
+            Vocab object
         """
         # Try to load both from files
         atom_tokens_exist = os.path.exists(self.atom_tokens_path)
@@ -109,19 +96,26 @@ class Preprocessing:
             atom_tokens = self._load_tokens(self.atom_tokens_path)
             edge_tokens = self._load_tokens(self.edge_tokens_path)
             charge_tokens = self._load_tokens(self.charge_tokens_path)
-            return atom_tokens, edge_tokens, charge_tokens
+        else:
+            # Compute both from data in a single loop
+            atom_tokens, edge_tokens, charge_tokens = self._compute_tokens_from_data()
 
-        # Compute both from data in a single loop
-        atom_tokens, edge_tokens, charge_tokens = self._compute_tokens_from_data()
+            # Save both to files
+            if not atom_tokens_exist:
+                self._save_tokens(self.atom_tokens_path, atom_tokens)
+            if not edge_tokens_exist:
+                self._save_tokens(self.edge_tokens_path, edge_tokens)
+            if not charge_tokens_exist:
+                self._save_tokens(self.charge_tokens_path, charge_tokens)
 
-        # Save both to files
-        if not atom_tokens_exist:
-            self._save_tokens(self.atom_tokens_path, atom_tokens)
-        if not edge_tokens_exist:
-            self._save_tokens(self.edge_tokens_path, edge_tokens)
-        if not charge_tokens_exist:
-            self._save_tokens(self.charge_tokens_path, charge_tokens)
-        return atom_tokens, edge_tokens, charge_tokens
+        token_dict = {
+            "atom_tokens": atom_tokens,
+            "edge_tokens": edge_tokens,
+            "charge_tokens": charge_tokens,
+        }
+
+        vocab = Vocab(**token_dict)
+        return vocab
 
     def _compute_tokens_from_data(
         self,
@@ -205,36 +199,25 @@ class Preprocessing:
             tokens = [line.strip() for line in f.readlines()]
         return tokens
 
-    def _load_or_compute_distributions(self):
+    def _load_or_compute_distributions(self) -> Distributions:
         """
         Load distributions from file if exists, otherwise compute from data and save.
 
         Returns:
-            None (sets instance attributes)
+            Distributions object
         """
         # Try to load from file
         if os.path.exists(self.distributions_path):
             distributions = self._load_distributions()
-            self.atom_type_distribution = distributions["atom_type_distribution"]
-            self.edge_type_distribution = distributions["edge_type_distribution"]
-            self.charge_type_distribution = distributions["charge_type_distribution"]
-            self.n_atoms_distribution = distributions["n_atoms_distribution"]
-            self.coordinate_std = distributions.get("coordinate_std", None)
-            self.distributions = distributions
-            return
+        else:
+            # Compute distributions from data
+            distributions = self._compute_distributions()
 
-        # Compute distributions from data
-        distributions = self._compute_distributions()
+            # Save distributions to file
+            self._save_distributions(distributions)
 
-        # Save distributions to file
-        self._save_distributions(distributions)
-
-        # Store as instance attributes
-        self.atom_type_distribution = distributions["atom_type_distribution"]
-        self.edge_type_distribution = distributions["edge_type_distribution"]
-        self.n_atoms_distribution = distributions["n_atoms_distribution"]
-        self.coordinate_std = distributions["coordinate_std"]
-        self.distributions = distributions
+        distributions = Distributions(**distributions)
+        return distributions
 
     def _compute_distributions(self) -> dict[str, torch.Tensor]:
         """Compute distributions from the training dataset."""
@@ -244,12 +227,12 @@ class Preprocessing:
         # Compute atom type distribution
         atom_types = z_to_atom_types(dataset.z.tolist())
         atom_type_indices = [
-            token_to_index(self.atom_tokens, token) for token in atom_types
+            token_to_index(self.vocab.atom_tokens, token) for token in atom_types
         ]
         atom_type_indices = torch.tensor(atom_type_indices, dtype=torch.long)
 
         # Create distribution over all tokens
-        all_token_indices = torch.arange(len(self.atom_tokens), dtype=torch.long)
+        all_token_indices = torch.arange(len(self.vocab.atom_tokens), dtype=torch.long)
         atom_type_distribution = (
             atom_type_indices.unsqueeze(1) == all_token_indices
         ).sum(dim=0)
@@ -294,7 +277,8 @@ class Preprocessing:
             if hasattr(data, "charges") and data.charges is not None:
                 charges = data.charges.tolist()
                 charge_type_indices = [
-                    token_to_index(self.charge_tokens, str(token)) for token in charges
+                    token_to_index(self.vocab.charge_tokens, str(token))
+                    for token in charges
                 ]
                 charge_type_indices = torch.tensor(
                     charge_type_indices, dtype=torch.long
@@ -313,7 +297,7 @@ class Preprocessing:
 
         # Create distribution over all edge tokens
         # Edge tokens are: [NO_BOND (0), bond types (1-4), MASK (5)]
-        num_edge_tokens = len(self.edge_tokens)
+        num_edge_tokens = len(self.vocab.edge_tokens)
         edge_type_distribution = all_edge_type_indices.bincount(
             minlength=num_edge_tokens
         )
@@ -330,7 +314,7 @@ class Preprocessing:
         all_charges = torch.cat(all_charges, dim=0)
         charge_type_indices = all_charges.long()
         charge_type_distribution = charge_type_indices.bincount(
-            minlength=len(self.charge_tokens)
+            minlength=len(self.vocab.charge_tokens)
         )
         charge_type_distribution = (
             charge_type_distribution / charge_type_distribution.sum()
