@@ -86,7 +86,7 @@ module:
 
   # The 'model' key below is an argument to your LightningModule
   model:
-    _target_: chemflow.model.gnn.EGNNwithHeads
+    _target_: chemflow.model.model.BackboneWithHeads
     _recursive_: false
 
     atom_type_embedding_args: ${model.atom_type_embedding}
@@ -94,14 +94,15 @@ module:
     charge_embedding_args: ${model.charge_embedding}
     time_embedding_args: ${model.time_embedding}
     node_count_embedding_args: ${model.node_count_embedding}
-    egnn_args: ${model.egnn}
+
+    backbone_model_args: ${model.backbone}
+
     heads_args: ${model.heads}
-    gmm_head_args: ${model.gmm_head_args}
-    self_conditioning: False
+    ins_gmm_head_args: ${model.gmm_head_args}
     ins_edge_head_args:
       _target_: chemflow.model.heads.InsertionEdgeHead
       _recursive_: false
-      hidden_dim: 128  # Match your EGNN hidden dim
+      hidden_dim: ${model.backbone.out_node_nf}  # Match your EGNN hidden dim
       n_edge_types: ${len:${data.vocab.edge_tokens}} # Your number of edge types
       n_atom_types: ${len:${data.vocab.atom_tokens}}  # Your number of atom types
       n_charge_types: ${len:${data.vocab.charge_tokens}}  # Your number of charge types
@@ -140,8 +141,8 @@ node_count_embedding:
   embedding_dim: 64
   out_dim: 64
 
-egnn:
-  _target_: chemflow.model.gnn.EGNNWithEdgeType
+backbone:
+  _target_: chemflow.model.backbones.egnn.EGNNWithEdgeType
   _recursive_: false
   # Concatenated embeddings: atom + time + count + charge
   in_node_nf: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.charge_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim}"}
@@ -169,52 +170,57 @@ heads:
     
     node_heads:
       atom_type_head:
-        input_dim: ${model.egnn.out_node_nf}
+        input_dim: ${model.backbone.out_node_nf}
         output_dim: ${len:${data.vocab.atom_tokens}}
         hidden_dim: 64
 
       charge_head:
-        input_dim: ${model.egnn.out_node_nf}
+        input_dim: ${model.backbone.out_node_nf}
         output_dim: ${len:${data.vocab.charge_tokens}}
         hidden_dim: 64
 
       ins_rate_head:
-        input_dim: ${model.egnn.out_node_nf}
+        input_dim: ${model.backbone.out_node_nf}
         output_dim: 1
         hidden_dim: 64
 
       del_rate_head:
-        input_dim: ${model.egnn.out_node_nf}
+        input_dim: ${model.backbone.out_node_nf}
         output_dim: 1
         hidden_dim: 64
 
       sub_rate_a_head:
-        input_dim: ${model.egnn.out_node_nf}
+        input_dim: ${model.backbone.out_node_nf}
         output_dim: 1
         hidden_dim: 64
       
       sub_rate_c_head:
-        input_dim: ${model.egnn.out_node_nf}
+        input_dim: ${model.backbone.out_node_nf}
         output_dim: 1
         hidden_dim: 64
 
     edge_heads:
       sub_rate_e_head:
-        input_dim: ${model.egnn.out_node_nf}
+        input_dim: ${model.backbone.out_node_nf}
         output_dim: 1
         hidden_dim: 64
 
       edge_type_head:
-        input_dim: ${model.egnn.out_node_nf}
+        input_dim: ${model.backbone.out_node_nf}
         output_dim: ${len:${data.vocab.edge_tokens}}
         hidden_dim: 64
 
 gmm_head_args:
   _target_: chemflow.model.heads.EquivariantGMMHead
   _recursive_: false
-  hidden_dim: ${model.egnn.out_node_nf}
+  hidden_dim: ${model.backbone.out_node_nf}
   K: ${model.gmm_params.K}
   N_a: ${len:${data.vocab.atom_tokens}}
   N_c: ${len:${data.vocab.charge_tokens}}
-  rbf_embedding_args: ${model.egnn.rbf_embedding_args}
+  rbf_embedding_args:
+    _target_: chemflow.model.embedding.RBFEmbedding
+    num_rbf: 64
+    rbf_dmax: 15.0
+    out_dim: 64
+    dropout: 0.0
       
