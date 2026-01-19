@@ -147,7 +147,7 @@ class BackboneWithHeads(nn.Module):
 
         # 2. Backbone Pass
         # self.backbone returns features, coordinates, and edge attrs
-        h, x_out, e_out = self.backbone(h_0, x, edge_index_tuple, e_embed)
+        h, x_out, e_out = self.backbone(h_0, x, edge_index_tuple, e_embed, batch)
 
         # 3. Heads Pass
         out_dict = self.heads(h, batch, e_out)

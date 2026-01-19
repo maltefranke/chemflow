@@ -25,6 +25,8 @@ class QM9Charges(QM9):
     QM9 dataset from PyG, adapted to also process charges.
     """  # noqa: E501
 
+    # TODO we should overwrite the process methods to use the rQM9 dataset instead!
+
     def process(self) -> None:
         try:
             from rdkit import Chem, RDLogger
@@ -75,9 +77,20 @@ class QM9Charges(QM9):
 
         suppl = Chem.SDMolSupplier(self.raw_paths[0], removeHs=False, sanitize=False)
 
+        errors = 0
+        skipped = 0
+
         data_list = []
         for i, mol in enumerate(tqdm(suppl)):
             if i in skip:
+                skipped += 1
+                continue
+
+            try:
+                Chem.SanitizeMol(mol)
+                smiles = Chem.MolToSmiles(mol, isomericSmiles=False)
+            except:
+                errors += 1
                 continue
 
             N = mol.GetNumAtoms()
@@ -140,7 +153,6 @@ class QM9Charges(QM9):
             charges = torch.tensor(charges, dtype=torch.int64)
 
             name = mol.GetProp("_Name")
-            smiles = Chem.MolToSmiles(mol, isomericSmiles=True)
 
             # TODO exchange with our own MolData object for consistency
             data = Data(
@@ -164,6 +176,9 @@ class QM9Charges(QM9):
             data_list.append(data)
 
         self.save(data_list, self.processed_paths[0])
+
+        print(f"Errors: {errors}")
+        print(f"Skipped: {skipped}")
 
 
 class FlowMatchingQM9Dataset(QM9Charges):

@@ -9,6 +9,7 @@ from rdkit.Chem import AllChem
 from scipy.spatial.transform import Rotation
 from rdkit.Chem.Descriptors import NumRadicalElectrons
 from rdkit.Chem.rdDetermineBonds import DetermineBonds
+
 ArrT = np.ndarray
 
 
@@ -104,7 +105,6 @@ def _check_dim_shape(arr, dim, allowed, name="object"):
 
 
 def mol_is_valid(mol: Chem.Mol, allow_radical: bool = False):
-
     for a in mol.GetAtoms():
         a.SetNoImplicit(True)
         if a.HasProp("_MolFileHCount"):
@@ -147,7 +147,9 @@ def calc_energy(mol: Chem.Mol, per_atom: bool = False, level: str = "MMFF94") ->
 
     try:
         if level == "MMFF94":
-            mmff_props = AllChem.MMFFGetMoleculeProperties(mol_copy, mmffVariant="MMFF94")
+            mmff_props = AllChem.MMFFGetMoleculeProperties(
+                mol_copy, mmffVariant="MMFF94"
+            )
             ff = AllChem.MMFFGetMoleculeForceField(mol_copy, mmff_props, confId=0)
             energy = ff.CalcEnergy()
             energy = energy / mol.GetNumAtoms() if per_atom else energy
@@ -157,7 +159,9 @@ def calc_energy(mol: Chem.Mol, per_atom: bool = False, level: str = "MMFF94") ->
     return energy
 
 
-def optimise_mol(mol: Chem.rdchem.Mol, level: str = "MMFF94", max_iters: int = 1000) -> Chem.rdchem.Mol:
+def optimise_mol(
+    mol: Chem.rdchem.Mol, level: str = "MMFF94", max_iters: int = 1000
+) -> Chem.rdchem.Mol:
     """Optimise the conformation of an RDKit molecule
 
     Only the first (0th index) conformer within the molecule is optimised. The molecule is copied so the original
@@ -347,31 +351,66 @@ def mol_from_atoms(
     if bonds is None:
         return _infer_bonds(mol)
 
-    # Add bonds if they have been provided
-    mol = Chem.EditableMol(mol)
-    for bond in bonds.astype(np.int32).tolist():
-        start, end, b_type = bond
+    else:
+        # Add bonds if they have been provided
+        # take only unique bonds (i.e. make undirected bonds directed)
+        start_indices, end_indices, b_types = bonds.T
+        keep_mask = start_indices < end_indices
 
-        if b_type not in IDX_BOND_MAP:
+        start_indices = start_indices[keep_mask]
+        end_indices = end_indices[keep_mask]
+        b_types = b_types[keep_mask]
+        bonds = np.column_stack([start_indices, end_indices, b_types])
+
+        mol = Chem.EditableMol(mol)
+        for bond in bonds.astype(np.int32).tolist():
+            start, end, b_type = bond
+
+            # Don't add self connections
+            if start != end:
+                rdkit_b_type = IDX_BOND_MAP[b_type]
+                mol.AddBond(start, end, rdkit_b_type)
+
+        try:
+            mol = mol.GetMol()
+            for atom in mol.GetAtoms():
+                atom.UpdatePropertyCache(strict=False)
+        except Exception:
             return None
-
-        # Don't add self connections
-        if start != end:
-            b_type = IDX_BOND_MAP[b_type]
-            mol.AddBond(start, end, b_type)
-
-    try:
-        mol = mol.GetMol()
-        for atom in mol.GetAtoms():
-            atom.UpdatePropertyCache(strict=False)
-    except Exception:
-        return None
 
     if sanitise:
         try:
             Chem.SanitizeMol(mol)
         except Exception:
-            return None
+            # If standard sanitization fails (often due to kekulization errors
+            # with aromatic bonds), try a fallback approach:
+            # 1. Sanitize without kekulization/aromaticity
+            # 2. Manually set aromaticity
+            # 3. Try to kekulize
+            try:
+                from rdkit.Chem import SanitizeFlags
+
+                # Sanitize everything except kekulization and aromaticity setting
+                flags = (
+                    SanitizeFlags.SANITIZE_ALL
+                    ^ SanitizeFlags.SANITIZE_KEKULIZE
+                    ^ SanitizeFlags.SANITIZE_SETAROMATICITY
+                )
+                Chem.SanitizeMol(mol, sanitizeOps=flags)
+
+                # Set aromaticity based on bond types
+                Chem.SetAromaticity(mol)
+
+                # Try to kekulize - if this fails, molecule is invalid
+                try:
+                    Chem.Kekulize(mol, clearAromaticFlags=True)
+                except Exception:
+                    # Kekulization failed - molecule cannot be properly represented
+                    return None
+
+            except Exception:
+                # All sanitization attempts failed - molecule is invalid
+                return None
 
     return mol
 

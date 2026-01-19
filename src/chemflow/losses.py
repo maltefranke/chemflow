@@ -43,9 +43,7 @@ def gmm_loss(gmm_output, target_locations, target_batch_ids, mask_value=-1e3):
     return -torch.mean(log_likelihood)
 
 
-def typed_gmm_loss(
-    gmm_output, target_x, target_a, target_c, target_batch_ids, reduction="mean"
-):
+def typed_gmm_loss(gmm_output, target_x, target_a, target_c, sigma_t, reduction="mean"):
     """
     Computes the NLL loss using the get_typed_gmm_components helper.
 
@@ -64,6 +62,7 @@ def typed_gmm_loss(
     mix_dist, x_dist, a_dist, c_dist = get_typed_gmm_components(gmm_output)
 
     N = mix_dist.logits.shape[0]
+    D = target_x.shape[-1]
 
     target_x = target_x.view(N, 1, 1, -1)
     target_a = target_a.view(N, 1, 1)
@@ -74,7 +73,10 @@ def typed_gmm_loss(
 
     # A. Spatial Log-Prob
     # Target: [N, 3] -> [N, 1, 3] to broadcast against dist [N, 1, K]
-    log_prob_x = x_dist.log_prob(target_x)  # Result: [N, 1, K]
+    log_prob_x = x_dist.log_prob(target_x) / D  # Result: [N, 1, K]
+
+    # handle shrinking variance --> makes it MSE-like loss
+    log_prob_x = log_prob_x * 2 * (sigma_t.pow(2)).clamp(min=1e-5).reshape(N, 1, 1)
 
     # B. Type Log-Prob
     # Target: [N] -> [N, 1] to broadcast against dist [N, 1, K]
