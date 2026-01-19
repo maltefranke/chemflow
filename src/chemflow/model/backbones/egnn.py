@@ -26,7 +26,7 @@ class EGNNWithEdgeType(EGNN):
             nn.Dropout(0.1),
         )
 
-    def forward(self, h, x, edges, edge_attr):
+    def forward(self, h, x, edges, edge_attr, batch):
         h = self.embedding_in(h)
         for i in range(0, self.n_layers):
             h, x, _ = self._modules["gcl_%d" % i](h, edges, x, edge_attr=edge_attr)

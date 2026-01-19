@@ -17,17 +17,6 @@ integrator:
   time_strategy: log # "linear" or "log"
   num_integration_steps: 100
 
-beta_sched:
-  # Beta distribution for time scheduling. 1.0 , 1.0 is equivalent to uniform distribution.
-  # SEMLAFLOW uses 2.0, 1.0
-  _target_: torch.distributions.Beta
-  concentration1: 2.0
-  concentration0: 1.0
-
-linear_sched:
-  _target_: torch.distributions.Uniform
-  low: 0.0
-  high: 1.0
 
 module:
   _target_: chemflow.model.lightning_module.LightningModuleRates
@@ -40,32 +29,43 @@ module:
     _target_: DictConfig
     cat_strategy: ${data.cat_strategy}
     weight_alpha: 1.0
-  ins_noise_scale: ${data.ins_noise_scale}
-  time_dist: ${if:${eq:${model.integrator.time_strategy}, log}, ${model.beta_sched}, ${model.linear_sched}}
+  noise_params:
+    _target_: DictConfig
+    cat_noise_level: 0.1
+    coord_noise_level: 0.0
+  time_dist:
+    # Beta distribution for time scheduling. 1.0 , 1.0 is equivalent to uniform distribution.
+    # SEMLAFLOW uses 2.0, 1.0
+    _target_: torch.distributions.Beta
+    concentration1: 2.0
+    concentration0: 1.0
   integrator: ${model.integrator}
 
   vocab: ${data.vocab}
   
   # Loss component weights
-  use_learnable_loss_weights: true
   loss_weights:
-    l_sub_a_rate: 1.0
-    l_sub_a_class: 1.0
-    l_sub_c_rate: 1.0
-    l_sub_c_class: 1.0
-    l_sub_e_rate: 1.0
-    l_sub_e_class: 1.0
-    l_del_rate: 1.0
-    l_ins_rate: 1.0
-    l_ins_gmm: 1.0
-    l_ins_e: 1.0
-    l_x: 10.0
+    # Flow matching loss weights
+    l_x: 20.0
+
+    # EditFlow loss weights
+    # Substitution is used for atom type changes
+    l_sub_a: 1.0
+
+    l_sub_c: 1.0
+
+    l_sub_e: 1.0
+    
+    # Only use deletion and insertion losses if the number of atoms is flexible
+    l_ins: ${if:${eq:${data.n_atoms_strategy},flexible},1.0,0.0}
+    l_del: ${if:${eq:${data.n_atoms_strategy},flexible},1.0,0.0}
+    l_sub: 1.0
 
   # Optimizer configuration
   optimizer_config:
     optimizer:
       _target_: torch.optim.AdamW
-      lr: 1e-3
+      lr: 5e-4
       betas: [0.9, 0.999]
       weight_decay: 1e-2
       fused: true
@@ -76,8 +76,8 @@ module:
       # warmup_steps: 1000
       _target_: chemflow.schedulers.CosineWarmupLR
       max_lr: 1e-3
-      min_lr: 5e-5
-      warmup_steps: 500
+      min_lr: 1e-5
+      warmup_steps: 1000
       total_steps: 100000
 
     interval: step
@@ -101,7 +101,7 @@ module:
     ins_edge_head_args:
       _target_: chemflow.model.heads.InsertionEdgeHead
       _recursive_: false
-      hidden_dim: ${model.backbone.out_node_nf}  # Match your EGNN hidden dim
+      hidden_dim: ${model.backbone.in_node_nf}  # Match your EGNN hidden dim
       n_edge_types: ${len:${data.vocab.edge_tokens}} # Your number of edge types
       n_atom_types: ${len:${data.vocab.atom_tokens}}  # Your number of atom types
       n_charge_types: ${len:${data.vocab.charge_tokens}}  # Your number of charge types
@@ -141,24 +141,19 @@ node_count_embedding:
   out_dim: 64
 
 backbone:
-  _target_: chemflow.model.backbones.egnn.EGNNWithEdgeType
+  _target_: chemflow.model.backbones.semla_bb.SemlaBB
   _recursive_: false
   # Concatenated embeddings: atom + time + count + charge
   in_node_nf: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.charge_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim}"}
-  hidden_nf: 256
-  out_node_nf: 128
+  hidden_nf: 128
   in_edge_nf: ${model.edge_type_embedding.out_dim} # set to zero when not predicting edge types
   n_layers: 6
-  residual: True
-  attention: True
-  normalize: True
-  tanh: True
-  rbf_embedding_args:
-    _target_: chemflow.model.embedding.RBFEmbedding
-    num_rbf: 64
-    rbf_dmax: 15.0
-    out_dim: 64
-    dropout: 0.0
+  bond_refine: True
+  self_cond: False
+  coord_norm: "length"
+  eps: 1e-6
+  n_attn_heads: 4
+
 
 heads:
   _target_: chemflow.model.heads.MultiHeadModule
@@ -169,50 +164,50 @@ heads:
     
     node_heads:
       atom_type_head:
-        input_dim: ${model.backbone.out_node_nf}
+        input_dim: ${model.backbone.in_node_nf}
         output_dim: ${len:${data.vocab.atom_tokens}}
         hidden_dim: 64
 
       charge_head:
-        input_dim: ${model.backbone.out_node_nf}
+        input_dim: ${model.backbone.in_node_nf}
         output_dim: ${len:${data.vocab.charge_tokens}}
         hidden_dim: 64
 
       ins_rate_head:
-        input_dim: ${model.backbone.out_node_nf}
+        input_dim: ${model.backbone.in_node_nf}
         output_dim: 1
         hidden_dim: 64
 
       del_rate_head:
-        input_dim: ${model.backbone.out_node_nf}
+        input_dim: ${model.backbone.in_node_nf}
         output_dim: 1
         hidden_dim: 64
 
       sub_rate_a_head:
-        input_dim: ${model.backbone.out_node_nf}
+        input_dim: ${model.backbone.in_node_nf}
         output_dim: 1
         hidden_dim: 64
       
       sub_rate_c_head:
-        input_dim: ${model.backbone.out_node_nf}
+        input_dim: ${model.backbone.in_node_nf}
         output_dim: 1
         hidden_dim: 64
 
     edge_heads:
       sub_rate_e_head:
-        input_dim: ${model.backbone.out_node_nf}
+        input_dim: ${model.backbone.in_edge_nf}
         output_dim: 1
         hidden_dim: 64
 
       edge_type_head:
-        input_dim: ${model.backbone.out_node_nf}
+        input_dim: ${model.backbone.in_edge_nf}
         output_dim: ${len:${data.vocab.edge_tokens}}
         hidden_dim: 64
 
 gmm_head_args:
   _target_: chemflow.model.heads.EquivariantGMMHead
   _recursive_: false
-  hidden_dim: ${model.backbone.out_node_nf}
+  hidden_dim: ${model.backbone.in_node_nf}
   K: ${model.gmm_params.K}
   N_a: ${len:${data.vocab.atom_tokens}}
   N_c: ${len:${data.vocab.charge_tokens}}

@@ -9,9 +9,10 @@ trainer:
   num_sanity_val_steps: 1 
   gradient_clip_val: 5.0
   gradient_clip_algorithm: norm
-  val_check_interval: 0.8
+  #val_check_interval: 5000
+  check_val_every_n_epoch: 10
  # profiler: simple
 
-  # limit_train_batches: 4
+  #limit_train_batches: 0.1
   limit_val_batches: 4
   limit_predict_batches: 2

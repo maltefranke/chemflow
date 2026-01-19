@@ -155,12 +155,12 @@ class MoleculeData(PointCloud):
         x = self.x.clone().detach().cpu().numpy()
         c = self.c.clone().detach().cpu().numpy()
 
-        atom_tokens = [index_to_token(atom_tokens, index) for index in a]
-        charge_tokens = [int(index_to_token(charge_tokens, index)) for index in c]
+        atom_tokens = [index_to_token(atom_tokens, int(index)) for index in a]
+        charge_tokens = [int(index_to_token(charge_tokens, int(index))) for index in c]
 
         e_triu, edge_index_triu = self.get_e_triu()
         e = e_triu.clone().detach().cpu().numpy()
-        edge_tokens = [index_to_token(edge_tokens, index) for index in e]
+        edge_tokens = [index_to_token(edge_tokens, int(index)) for index in e]
 
         # make edge_index (2, N) -> (N, 2)
         edge_index = edge_index_triu.clone().detach().cpu().numpy()
