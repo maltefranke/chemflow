@@ -18,6 +18,7 @@ from torch_geometric.utils import one_hot, scatter
 
 from chemflow.dataset.molecule_data import MoleculeData
 from chemflow.dataset.vocab import Vocab, Distributions
+from chemflow.rdkit import mol_is_valid, sanitize_mol_correctly
 
 
 class QM9Charges(QM9):
@@ -77,7 +78,12 @@ class QM9Charges(QM9):
 
         data_list = []
         for i, mol in enumerate(tqdm(suppl)):
-            if i in skip:
+            #if i in skip:
+            #    continue
+            if mol is None or not mol_is_valid(mol):
+                continue
+            mol = sanitize_mol_correctly(mol)
+            if mol is None:
                 continue
 
             N = mol.GetNumAtoms()

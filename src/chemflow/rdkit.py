@@ -97,14 +97,7 @@ def _check_dim_shape(arr, dim, allowed, name="object"):
             f"Shape of {name} for dim {dim} must be in {allowed}, got {shape}"
         )
 
-
-# *************************************************************************************************
-# ************************************* External Functions ****************************************
-# *************************************************************************************************
-
-
-def mol_is_valid(mol: Chem.Mol, allow_radical: bool = False):
-
+def sanitize_mol_correctly(mol: Chem.Mol):
     for a in mol.GetAtoms():
         a.SetNoImplicit(True)
         if a.HasProp("_MolFileHCount"):
@@ -118,12 +111,25 @@ def mol_is_valid(mol: Chem.Mol, allow_radical: bool = False):
         sanitizeOps=flags,
         catchErrors=True,
     )
-
     if err:  # nonzero bitmask means some step failed
+        return None
+    return mol
+
+# *************************************************************************************************
+# ************************************* External Functions ****************************************
+# *************************************************************************************************
+
+
+def mol_is_valid(mol: Chem.Mol, allow_radical: bool = False, allow_charged: bool = False) -> bool:
+
+    sanitized_mol = sanitize_mol_correctly(mol)
+    if sanitized_mol is None:
         return False
-    elif len(Chem.GetMolFrags(mol)) > 1:
+    elif len(Chem.GetMolFrags(sanitized_mol)) > 1:
         return False
-    elif not allow_radical and NumRadicalElectrons(mol) != 0:
+    elif not allow_radical and NumRadicalElectrons(sanitized_mol) != 0:
+        return False
+    elif not allow_charged and Chem.GetFormalCharge(sanitized_mol) != 0:
         return False
     else:
         return True
@@ -368,10 +374,9 @@ def mol_from_atoms(
         return None
 
     if sanitise:
-        try:
-            Chem.SanitizeMol(mol)
-        except Exception:
-            return None
+        mol = sanitize_mol_correctly(mol)
+        if mol is None:
+            return None 
 
     return mol
 
