@@ -90,10 +90,8 @@ class MoleculeStability(Metric):
 
 
 class Validity(GenerativeMetric):
-    def __init__(self, connected=False, **kwargs):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.connected = connected
-
         self.add_state("valid", default=torch.tensor(0), dist_reduce_fx="sum")
         self.add_state("total", default=torch.tensor(0), dist_reduce_fx="sum")
 
@@ -341,9 +339,8 @@ def init_metrics(train_mols=None):
 
     metrics = {
         "validity": Validity(),
-        "connected-validity": Validity(connected=True),
         "uniqueness": Uniqueness(),
-        "novelty": Novelty(train_mols),
+    #     "novelty": Novelty(train_mols),
         "energy-validity": EnergyValidity(),
         "opt-energy-validity": EnergyValidity(optimise=True),
         "energy": AverageEnergy(),

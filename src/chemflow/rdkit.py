@@ -98,13 +98,7 @@ def _check_dim_shape(arr, dim, allowed, name="object"):
             f"Shape of {name} for dim {dim} must be in {allowed}, got {shape}"
         )
 
-
-# *************************************************************************************************
-# ************************************* External Functions ****************************************
-# *************************************************************************************************
-
-
-def mol_is_valid(mol: Chem.Mol, allow_radical: bool = False):
+def sanitize_mol_correctly(mol: Chem.Mol):
     for a in mol.GetAtoms():
         a.SetNoImplicit(True)
         if a.HasProp("_MolFileHCount"):
@@ -118,12 +112,25 @@ def mol_is_valid(mol: Chem.Mol, allow_radical: bool = False):
         sanitizeOps=flags,
         catchErrors=True,
     )
-
     if err:  # nonzero bitmask means some step failed
+        return None
+    return mol
+
+# *************************************************************************************************
+# ************************************* External Functions ****************************************
+# *************************************************************************************************
+
+
+def mol_is_valid(mol: Chem.Mol, allow_radical: bool = False, allow_charged: bool = False) -> bool:
+
+    sanitized_mol = sanitize_mol_correctly(mol)
+    if sanitized_mol is None:
         return False
-    elif len(Chem.GetMolFrags(mol)) > 1:
+    elif len(Chem.GetMolFrags(sanitized_mol)) > 1:
         return False
-    elif not allow_radical and NumRadicalElectrons(mol) != 0:
+    elif not allow_radical and NumRadicalElectrons(sanitized_mol) != 0:
+        return False
+    elif not allow_charged and Chem.GetFormalCharge(sanitized_mol) != 0:
         return False
     else:
         return True
@@ -379,38 +386,9 @@ def mol_from_atoms(
             return None
 
     if sanitise:
-        try:
-            Chem.SanitizeMol(mol)
-        except Exception:
-            # If standard sanitization fails (often due to kekulization errors
-            # with aromatic bonds), try a fallback approach:
-            # 1. Sanitize without kekulization/aromaticity
-            # 2. Manually set aromaticity
-            # 3. Try to kekulize
-            try:
-                from rdkit.Chem import SanitizeFlags
-
-                # Sanitize everything except kekulization and aromaticity setting
-                flags = (
-                    SanitizeFlags.SANITIZE_ALL
-                    ^ SanitizeFlags.SANITIZE_KEKULIZE
-                    ^ SanitizeFlags.SANITIZE_SETAROMATICITY
-                )
-                Chem.SanitizeMol(mol, sanitizeOps=flags)
-
-                # Set aromaticity based on bond types
-                Chem.SetAromaticity(mol)
-
-                # Try to kekulize - if this fails, molecule is invalid
-                try:
-                    Chem.Kekulize(mol, clearAromaticFlags=True)
-                except Exception:
-                    # Kekulization failed - molecule cannot be properly represented
-                    return None
-
-            except Exception:
-                # All sanitization attempts failed - molecule is invalid
-                return None
+        mol = sanitize_mol_correctly(mol)
+        if mol is None:
+            return None 
 
     return mol
 
