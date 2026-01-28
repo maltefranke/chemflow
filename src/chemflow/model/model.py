@@ -17,13 +17,13 @@ class EmbeddingBackbone(nn.Module):
         self,
         atom_type_embedding_args: DictConfig,
         edge_type_embedding_args: DictConfig,
-        charge_embedding_args: DictConfig,
+        # charge_embedding_args: DictConfig,
         time_embedding_args: DictConfig,
         node_count_embedding_args: DictConfig,
     ):
         super().__init__()
         self.atom_type_embedding = hydra.utils.instantiate(atom_type_embedding_args)
-        self.charge_embedding = hydra.utils.instantiate(charge_embedding_args)
+        # self.charge_embedding = hydra.utils.instantiate(charge_embedding_args)
         self.edge_type_embedding = hydra.utils.instantiate(edge_type_embedding_args)
         self.time_embedding = hydra.utils.instantiate(time_embedding_args)
         self.node_count_embedding = hydra.utils.instantiate(node_count_embedding_args)
@@ -40,7 +40,7 @@ class EmbeddingBackbone(nn.Module):
         N_nodes = torch.bincount(batch)
 
         a_embed = self.atom_type_embedding(a)
-        c_embed = self.charge_embedding(c)
+        # c_embed = self.charge_embedding(c)
 
         # Calculate conditioning embeddings
         # Ensure we index correctly based on the batch size
@@ -48,7 +48,8 @@ class EmbeddingBackbone(nn.Module):
         t_embedding = self.time_embedding(t)[batch]
 
         # Concatenate all embeddings
-        embeddings_to_concat = [a_embed, c_embed, N_nodes_embedding, t_embedding]
+        # embeddings_to_concat = [a_embed, c_embed, N_nodes_embedding, t_embedding]
+        embeddings_to_concat = [a_embed, N_nodes_embedding, t_embedding]
         h_0 = torch.cat(embeddings_to_concat, dim=-1)
 
         # Process edge embeddings
@@ -71,7 +72,7 @@ class BackboneWithHeads(nn.Module):
         # Embedding args
         atom_type_embedding_args: DictConfig,
         edge_type_embedding_args: DictConfig,
-        charge_embedding_args: DictConfig,
+        # charge_embedding_args: DictConfig,
         time_embedding_args: DictConfig,
         node_count_embedding_args: DictConfig,
         # Backbone model args
@@ -87,7 +88,7 @@ class BackboneWithHeads(nn.Module):
         self.embedding_backbone = EmbeddingBackbone(
             atom_type_embedding_args=atom_type_embedding_args,
             edge_type_embedding_args=edge_type_embedding_args,
-            charge_embedding_args=charge_embedding_args,
+            # charge_embedding_args=charge_embedding_args,
             time_embedding_args=time_embedding_args,
             node_count_embedding_args=node_count_embedding_args,
         )
@@ -114,6 +115,7 @@ class BackboneWithHeads(nn.Module):
         batch: torch.Tensor,
         spawn_node_idx: torch.Tensor,
         target_node_idx: torch.Tensor,
+        hard_sampling: bool = True,
     ) -> Optional[torch.Tensor]:
         """Predict edge types between insertion points and existing nodes."""
 
@@ -125,9 +127,10 @@ class BackboneWithHeads(nn.Module):
             h=h,
             x=x,
             gmm_dict=gmm_dict,
-            batch=batch,
+            # batch=batch,
             spawn_node_idx=spawn_node_idx,
             target_node_idx=target_node_idx,
+            hard_sampling=hard_sampling,
         )
 
     def forward(

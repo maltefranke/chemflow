@@ -7,7 +7,7 @@ from functools import partial
 
 from chemflow.dataset.molecule_data import MoleculeBatch
 from chemflow.flow_matching.sampling import sample_prior_graph
-from chemflow.utils import token_to_index
+from chemflow.utils import token_to_index, validate_no_cross_batch_edges
 
 
 class LightningDataModule(pl.LightningDataModule):
@@ -119,6 +119,15 @@ class LightningDataModule(pl.LightningDataModule):
         targets = batch
         if self.n_atoms_strategy == "fixed":
             n_atoms = [target.num_nodes for target in targets]
+        elif self.n_atoms_strategy == "approx":
+            # sample normal distribution with mean 0 and std 2 and add to target.num_nodes
+            n_atoms = [
+                target.num_nodes + int((torch.randn(1) * 2).round().item())
+                for target in targets
+            ]
+            # floor to minimum of 3
+            n_atoms = [max(3, n_atoms_i) for n_atoms_i in n_atoms]
+
         else:
             n_atoms = [None for target in targets]
 
@@ -138,14 +147,36 @@ class LightningDataModule(pl.LightningDataModule):
 
             # interpolate
             t = self.time_dist.sample((batch_size,)).to(device)
+            # clip t_max
+            t = torch.clamp(t, min=0.0, max=1 - 1e-6)
             mols_t, mols_1, ins_targets = self.interpolator.interpolate_different_size(
                 samples_batched,
                 targets_batched,
                 t,
             )
+
+            # Validate: check for cross-batch edges after interpolation
+            validate_no_cross_batch_edges(
+                mols_t.edge_index, mols_t.batch, "collate_fn train mols_t"
+            )
+            validate_no_cross_batch_edges(
+                mols_1.edge_index, mols_1.batch, "collate_fn train mols_1"
+            )
+
             return mols_t, mols_1, ins_targets, t
 
         else:
+            # Validate: check for cross-batch edges in validation batches
+            validate_no_cross_batch_edges(
+                samples_batched.edge_index,
+                samples_batched.batch,
+                "collate_fn val samples",
+            )
+            validate_no_cross_batch_edges(
+                targets_batched.edge_index,
+                targets_batched.batch,
+                "collate_fn val targets",
+            )
             return samples_batched, targets_batched
 
     def train_dataloader(self):

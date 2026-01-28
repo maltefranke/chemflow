@@ -129,7 +129,7 @@ class CountEmbedding(nn.Module):
 
         # Optional: A small MLP to adapt the fixed features to the task
         self.projection = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim),
+            nn.Linear(embedding_dim, out_dim),
             nn.LayerNorm(out_dim),
             nn.GELU(),
         )
@@ -171,6 +171,7 @@ class TimeEmbedding(nn.Module):
         if times.ndim == 1:
             times = times.unsqueeze(-1)
 
+        times = times * 1000.0
         t_enc = self.encoder(times)
         return self.mlp(t_enc)
 
@@ -242,6 +243,7 @@ class RBFEmbedding(nn.Module):
         rbf_dmax: float = 10.0,
         out_dim: int = None,
         dropout: float = 0.0,
+        trainable: bool = True,
     ):
         """
         Args:
@@ -260,7 +262,9 @@ class RBFEmbedding(nn.Module):
         self.out_dim = out_dim
 
         # RBF encoding layer
-        self.rbf_encoding = RBFEncoding(num_rbf=num_rbf, rbf_dmax=rbf_dmax)
+        self.rbf_encoding = RBFEncoding(
+            num_rbf=num_rbf, rbf_dmax=rbf_dmax, trainable=trainable
+        )
 
         # Simple projection block (matching Embedding class style)
         self.projection = nn.Sequential(

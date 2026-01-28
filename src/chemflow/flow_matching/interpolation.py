@@ -9,6 +9,7 @@ from chemflow.flow_matching.assignment import partial_optimal_transport
 from chemflow.utils import (
     token_to_index,
     EdgeAligner,
+    validate_no_cross_batch_edges,
 )
 from external_code.egnn import unsorted_segment_mean
 
@@ -33,6 +34,9 @@ class Interpolator:
         ins_noise_scale=1.0,
         t_end_del=0.95,
         t_end_ins=0.95,
+        c_move=1.0,
+        c_sub=0.0,
+        c_ins=1e8,
     ):
         self.vocab = vocab
         self.distributions = distributions
@@ -43,6 +47,9 @@ class Interpolator:
         self.ins_noise_scale = ins_noise_scale
         self.t_end_del = t_end_del
         self.t_end_ins = t_end_ins
+        self.c_move = c_move
+        self.c_sub = c_sub
+        self.c_ins = c_ins
 
         if self.cat_strategy == "mask":
             self.atom_mask_token = token_to_index(self.atom_tokens, "<MASK>")
@@ -151,9 +158,9 @@ class Interpolator:
         aligned_pairs = partial_optimal_transport(
             samples_batched,
             targets_batched,
-            c_move=1.0,
-            c_sub=0.0,
-            c_ins=1e8,  # High birth cost forces matches where possible
+            c_move=self.c_move,
+            c_sub=self.c_sub,
+            c_ins=self.c_ins,  # High birth cost forces matches where possible
             optimal_transport=self.optimal_transport,
         )
 
@@ -443,6 +450,7 @@ class Interpolator:
 
             # INSERTION
             interp_state.lambda_ins = ins_counts * inst_rate_ins
+            interp_state.n_ins = ins_counts
 
             # DELETION
             node_del_rate_target = torch.zeros((N,), device=device)
@@ -456,6 +464,11 @@ class Interpolator:
             interp_state.lambda_a_sub = need_a_sub * inst_rate_sub
             interp_state.lambda_c_sub = need_c_sub * inst_rate_sub
             interp_state.lambda_e_sub = need_e_sub * inst_rate_sub
+
+            # Graph-level counts of insertions and deletions still missing
+            # These are used by the global budget heads for graph-level predictions
+            interp_state.n_ins_missing = mask_future_ins.sum().float()
+            interp_state.n_del_missing = mask_keep_del.sum().float()
 
             # Collect results
             interpolated_graphs.append(interp_state)
@@ -474,5 +487,13 @@ class Interpolator:
         _ = mol_t.remove_com(x_mean)
         _ = mol_1.remove_com(x_mean)
         _ = ins_targets.remove_com(x_mean)
+
+        # Validate: check for cross-batch edges after interpolation
+        validate_no_cross_batch_edges(
+            mol_t.edge_index, mol_t.batch, "interpolate_different_size mol_t"
+        )
+        validate_no_cross_batch_edges(
+            mol_1.edge_index, mol_1.batch, "interpolate_different_size mol_1"
+        )
 
         return mol_t, mol_1, ins_targets

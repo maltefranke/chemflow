@@ -199,6 +199,8 @@ class EquivariantGMMHead(nn.Module):
             nn.Linear(hidden_dim, K, bias=False),
         )
 
+        self.coord_scale = nn.Parameter(torch.tensor(1.0))
+
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -273,6 +275,7 @@ class EquivariantGMMHead(nn.Module):
         # 3. Predict weights for K distinct vectors
         # Weights shape: [E, K]
         weights = self.coord_mlp(edge_feat)
+        weights = F.tanh(weights) * self.coord_scale
 
         # 4. Weighted Sum (Equivariant Aggregation)
         # We need to broadcast diff to K channels: [E, 1, 3] * [E, K, 1] -> [E, K, 3]
@@ -379,72 +382,91 @@ class InsertionEdgeHead(nn.Module):
         h: torch.Tensor,
         x: torch.Tensor,
         gmm_dict: dict,
-        batch: torch.Tensor,
         spawn_node_idx: torch.Tensor,
         target_node_idx: torch.Tensor,
+        hard_sampling: bool = True,  # Controls both Component and Type sampling
     ) -> torch.Tensor:
-        """
-        Predict edge types between insertion points and existing nodes.
-
-        Args:
-            h: [N, hidden_dim] - Node features for all nodes
-            x: [N, 3] - Node positions for all nodes
-            gmm_dict: dict with 'mu' [N, K, 3], 'a_probs' [N, K, n_atom],
-                      'c_probs' [N, K, n_charge] - GMM parameters
-            batch: [N] - Batch assignment for each node
-            spawn_node_idx: [E_ins] - Indices of spawn nodes (nodes predicting insertions)
-            target_node_idx: [E_ins] - Indices of existing nodes to predict edges to
-
-        Returns:
-            edge_logits: [E_ins, n_edge_types] - Edge type logits for each pair
-        """
         if spawn_node_idx.numel() == 0:
-            return torch.empty((0, self.n_edge_types), device=h.device, dtype=h.dtype)
+            return torch.empty((0, self.n_edge_types), device=h.device)
 
-        # Get GMM parameters for spawn nodes
-        mu = gmm_dict["mu"]  # [N, K, 3]
-        pi = gmm_dict["pi"]  # [N, K]
-        a_probs = gmm_dict["a_probs"]  # [N, K, n_atom_types]
-        c_probs = gmm_dict["c_probs"]  # [N, K, n_charge_types]
+        # ------------------------------------------------------------------
+        # 1. PREPARE GMM PARAMETERS
+        # ------------------------------------------------------------------
+        # Slice the GMM dictionary for the relevant spawn nodes
+        # pi: [E_ins, K]
+        pi_spawn = gmm_dict["pi"][spawn_node_idx]
 
-        # Sample GMM component for each spawn node based on mixture weights
-        pi_spawn = pi[spawn_node_idx]  # [E_ins, K]
-        k_samples = torch.distributions.Categorical(probs=pi_spawn).sample()  # [E_ins]
+        # mu, sigma: [E_ins, K, 3]
+        mu_spawn = gmm_dict["mu"][spawn_node_idx]
+        # Ensure sigma is positive (softplus or exp usually done in model output)
+        sigma_spawn = gmm_dict["sigma"][spawn_node_idx]
 
-        # Gather the sampled component's parameters
-        E_ins = spawn_node_idx.shape[0]
-        batch_idx = torch.arange(E_ins, device=h.device)
+        # probs: [E_ins, K, n_types]
+        a_probs_spawn = gmm_dict["a_probs"][spawn_node_idx]
+        c_probs_spawn = gmm_dict["c_probs"][spawn_node_idx]
 
-        # [E_ins, 3]
-        insertion_pos = mu[spawn_node_idx][batch_idx, k_samples, :]
+        # ------------------------------------------------------------------
+        # 2. HIERARCHICAL SAMPLING
+        # ------------------------------------------------------------------
 
-        # [E_ins, n_atom]
-        ins_atom_probs = a_probs[spawn_node_idx][batch_idx, k_samples, :]
+        # A. Sample the Mixture Component (z)
+        # -----------------------------------
+        # We use log-probs for Gumbel. Add epsilon for stability.
+        z_logits = torch.log(pi_spawn + 1e-9)
 
-        # [E_ins, n_charge]
-        ins_charge_probs = c_probs[spawn_node_idx][batch_idx, k_samples, :]
+        # z: [E_ins, K] (One-hot if hard=True)
+        z = F.gumbel_softmax(z_logits, tau=1.0, hard=hard_sampling)
 
-        # Get positions of target nodes
-        target_pos = x[target_node_idx]  # [E_ins, 3]
+        # B. Sample Position (x) - Gaussian Reparameterization
+        # ----------------------------------------------------
+        # Select mean and sigma for the chosen component using einsum
+        # [E_ins, K] * [E_ins, K, 3] -> [E_ins, 3]
+        mu_selected = torch.einsum("bk, bkx -> bx", z, mu_spawn)
+        sigma_selected = torch.einsum("bk, bk -> b", z, sigma_spawn)
+        sigma_selected = sigma_selected.unsqueeze(-1)
 
-        # Compute distances with numerical stability
+        # Standard Normal Noise
+        epsilon = torch.randn_like(mu_selected)
+
+        # Reparameterize: x = mu + sigma * eps
+        insertion_pos = mu_selected + sigma_selected * epsilon
+
+        # C. Sample Atom/Charge Types (a, c) - Gumbel Reparameterization
+        # --------------------------------------------------------------
+        # First, select the probability vector for the chosen component
+        # [E_ins, K] * [E_ins, K, n_atom] -> [E_ins, n_atom]
+        a_probs_selected = torch.einsum("bk, bkc -> bc", z, a_probs_spawn)
+        c_probs_selected = torch.einsum("bk, bkc -> bc", z, c_probs_spawn)
+
+        # Now sample the specific type from that selected probability vector
+        # This is the "Sample a given k" step
+        a_logits = torch.log(a_probs_selected + 1e-9)
+        c_logits = torch.log(c_probs_selected + 1e-9)
+
+        # ins_atom_type: [E_ins, n_atom] (One-hot)
+        ins_atom_type = F.gumbel_softmax(a_logits, tau=1.0, hard=hard_sampling)
+        ins_charge_type = F.gumbel_softmax(c_logits, tau=1.0, hard=hard_sampling)
+
+        # ------------------------------------------------------------------
+        # 3. EDGE PREDICTION
+        # ------------------------------------------------------------------
+
+        # Get target positions and compute distance based on SAMPLED insertion_pos
+        target_pos = x[target_node_idx]
         distances = torch.norm(insertion_pos - target_pos, dim=-1).clamp(min=1e-6)
+        dist_features = self.rbf_embedding(distances)
 
-        # Compute distance features
-        dist_features = self.rbf_embedding(distances)  # [E_ins, num_rbf]
+        h_spawn = h[spawn_node_idx]
+        h_target = h[target_node_idx]
 
-        # Get node features
-        h_spawn = h[spawn_node_idx]  # [E_ins, hidden_dim]
-        h_target = h[target_node_idx]  # [E_ins, hidden_dim]
-
-        # Concatenate all features including inserted node type info
+        # Concatenate features.
+        # Note: We pass the sampled 'ins_atom_type' (one-hot), not the raw probs.
         edge_features = torch.cat(
-            [h_spawn, h_target, dist_features, ins_atom_probs, ins_charge_probs],
+            [h_spawn, h_target, dist_features, ins_atom_type, ins_charge_type],
             dim=-1,
         )
 
-        # Predict edge types
-        edge_logits = self.edge_mlp(edge_features)  # [E_ins, n_edge_types]
+        edge_logits = self.edge_mlp(edge_features)
 
         return edge_logits
 
@@ -455,6 +477,7 @@ class InsertionEdgeHead(nn.Module):
         gmm_dict: dict,
         batch: torch.Tensor,
         insertion_mask: torch.Tensor,
+        hard_sampling: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Predict edges for all insertions to all other nodes in the same graph.
@@ -503,6 +526,13 @@ class InsertionEdgeHead(nn.Module):
         target_idx = torch.cat(target_list)
 
         # Predict edge types
-        edge_logits = self.forward(h, x, gmm_dict, batch, spawn_idx, target_idx)
+        edge_logits = self.forward(
+            h,
+            x,
+            gmm_dict,
+            spawn_idx,
+            target_idx,
+            hard_sampling,
+        )
 
         return spawn_idx, target_idx, edge_logits

@@ -291,6 +291,9 @@ def compute_token_weights(
                 special_weight = special_weight / mean_regular_weight
             final_weights[token_idx] = special_weight
 
+    # set the minimum weight to 1.0
+    final_weights = final_weights / final_weights.min()
+
     return final_weights
 
 
@@ -329,6 +332,40 @@ def remove_token_from_distribution(token_list, distribution, token="<MASK>"):
         [distribution[:token_index], distribution[token_index + 1 :]]
     )
     return token_list, distribution
+
+
+def validate_no_cross_batch_edges(
+    edge_index: torch.Tensor,
+    batch: torch.Tensor,
+    location: str = "",
+) -> bool:
+    """
+    Validates that all edges are within the same batch (no cross-batch edges).
+
+    Args:
+        edge_index: Shape (2, E) - edge indices
+        batch: Shape (N,) - batch assignment for each node
+        location: String identifier for where this check is called (for debugging)
+
+    Returns:
+        True if valid (no cross-batch edges), False otherwise
+    """
+    if edge_index is None or edge_index.numel() == 0:
+        return True
+
+    edge_batches_src = batch[edge_index[0]]
+    edge_batches_tgt = batch[edge_index[1]]
+    cross_batch_mask = edge_batches_src != edge_batches_tgt
+
+    if cross_batch_mask.any():
+        n_cross = cross_batch_mask.sum().item()
+        print(f"WARNING [{location}]: Found {n_cross} cross-batch edges!")
+        print(f"  Cross-batch edge indices: {edge_index[:, cross_batch_mask]}")
+        print(f"  Source batches: {edge_batches_src[cross_batch_mask]}")
+        print(f"  Target batches: {edge_batches_tgt[cross_batch_mask]}")
+        return False
+
+    return True
 
 
 class EdgeAligner:

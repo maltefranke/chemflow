@@ -72,7 +72,7 @@ def distance_and_class_based_assignment(
     Note: This will not be useful for our application!
     c_move=0, c_sub=const, c_ins>>c_sub
 
-    3) Pure birth-death assignment - no move.
+    3) Pure insertion-deletion assignment - no move.
     c_move>>c_ins, c_sub=const, c_ins=const
 
     Args:
@@ -82,7 +82,7 @@ def distance_and_class_based_assignment(
         a1 (np.ndarray): Shape (N_x1, C)
         c_move (float): Distance cost weight
         c_sub (float): Class cost weight
-        c_ins (float): Birth cost weight
+        c_ins (float): Insertion cost weight
 
     Returns:
         tuple: A tuple of two arrays:
@@ -107,18 +107,18 @@ def distance_and_class_based_assignment(
     # [Top-Left] Real matches (N x M)
     aug_cost[:N, :M] = cost_real
 
-    # [Top-Right] DEATH Cost (N x N)
+    # [Top-Right] Deletion Cost (N x N)
     # A real point x0[i] matches a dummy target.
     # We use a very high value for off-diagonals so each point has its own dummy.
-    death_block = np.full((N, N), fill_value=1e8)
-    np.fill_diagonal(death_block, c_sub)
-    aug_cost[:N, M:] = death_block
+    del_block = np.full((N, N), fill_value=1e8)
+    np.fill_diagonal(del_block, c_sub)
+    aug_cost[:N, M:] = del_block
 
-    # [Bottom-Left] BIRTH Cost (M x M)
+    # [Bottom-Left] Insertion Cost (M x M)
     # A real point x1[j] matches a dummy source.
-    birth_block = np.full((M, M), fill_value=1e8)
-    np.fill_diagonal(birth_block, c_ins)
-    aug_cost[N:, :M] = birth_block
+    ins_block = np.full((M, M), fill_value=1e8)
+    np.fill_diagonal(ins_block, c_ins)
+    aug_cost[N:, :M] = ins_block
 
     # [Bottom-Right] Unused Dummies (M x N)
     # This block must be 0.0 to allow dummies to pair with each other for "free"

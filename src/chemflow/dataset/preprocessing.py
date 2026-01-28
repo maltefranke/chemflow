@@ -143,13 +143,9 @@ class Preprocessing:
             all_atom_types.update(atom_types)
 
             # Extract edge types
-            # QM9 edge_attr is one-hot encoded, so we need to convert to indices
+            # QM9 edge_attr is the bond type indices
             if data.edge_attr.numel() > 0:
-                # Convert one-hot to indices: argmax gives 0=single, 1=double,
-                # 2=triple, 3=aromatic. Then add 1 to get: 1=single, 2=double,
-                # 3=triple, 4=aromatic
-                edge_type_indices = data.edge_attr.argmax(dim=-1) + 1
-                all_edge_type_indices.update(edge_type_indices.tolist())
+                all_edge_type_indices.update(data.edge_attr.tolist())
 
             if hasattr(data, "charges") and data.charges is not None:
                 all_charge_tokens.update(data.charges.tolist())
@@ -251,7 +247,7 @@ class Preprocessing:
 
             # Convert edge_attr (one-hot) to dense adjacency matrix
             # This gives: 0=no bond, 1=single, 2=double, 3=triple, 4=aromatic
-            edge_types = data.edge_attr.argmax(dim=-1) + 1
+            edge_types = data.edge_attr
             adj_matrix = to_dense_adj(
                 data.edge_index, edge_attr=edge_types, max_num_nodes=num_atoms
             )

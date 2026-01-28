@@ -43,7 +43,15 @@ def gmm_loss(gmm_output, target_locations, target_batch_ids, mask_value=-1e3):
     return -torch.mean(log_likelihood)
 
 
-def typed_gmm_loss(gmm_output, target_x, target_a, target_c, sigma_t, reduction="mean"):
+def typed_gmm_loss(
+    gmm_output,
+    target_x,
+    target_a,
+    target_c,
+    class_weights_a,
+    class_weights_c,
+    reduction="mean",
+):
     """
     Computes the NLL loss using the get_typed_gmm_components helper.
 
@@ -76,9 +84,10 @@ def typed_gmm_loss(gmm_output, target_x, target_a, target_c, sigma_t, reduction=
     log_prob_x = x_dist.log_prob(target_x) / D  # Result: [N, 1, K]
 
     # handle shrinking variance --> makes it MSE-like loss
-    log_prob_x = log_prob_x * 2 * (sigma_t.pow(2)).clamp(min=1e-5).reshape(N, 1, 1)
+    # log_prob_x = log_prob_x * 2 * (sigma_t.pow(2)).clamp(min=1e-5).reshape(N, 1, 1)
 
     # B. Type Log-Prob
+    # TODO maybe we have to implement a weighted log_prob for the types
     # Target: [N] -> [N, 1] to broadcast against dist [N, 1, K]
     log_prob_a = a_dist.log_prob(target_a)  # Result: [N, 1, K]
     log_prob_c = c_dist.log_prob(target_c)  # Result: [N, 1, K]
@@ -97,12 +106,21 @@ def typed_gmm_loss(gmm_output, target_x, target_a, target_c, sigma_t, reduction=
     # LogSumExp over components (dim=-1): [N, 1]
     log_likelihood = torch.logsumexp(log_joint, dim=-1)
 
+    a_weight = class_weights_a[target_a].view(-1, 1)
+    c_weight = class_weights_c[target_c].view(-1, 1)
+
+    # Instead of multiplying the weights, we add them up to prevent exploding weight
+    weights = (a_weight + c_weight) / 2
+    log_likelihood = log_likelihood * weights
+
     # Average over nodes
     if reduction == "mean":
-        return -torch.mean(log_likelihood)
+        nll = -torch.mean(log_likelihood)
     elif reduction == "sum":
-        return -torch.sum(log_likelihood)
+        nll = -torch.sum(log_likelihood)
     elif reduction == "none":
-        return -log_likelihood
+        nll = -log_likelihood
     else:
         raise ValueError(f"Invalid reduction: {reduction}")
+
+    return nll, weights

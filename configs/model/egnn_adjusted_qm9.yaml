@@ -7,13 +7,17 @@ is_typed: ${if:${eq:${data.cat_strategy},uniform-sample},true,false}
 output_dim_typed: ${oc.eval:"${model.gmm_params.K} * (2 + ${model.gmm_params.D} + ${len:${data.vocab.atom_tokens}} + ${len:${data.vocab.charge_tokens}})"}
 output_dim_untyped: ${oc.eval:"${model.gmm_params.K} * (3 +  ${model.gmm_params.D})"}
 
+# Insertion rate strategy: "poisson" (regression with Poisson NLL) or "classification" (cross-entropy)
+ins_rate_strategy: "classification"
+
 integrator:
-  _target_: chemflow.flow_matching.integration.RateIntegrator
+  _target_: chemflow.flow_matching.integration_adjusted.RateIntegrator
   vocab: ${data.vocab}
   distributions: None
   gmm_params: ${model.gmm_params}
   cat_strategy: ${data.cat_strategy}
   n_atoms_strategy: ${data.n_atoms_strategy}
+  #ins_rate_strategy: ${model.ins_rate_strategy}
   time_strategy: log # "linear" or "log"
   num_integration_steps: 200
   t_end_ins: ${data.t_end_ins}
@@ -32,11 +36,12 @@ linear_sched:
   high: 1.0
 
 module:
-  _target_: chemflow.model.lightning_module.LightningModuleRates
+  _target_: chemflow.model.lightning_module_adjusted.LightningModuleRates
   # args and kwargs 
   # tokens and atom_type_distribution will be passed from preprocessing in run.py
   gmm_params: ${model.gmm_params}
   n_atoms_strategy: ${data.n_atoms_strategy}
+  ins_rate_strategy: ${model.ins_rate_strategy}
   type_loss_token_weights: training
   cat_weighting:
     _target_: DictConfig
@@ -51,24 +56,26 @@ module:
   # Loss component weights
   use_learnable_loss_weights: false
   loss_weights:
-    l_sub_a_rate: 1.0 # 1.2
-    l_sub_a_class: 1.0 # 40.0
-    # l_sub_c_rate: 25.0
-    # l_sub_c_class: 1000.0
-    l_sub_e_rate: 1.0 # 3.5
-    l_sub_e_class: 1.0 # 500.0
-    l_del_rate: 1.0 # 6.0
-    l_ins_rate: 1.0 # 3.2
-    l_ins_gmm: 1.0 # 1.2
-    l_ins_e: 1.0 # 500.0
+    l_do_sub_a: 1.0 # 1.2
+    l_sub_a_class: 1.0
+    l_do_sub_e: 1.0
+    l_sub_e_class: 1.0
+    l_do_del: 1.0
+    l_do_ins: 1.0
+    l_ins_rate: 1.0
+    l_ins_gmm: 1.0
+    l_ins_e: 1.0
     l_x: 20.0
-    l_c: 1.0 # 10.0
+    l_c: 1.0
+    # Global budget prediction losses (cross-entropy classifiers)
+    l_global_ins_budget: 1.0  # Used for sampling
+    l_global_del_budget: 1.0  # Regularizer only (not used in sampling)
 
   # Optimizer configuration
   optimizer_config:
     optimizer:
       _target_: torch.optim.AdamW
-      lr: 3e-4
+      lr: 5e-4
       betas: [0.9, 0.999]
       weight_decay: 1e-12
       fused: true
@@ -78,10 +85,10 @@ module:
       # max_lr: 1e-3
       # warmup_steps: 1000
       _target_: chemflow.schedulers.CosineWarmupLR
-      max_lr: 2e-4
+      max_lr: 1e-3
       min_lr: 1e-4
-      warmup_steps: 500
-      total_steps: 100000
+      warmup_steps: 100
+      total_steps: 500000
 
     interval: step
     monitor: null
@@ -93,7 +100,6 @@ module:
 
     atom_type_embedding_args: ${model.atom_type_embedding}
     edge_type_embedding_args: ${model.edge_type_embedding}
-    # charge_embedding_args: ${model.charge_embedding}
     time_embedding_args: ${model.time_embedding}
     node_count_embedding_args: ${model.node_count_embedding}
 
@@ -113,43 +119,37 @@ module:
         num_rbf: 128
         rbf_dmax: 3.5
         out_dim: 64
-        dropout: 0.0
+        dropout: 0.05
         trainable: false
 
 atom_type_embedding:
   _target_: chemflow.model.embedding.Embedding
   num_embeddings: ${len:${data.vocab.atom_tokens}}
   embedding_dim: 64
-  out_dim: 64
+  out_dim: 128
 
 edge_type_embedding:
   _target_: chemflow.model.embedding.Embedding
   num_embeddings: ${len:${data.vocab.edge_tokens}}
   embedding_dim: 64
-  out_dim: 64
-
-charge_embedding:
-  _target_: chemflow.model.embedding.Embedding
-  num_embeddings: ${len:${data.vocab.charge_tokens}}
-  embedding_dim: 64
-  out_dim: 64
+  out_dim: 128
 
 time_embedding:
   _target_: chemflow.model.embedding.TimeEmbedding
   embedding_dim: 64
-  out_dim: 64
+  out_dim: 128
 
 node_count_embedding:
   _target_: chemflow.model.embedding.CountEmbedding
   embedding_dim: 64
-  out_dim: 64
+  out_dim: 128
 
 backbone:
   _target_: chemflow.model.backbones.egnn.EGNNWithEdgeType
   _recursive_: false
   # Concatenated embeddings: atom + time + count (+ ${model.charge_embedding.out_dim} if charge prediction is enabled)
   in_node_nf: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim}"}
-  hidden_nf: 256
+  hidden_nf: 384
   out_node_nf: 256
   in_edge_nf: ${model.edge_type_embedding.out_dim} # set to zero when not predicting edge types
   n_layers: 6
@@ -162,7 +162,7 @@ backbone:
     num_rbf: 128
     rbf_dmax: 3.5
     out_dim: 64
-    dropout: 0.0
+    dropout: 0.05
     trainable: false
 
 heads:
@@ -183,35 +183,56 @@ heads:
         output_dim: ${len:${data.vocab.charge_tokens}}
         hidden_dim: 128
 
+      # Insertion rate head: output_dim depends on strategy
+      # - For "poisson": output_dim = 1 (regression)
+      # - For "classification": output_dim = max_n_atoms (number of classes)
+      # max_n_atoms will be determined at runtime from the n_atoms_distribution
       ins_rate_head:
         input_dim: ${model.backbone.out_node_nf}
-        output_dim: 1
+        output_dim: ${if:${eq:${model.ins_rate_strategy},classification},30,1}
         hidden_dim: 128
 
-      del_rate_head:
+      do_ins_head:
         input_dim: ${model.backbone.out_node_nf}
         output_dim: 1
         hidden_dim: 128
 
-      sub_rate_a_head:
+      do_del_head:
         input_dim: ${model.backbone.out_node_nf}
         output_dim: 1
+        hidden_dim: 128
+
+      do_sub_a_head:
+        input_dim: ${model.backbone.out_node_nf}
+        output_dim: 1
+        hidden_dim: 128
+    
+    # Graph-level heads for global budget prediction
+    graph_heads:
+      # Predicts total number of insertions remaining to reach target size
+      # Used during sampling to determine step-level insertion budget
+      global_ins_budget_head:
+        input_dim: ${model.backbone.out_node_nf}
+        output_dim: 30  # Max possible insertions (same as ins_rate_head classes)
+        hidden_dim: 128
+
+      # Predicts total number of deletions remaining to reach target size
+      # Only used during training as a regularizer, not during sampling
+      global_del_budget_head:
+        input_dim: ${model.backbone.out_node_nf}
+        output_dim: 30  # Max possible deletions
         hidden_dim: 128
       
-      #sub_rate_c_head:
-      #  input_dim: ${model.backbone.out_node_nf}
-      #  output_dim: 1
-      #  hidden_dim: 128
-
     edge_heads:
-      sub_rate_e_head:
-        input_dim: ${model.backbone.out_node_nf}
-        output_dim: 1
-        hidden_dim: 128
 
       edge_type_head:
         input_dim: ${model.backbone.out_node_nf}
         output_dim: ${len:${data.vocab.edge_tokens}}
+        hidden_dim: 128
+
+      do_sub_e_head:
+        input_dim: ${model.backbone.out_node_nf}
+        output_dim: 1
         hidden_dim: 128
 
 gmm_head_args:
@@ -226,6 +247,6 @@ gmm_head_args:
     num_rbf: 128
     rbf_dmax: 3.5
     out_dim: 64
-    dropout: 0.0
+    dropout: 0.05
     trainable: false
       

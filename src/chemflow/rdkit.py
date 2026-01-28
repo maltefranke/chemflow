@@ -63,6 +63,7 @@ class PeriodicTable:
 PT = PeriodicTable()
 
 IDX_BOND_MAP = {
+    0: "NO_BOND",
     1: Chem.BondType.SINGLE,
     2: Chem.BondType.DOUBLE,
     3: Chem.BondType.TRIPLE,
@@ -98,6 +99,7 @@ def _check_dim_shape(arr, dim, allowed, name="object"):
             f"Shape of {name} for dim {dim} must be in {allowed}, got {shape}"
         )
 
+
 def sanitize_mol_correctly(mol: Chem.Mol):
     for a in mol.GetAtoms():
         a.SetNoImplicit(True)
@@ -116,13 +118,15 @@ def sanitize_mol_correctly(mol: Chem.Mol):
         return None
     return mol
 
+
 # *************************************************************************************************
 # ************************************* External Functions ****************************************
 # *************************************************************************************************
 
 
-def mol_is_valid(mol: Chem.Mol, allow_radical: bool = False, allow_charged: bool = False) -> bool:
-
+def mol_is_valid(
+    mol: Chem.Mol, allow_radical: bool = False, allow_charged: bool = False
+) -> bool:
     sanitized_mol = sanitize_mol_correctly(mol)
     if sanitized_mol is None:
         return False
@@ -221,13 +225,18 @@ def conf_distance(
     coords1 = coords1 - (coords1.sum(axis=0) / coords1.shape[0])
     coords2 = coords2 - (coords2.sum(axis=0) / coords2.shape[0])
 
-    # Find the best rotation alignment between the centred mols
-    rotation, _ = Rotation.align_vectors(coords1, coords2)
-    aligned_coords2 = rotation.apply(coords2)
+    if coords1.shape[0] == 1:
+        # catch the case where the molecule is a single atom
+        return 0.0
 
-    sqrd_dists = (coords1 - aligned_coords2) ** 2
-    rmsd = np.sqrt(sqrd_dists.sum(axis=1).mean())
-    return rmsd
+    else:
+        # Find the best rotation alignment between the centred mols
+        rotation, _ = Rotation.align_vectors(coords1, coords2)
+        aligned_coords2 = rotation.apply(coords2)
+
+        sqrd_dists = (coords1 - aligned_coords2) ** 2
+        rmsd = np.sqrt(sqrd_dists.sum(axis=1).mean())
+        return rmsd
 
 
 def smiles_from_mol(
@@ -388,7 +397,7 @@ def mol_from_atoms(
     if sanitise:
         mol = sanitize_mol_correctly(mol)
         if mol is None:
-            return None 
+            return None
 
     return mol
 

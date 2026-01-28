@@ -29,10 +29,6 @@ module:
     _target_: DictConfig
     cat_strategy: ${data.cat_strategy}
     weight_alpha: 1.0
-  noise_params:
-    _target_: DictConfig
-    cat_noise_level: 0.1
-    coord_noise_level: 0.0
   time_dist:
     # Beta distribution for time scheduling. 1.0 , 1.0 is equivalent to uniform distribution.
     # SEMLAFLOW uses 2.0, 1.0
@@ -44,22 +40,19 @@ module:
   vocab: ${data.vocab}
   
   # Loss component weights
+  use_learnable_loss_weights: false
   loss_weights:
-    # Flow matching loss weights
-    l_x: 20.0
-
-    # EditFlow loss weights
-    # Substitution is used for atom type changes
-    l_sub_a: 1.0
-
-    l_sub_c: 1.0
-
-    l_sub_e: 1.0
-    
-    # Only use deletion and insertion losses if the number of atoms is flexible
-    l_ins: ${if:${eq:${data.n_atoms_strategy},flexible},1.0,0.0}
-    l_del: ${if:${eq:${data.n_atoms_strategy},flexible},1.0,0.0}
-    l_sub: 1.0
+    l_sub_a_rate: 1.2
+    l_sub_a_class: 40.0
+    l_sub_c_rate: 25.0
+    l_sub_c_class: 1000.0
+    l_sub_e_rate: 3.5
+    l_sub_e_class: 500.0
+    l_del_rate: 6.0
+    l_ins_rate: 3.2
+    l_ins_gmm: 1.2
+    l_ins_e: 500.0
+    l_x: 25.0
 
   # Optimizer configuration
   optimizer_config:

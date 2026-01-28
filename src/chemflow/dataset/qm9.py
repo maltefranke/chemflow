@@ -18,7 +18,7 @@ from torch_geometric.utils import one_hot, scatter
 
 from chemflow.dataset.molecule_data import MoleculeData
 from chemflow.dataset.vocab import Vocab, Distributions
-from chemflow.rdkit import mol_is_valid, sanitize_mol_correctly
+from chemflow.rdkit import mol_is_valid, sanitize_mol_correctly, BOND_IDX_MAP
 
 
 class QM9Charges(QM9):
@@ -62,7 +62,8 @@ class QM9Charges(QM9):
             return
 
         types = {"H": 0, "C": 1, "N": 2, "O": 3, "F": 4}
-        bonds = {BT.SINGLE: 0, BT.DOUBLE: 1, BT.TRIPLE: 2, BT.AROMATIC: 3}
+        # bonds = {"NO_BOND": 0, "SINGLE": 1, "DOUBLE": 2, "TRIPLE": 3, "AROMATIC": 4}
+        bonds = BOND_IDX_MAP
 
         with open(self.raw_paths[1]) as f:
             target = [
@@ -83,15 +84,15 @@ class QM9Charges(QM9):
 
         data_list = []
         for i, mol in enumerate(tqdm(suppl)):
-            #if i in skip:
+            # if i in skip:
             #    continue
             if mol is None or not mol_is_valid(mol):
                 errors += 1
                 continue
-               
+
             mol = sanitize_mol_correctly(mol)
             if mol is None:
-                errors +=1
+                errors += 1
                 continue
 
             N = mol.GetNumAtoms()
@@ -130,12 +131,12 @@ class QM9Charges(QM9):
 
             edge_index = torch.tensor([rows, cols], dtype=torch.long)
             edge_type = torch.tensor(edge_types, dtype=torch.long)
-            edge_attr = one_hot(edge_type, num_classes=len(bonds))
+            # edge_attr = one_hot(edge_type, num_classes=len(bonds))
 
             perm = (edge_index[0] * N + edge_index[1]).argsort()
             edge_index = edge_index[:, perm]
             edge_type = edge_type[perm]
-            edge_attr = edge_attr[perm]
+            # edge_attr = edge_attr[perm]
 
             row, col = edge_index
             hs = (z == 1).to(torch.float)
@@ -154,6 +155,7 @@ class QM9Charges(QM9):
             charges = torch.tensor(charges, dtype=torch.int64)
 
             name = mol.GetProp("_Name")
+            smiles = Chem.MolToSmiles(mol, isomericSmiles=False)
 
             # TODO exchange with our own MolData object for consistency
             data = Data(
@@ -163,7 +165,7 @@ class QM9Charges(QM9):
                 charges=charges,
                 edge_index=edge_index,
                 smiles=smiles,
-                edge_attr=edge_attr,
+                edge_attr=edge_type,
                 y=y[i].unsqueeze(0),
                 name=name,
                 idx=i,
@@ -213,7 +215,7 @@ class FlowMatchingQM9Dataset(QM9Charges):
 
         # add 1 to the edge types to make them 1-indexed
         # 0 is no bond, 1 is single, 2 is double, 3 is triple, 4 is aromatic
-        edge_types = data.edge_attr.argmax(dim=-1) + 1
+        edge_types = data.edge_attr
         edge_types = edge_types_to_symmetric(
             data.edge_index, edge_types, data.num_nodes
         )

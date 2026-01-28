@@ -30,6 +30,7 @@ class LightningModuleRates(pl.LightningModule):
         optimizer_config: DictConfig = None,
         gmm_params: DictConfig = None,
         n_atoms_strategy: str = "fixed",
+        ins_rate_strategy: str = "poisson",  # "poisson" or "classification"
         type_loss_token_weights: str = "uniform",  # "uniform" or "training"
         cat_weighting: DictConfig = None,
         time_dist: DictConfig = None,
@@ -48,6 +49,7 @@ class LightningModuleRates(pl.LightningModule):
 
         self.gmm_params = gmm_params
         self.n_atoms_strategy = n_atoms_strategy
+        self.ins_rate_strategy = ins_rate_strategy
         self.type_loss_token_weights = type_loss_token_weights
 
         if self.cat_weighting.cat_strategy == "mask":
@@ -71,14 +73,15 @@ class LightningModuleRates(pl.LightningModule):
         if loss_weights is None:
             loss_weights = DictConfig(
                 {
-                    "l_sub_a_rate": 1.0,
+                    "do_sub_a": 1.0,
                     "l_sub_a_class": 1.0,
                     # "l_sub_c_rate": 1.0,
                     # "l_sub_c_class": 1.0,
-                    "l_sub_e_rate": 1.0,
+                    "do_sub_e": 1.0,
                     "l_sub_e_class": 1.0,
-                    "l_del_rate": 1.0,
-                    "l_ins_rate": 1.0,
+                    "do_del": 1.0,
+                    "do_ins": 1.0,
+                    "ins_rate": 1.0,
                     "l_ins_gmm": 1.0,
                     "l_ins_e": 1.0,
                     "l_x": 1.0,
@@ -159,16 +162,20 @@ class LightningModuleRates(pl.LightningModule):
 
         # Initialize unified loss weight wrapper with dictionary structure
         manual_weights = {
-            "sub_a_rate": float(self.l_sub_a_rate),
+            "do_sub_a": float(self.l_do_sub_a),
             "sub_a_class": float(self.l_sub_a_class),
-            "sub_e_rate": float(self.l_sub_e_rate),
+            "do_sub_e": float(self.l_do_sub_e),
             "sub_e_class": float(self.l_sub_e_class),
-            "del_rate": float(self.l_del_rate),
+            "do_del": float(self.l_do_del),
+            "do_ins": float(self.l_do_ins),
             "ins_rate": float(self.l_ins_rate),
             "ins_gmm": float(self.l_ins_gmm),
             "ins_e": float(self.l_ins_e),
             "x": float(self.l_x),
             "c": float(self.l_c),
+            # Global budget prediction losses
+            "global_ins_budget": float(getattr(self, "l_global_ins_budget", 1.0)),
+            "global_del_budget": float(getattr(self, "l_global_del_budget", 1.0)),
         }
         self.loss_weight_wrapper = UnifiedWeightedLoss(
             manual_weights=manual_weights,
@@ -208,113 +215,173 @@ class LightningModuleRates(pl.LightningModule):
             )
         return loss
 
-    def edit_flow_loss(
-        self,
-        rate_pred,
-        target_rate,
-        batch,
-        num_graphs,
-        class_pred=None,
-        class_target=None,
-        class_weights=None,
-    ):
-        # EditFlow loss (eq. 23 in the paper):
-        # L = sum(x != x_t)[u_t(x|x_t)]
-        #   + sum(i=0 to N_nodes)[1{is_different} * log(u_t(ins/del/sub|x_t))]
+    def do_action_loss(self, do_action_pred, num_actions, batch, num_graphs):
+        """Calculate the do action loss for the given do action predictions.
+        Is used for all actions (substitutions, deletions, insertions).
 
-        # Rate loss (EditFlow's term 1 in eq. 23)
-        # Intuitively, we want to do as few edits as possible
-
-        # Correct edits loss (EditFlows, term 2 in eq. 23)
-        # Intuitively, we want to do as many correct edits as possible
-        # u_t(insert) = lambda_insert * Q_insert
-        # <--> log[u_t(insert)] = log[lambda_insert * Q_insert]
-        # <--> log[u_t(insert)] = log[lambda_insert] + log[Q_insert]
-        # similar for delete and substitute
-
-        # This simiplies to a simple poisson nll loss and a cross entropy loss term
-        # Loss is L = sum(lambda_pred - weight * log(lambda_pred)) + sum(weight * log(Q_target))
-        #           = sum(poisson_nll(lambda_pred, weight)) + sum(weight * cross_entropy(class_pred, class_target))
-        # where weight is the target rate
+        Args:
+            do_action_pred: The predicted do action values.
+            num_actions: The number of actions for each node.
+            batch: The batch indices for each node.
+            num_graphs: The number of graphs in the batch.
+        """
+        do_action = num_actions > 0.0
 
         # calculate dynamic weighting for the rate loss
-        is_modified = target_rate.view(-1) > 0.0
-        num_modified = is_modified.sum()
-        num_total = target_rate.shape[0]
-        num_unmodified = num_total - num_modified
+        num_total_actions = do_action.sum()
+        num_total = do_action.shape[0]
+        num_no_action = num_total - num_total_actions
 
-        """total = num_modified + num_unmodified
-        w_modified = total / (2.0 * num_modified)
-        w_unmodified = total / (2.0 * num_unmodified)
+        pos_weight = num_no_action / num_total_actions if num_total_actions > 0 else 1.0
+        pos_weight = torch.tensor(pos_weight, device=self.device)
 
-        if num_modified == 0 or num_unmodified == 0:
-            w_modified = 1.0
-            w_unmodified = 1.0"""
-
-        w_modified = 1.0
-        w_unmodified = 1.0
-
-        # Apply weights for Rate Loss
-        weights = (
-            is_modified.to(torch.int32) * w_modified
-            + (1 - is_modified.to(torch.int32)) * w_unmodified
-        )
-
-        # Rate Loss Calculation
-        rate_loss = F.poisson_nll_loss(
-            rate_pred.view(-1),
-            target_rate.view(-1),
-            log_input=False,
+        # NOTE: we use BCEWithLogitsLoss for scalar logit predictions
+        # do_action_pred is shape (N,) with logits
+        do_action_loss = F.binary_cross_entropy_with_logits(
+            do_action_pred.view(-1),
+            do_action.float().view(-1),
+            pos_weight=pos_weight,
             reduction="none",
-            full=True,
         )
-        rate_loss = rate_loss * weights
+        do_action_loss = unsorted_segment_mean(
+            do_action_loss.view(-1, 1), batch, num_graphs
+        )
 
-        rate_loss = unsorted_segment_mean(rate_loss.view(-1, 1), batch, num_graphs)
-        rate_loss = rate_loss.mean()
+        do_action_loss = do_action_loss.mean()
 
-        # Class Loss Calculation
-        class_loss_val = torch.tensor(0.0, device=self.device)
+        return do_action_loss
 
-        if class_pred is not None and class_target is not None:
-            # 1. Slice: Only process nodes that are actually modified
-            # This makes the operation O(N_modified) instead of O(N_total)
-            if is_modified.any():
-                pred_sub = class_pred[is_modified]
-                target_sub = class_target[is_modified]
-                rate_sub = target_rate.view(-1)[is_modified]
-                batch_sub = batch[is_modified]
+    def rate_loss(self, rate_pred, num_actions, batch, num_graphs):
+        """
+        Calculate the rate loss for the given rate predictions and number of actions.
+        Is only used for insertions which can have multiple insertions per node.
+        For the other actions, we use the do_action_loss.
 
-                # 2. Compute Element-wise Weighted Loss
-                # The 'weight' param applies the class imbalance penalty (e.g. x100 for rare classes)
-                ce_loss = F.cross_entropy(
-                    pred_sub, target_sub, weight=class_weights, reduction="none"
-                )
+        Supports two strategies:
+        - "poisson": Poisson NLL loss for regression (rate_pred is scalar)
+        - "classification": Cross-entropy loss (rate_pred is logits over classes)
 
-                # Apply the target rate (lambda) scaling
-                # This corresponds to the term: lambda_target * CrossEntropy
-                weighted_loss_elements = rate_sub * ce_loss
+        Args:
+            rate_pred: The predicted rate values (scalar for poisson, logits for classification).
+            num_actions: The integer number of actions for each node.
+            batch: The batch indices for each node.
+            num_graphs: The number of graphs in the batch.
+        """
 
-                # 3. Aggregate per Graph using Mean
-                # unsorted_segment_mean sums the weighted elements and divides by the COUNT
-                # of items in that segment.
-                # Result: A graph with 1 rare error (weight 100) gets high loss.
-                graph_class_loss = unsorted_segment_mean(
-                    weighted_loss_elements.view(-1, 1), batch_sub, num_graphs
-                )
+        do_action = num_actions > 0.0
+        do_action = do_action.view(-1)
 
-                # 4. Filter and Average
-                # We must only average over graphs that actually appeared in batch_sub.
-                # Using 'graph_class_loss > 0' is risky if loss is genuinely 0 (perfect prediction).
-                # Instead, create a mask of present graphs.
-                present_graphs_mask = torch.zeros(
-                    num_graphs, dtype=torch.bool, device=self.device
-                )
-                present_graphs_mask[batch_sub] = True
+        if self.ins_rate_strategy == "classification":
+            # Classification: use cross-entropy loss
+            # rate_pred shape: (N, num_classes)
+            # num_actions needs to be converted to class indices (clamped to valid range)
+            num_classes = rate_pred.shape[-1]
+            targets = num_actions.long().view(-1).clamp(0, num_classes - 1)
 
-                class_loss_val = graph_class_loss[present_graphs_mask].mean()
+            # Only apply loss for nodes that have actions
+            rate_loss = F.cross_entropy(
+                rate_pred[do_action],
+                targets[do_action],
+                reduction="none",
+            )
+        else:
+            # Poisson: use Poisson NLL loss (original behavior)
+            # Only apply rate loss for nodes that have actions.
+            rate_loss = F.poisson_nll_loss(
+                rate_pred[do_action].view(-1),
+                num_actions[do_action].view(-1),
+                log_input=False,
+                reduction="none",
+                full=True,
+            )
 
-        return rate_loss, class_loss_val
+        # NOTE: first normalize by number of nodes / graphs
+        # Otherwise, nodes with more atoms will have more weight by design
+        rate_loss = unsorted_segment_mean(
+            rate_loss.view(-1, 1), batch[do_action], num_graphs
+        )
+
+        batch_has_modified = (
+            unsorted_segment_sum(
+                do_action.view(-1, 1),
+                batch,
+                num_graphs,
+            )
+            > 0
+        )
+        rate_loss = rate_loss[batch_has_modified].mean()
+
+        return rate_loss
+
+    def class_loss(
+        self, class_pred, class_target, class_weights, num_actions, batch, num_graphs
+    ):
+        """
+        Calculate the class loss for the given class predictions and target classes.
+        Is only used for atom type, edge type, and charge classes.
+
+        Args:
+            class_pred: The predicted class values.
+            class_target: The target class values.
+            class_weights: The weights for each class.
+            num_actions: The number of actions for each node.
+            batch: The batch indices for each node.
+            num_graphs: The number of graphs in the batch.
+        """
+        do_action = num_actions > 0.0
+
+        class_loss = F.cross_entropy(
+            class_pred,
+            class_target,
+            weight=class_weights,
+            reduction="none",
+        )
+
+        # NOTE As per EditFlow, only count class loss for nodes that need modification
+        class_loss = unsorted_segment_mean(
+            class_loss[do_action].view(-1, 1), batch[do_action], num_graphs
+        )
+
+        batch_has_modified = (
+            unsorted_segment_sum(
+                do_action.view(-1, 1),
+                batch,
+                num_graphs,
+            )
+            > 0
+        )
+
+        class_loss = class_loss[batch_has_modified].mean()
+
+        return class_loss
+
+    def global_budget_loss(self, budget_pred, target_budget, num_graphs):
+        """
+        Calculate the global budget loss for graph-level predictions.
+
+        This is a cross-entropy classification loss where we predict the total
+        number of insertions/deletions remaining to reach the target size.
+
+        Args:
+            budget_pred: Shape (num_graphs, num_classes) - logits for budget prediction
+            target_budget: Shape (num_graphs,) - target number of insertions/deletions
+            num_graphs: The number of graphs in the batch.
+
+        Returns:
+            loss: Scalar cross-entropy loss averaged over graphs
+        """
+        # Clamp target to valid range [0, num_classes - 1]
+        num_classes = budget_pred.shape[-1]
+        target_budget = target_budget.long().clamp(0, num_classes - 1)
+
+        # Cross-entropy loss
+        loss = F.cross_entropy(
+            budget_pred,
+            target_budget,
+            reduction="mean",
+        )
+
+        return loss
 
     def shared_step(self, batch, batch_idx):
         self.model.set_training()
@@ -348,85 +415,83 @@ class LightningModuleRates(pl.LightningModule):
         e_pred = preds["edge_type_head"]
         c_pred = preds["charge_head"]
 
+        do_ins_head = preds["do_ins_head"]
+        ins_rate_pred = preds["ins_rate_head"]
         gmm_pred_dict = preds["gmm_head"]
 
-        ins_rate_pred = preds["ins_rate_head"]
-        del_rate_pred = preds["del_rate_head"]
-        sub_rate_pred_a = preds["sub_rate_a_head"]
-        sub_rate_pred_e = preds["sub_rate_e_head"]
+        do_del_head = preds["do_del_head"]
+        do_sub_a_head = preds["do_sub_a_head"]
+        do_sub_e_head = preds["do_sub_e_head"]
 
-        c_loss = F.cross_entropy(
-            c_pred, mols_1.c, weight=self.charge_token_weights, reduction="none"
+        # Global budget predictions (graph-level classifiers)
+        global_ins_budget_pred = preds.get("global_ins_budget_head", None)
+        global_del_budget_pred = preds.get("global_del_budget_head", None)
+
+        # NOTE charges not in mol_t, so we need to predict them for all atoms
+        pred_all_atoms = torch.ones_like(mols_1.c, dtype=torch.bool)
+        c_loss = self.class_loss(
+            c_pred,
+            mols_1.c,
+            self.charge_token_weights,
+            pred_all_atoms,
+            mols_t.batch,
+            mols_t.num_graphs,
         )
-
-        c_loss = unsorted_segment_mean(
-            c_loss.view(-1, 1), mols_t.batch, mols_t.num_graphs
-        )
-
-        c_loss = c_loss.mean()
 
         # 1. Handle substitutions
 
         #### Handle atom type substitutions
-        # Mask indicating which nodes need to be substituted
-        sub_loss_a_rate, sub_loss_a_class = self.edit_flow_loss(
-            sub_rate_pred_a,
+        do_sub_a_loss = self.do_action_loss(
+            do_sub_a_head, mols_t.lambda_a_sub, mols_t.batch, mols_t.num_graphs
+        )
+        sub_a_class_loss = self.class_loss(
+            a_pred,
+            mols_1.a,
+            self.atom_type_weights,
             mols_t.lambda_a_sub,
             mols_t.batch,
             mols_t.num_graphs,
-            a_pred,
-            mols_1.a,
-            class_weights=self.atom_type_weights,
         )
+        sub_a_loss = do_sub_a_loss + sub_a_class_loss
 
         #### Handle edge type substitutions
         edge_infos = self.edge_aligner.align_edges(
-            source_group=(mols_t.edge_index, [e_pred, sub_rate_pred_e]),
+            source_group=(mols_t.edge_index, [e_pred, do_sub_e_head]),
             target_group=(mols_1.edge_index, [mols_1.e, mols_t.lambda_e_sub]),
         )
         e_batch_triu = mols_t.batch[edge_infos["edge_index"][0][0]]
-        e_pred_triu, sub_rate_pred_e_triu = edge_infos["edge_attr"][:2]
-        e_target_triu, sub_rate_target_e_triu = edge_infos["edge_attr"][2:]
+        e_pred_triu, do_sub_e_head_triu = edge_infos["edge_attr"][:2]
+        e_target_triu, do_sub_e_target_triu = edge_infos["edge_attr"][2:]
 
-        sub_loss_e_rate, sub_loss_e_class = self.edit_flow_loss(
-            sub_rate_pred_e_triu,
-            sub_rate_target_e_triu,
-            e_batch_triu,
-            mols_t.num_graphs,
+        # NOTE As per EditFlow, only count class loss for edges that need modification
+        do_sub_e_loss = self.do_action_loss(
+            do_sub_e_head_triu, do_sub_e_target_triu, e_batch_triu, mols_t.num_graphs
+        )
+        sub_e_class_loss = self.class_loss(
             e_pred_triu,
             e_target_triu,
-            class_weights=self.edge_token_weights,
+            self.edge_token_weights,
+            do_sub_e_target_triu,
+            e_batch_triu,
+            mols_t.num_graphs,
         )
+        sub_e_loss = do_sub_e_loss + sub_e_class_loss
 
         # Compute weighted components for logging using wrapper weights
         weights = self.loss_weight_wrapper.get_weight_tensors(self.device)
 
-        sub_loss_a_weighted = (
-            weights["sub_a_rate"] * sub_loss_a_rate
-            + weights["sub_a_class"] * sub_loss_a_class
-        )
-
-        sub_loss_e_weighted = (
-            weights["sub_e_rate"] * sub_loss_e_rate
-            + weights["sub_e_class"] * sub_loss_e_class
-        )
-        sub_loss_weighted = (
-            sub_loss_a_weighted + sub_loss_e_weighted  # + sub_loss_c_weighted
-        )
+        sub_loss_weighted = sub_a_loss + sub_e_loss
 
         # Log substitution losses with subgroups
         self.log_dict(
             {
-                "loss/sub/a/rate": sub_loss_a_rate,
-                "loss/sub/a/class": sub_loss_a_class,
-                "loss/sub/a/weighted": sub_loss_a_weighted,
-                # "loss/sub/c/rate": sub_loss_c_rate,
-                # "loss/sub/c/class": sub_loss_c_class,
-                # "loss/sub/c/weighted": sub_loss_c_weighted,
-                "loss/sub/e/rate": sub_loss_e_rate,
-                "loss/sub/e/class": sub_loss_e_class,
-                "loss/sub/e/weighted": sub_loss_e_weighted,
-                "loss/sub/weighted": sub_loss_weighted,
+                "loss/sub/a/action": do_sub_a_loss,
+                "loss/sub/a/class": sub_a_class_loss,
+                "loss/sub/a/weighted": sub_a_loss,
+                "loss/sub/e/action": do_sub_e_loss,
+                "loss/sub/e/class": sub_e_class_loss,
+                "loss/sub/e/weighted": sub_e_loss,
+                "loss/sub/weighted": sub_a_loss + sub_e_loss,
                 "loss/sub/c": c_loss,
             },
             prog_bar=False,
@@ -434,35 +499,39 @@ class LightningModuleRates(pl.LightningModule):
         )
 
         del_loss_weighted = torch.tensor(0.0, device=self.device)
-        del_loss = torch.tensor(0.0, device=self.device)
         ins_loss_weighted = torch.tensor(0.0, device=self.device)
         ins_loss_rate = torch.tensor(0.0, device=self.device)
         ins_loss_gmm = torch.tensor(0.0, device=self.device)
         ins_loss_e = torch.tensor(0.0, device=self.device)
         if self.n_atoms_strategy != "fixed":
             # 2. Handle deletions (no class changes here!)
-            del_loss, _ = self.edit_flow_loss(
-                del_rate_pred,
-                mols_t.lambda_del,
-                mols_t.batch,
-                mols_t.num_graphs,
+            do_del_loss = self.do_action_loss(
+                do_del_head, mols_t.lambda_del, mols_t.batch, mols_t.num_graphs
             )
 
             # 3. Handle insertions
-            # mask indicating which nodes are focal for insertion
-            ins_loss_rate, _ = self.edit_flow_loss(
-                ins_rate_pred,
-                mols_t.lambda_ins,
-                mols_t.batch,
-                mols_t.num_graphs,
+            do_ins_loss = self.do_action_loss(
+                do_ins_head, mols_t.lambda_ins, mols_t.batch, mols_t.num_graphs
             )
 
+            # Count number of insertions per node
+            # Initialize with zeros for all nodes
             ins_loss_gmm = torch.tensor(0.0, device=self.device)
             ins_loss_e = torch.tensor(0.0, device=self.device)
 
-            if ins_targets.spawn_node_idx.numel() > 0:
-                # spawn_node_idx: indices of nodes in mol_t that spawn/predict each insertion
-                spawn_node_idx = ins_targets.spawn_node_idx
+            # indices of nodes in mol_t that spawn/predict each insertion
+            spawn_node_idx = ins_targets.spawn_node_idx
+
+            # num_inserts_per_node = torch.zeros(mols_t.num_nodes, device=self.device)
+
+            if spawn_node_idx.numel() > 0:
+                # Count how many insertions each node spawns
+                num_inserts_per_node = mols_t.n_ins
+
+                # mask indicating which nodes are focal for insertion
+                ins_loss_rate = self.rate_loss(
+                    ins_rate_pred, num_inserts_per_node, mols_t.batch, mols_t.num_graphs
+                )
 
                 # mask indicating in which graph we have inserts
                 batch_has_inserts = (
@@ -501,8 +570,7 @@ class LightningModuleRates(pl.LightningModule):
                         ins_targets.batch,
                     )
 
-                # weight the gmm loss by the target rate
-                ins_loss_gmm = gmm_loss.view(-1) * mols_t.lambda_ins[spawn_node_idx]
+                ins_loss_gmm = gmm_loss.view(-1)
 
                 # reduce the loss
                 ins_loss_gmm = unsorted_segment_mean(
@@ -510,15 +578,17 @@ class LightningModuleRates(pl.LightningModule):
                     mols_t.batch[spawn_node_idx],
                     mols_t.num_graphs,
                 )
+
                 ins_loss_gmm = ins_loss_gmm[batch_has_inserts].mean()
 
             # Compute insertion edge loss if available
             # Validate indices are within bounds
-            n_nodes = mols_t.num_nodes
+            # n_nodes = mols_t.num_nodes
             spawn_idx = ins_targets.ins_edge_spawn_idx
             target_idx = ins_targets.ins_edge_target_idx
 
-            if spawn_idx.max() < n_nodes and target_idx.max() < n_nodes:
+            # make sure there are insertions to predict edges for
+            if spawn_idx.numel() > 0 and target_idx.numel() > 0:
                 # Get edge predictions using the insertion edge head
                 ins_edge_logits = self.model.predict_insertion_edges(
                     out_dict=preds,
@@ -528,8 +598,6 @@ class LightningModuleRates(pl.LightningModule):
                     hard_sampling=True,
                 )
                 if ins_edge_logits is not None and ins_edge_logits.numel() > 0:
-                    ins_edge_weights = mols_t.lambda_ins[spawn_idx]
-
                     ins_loss_e = F.cross_entropy(
                         ins_edge_logits,
                         ins_targets.ins_edge_types,
@@ -537,10 +605,8 @@ class LightningModuleRates(pl.LightningModule):
                         reduction="none",
                     )
 
-                    # weight the loss by the target rate
                     # NOTE All inserted edges will have a non-zero target rate
                     # NOTE Therefore no more filtering needed
-                    ins_loss_e = ins_loss_e * ins_edge_weights
 
                     # reduce the loss
                     ins_loss_e = unsorted_segment_mean(
@@ -552,7 +618,7 @@ class LightningModuleRates(pl.LightningModule):
                     ins_loss_e = ins_loss_e[batch_has_inserts].mean()
 
             # Compute weighted components for logging using wrapper weights
-            del_loss_weighted = weights["del_rate"] * del_loss
+            del_loss_weighted = weights["do_del"] * do_del_loss
             ins_loss_weighted = (
                 weights["ins_rate"] * ins_loss_rate
                 + weights["ins_gmm"] * ins_loss_gmm
@@ -562,8 +628,7 @@ class LightningModuleRates(pl.LightningModule):
             # Log insertion and deletion losses with subgroups
             self.log_dict(
                 {
-                    "loss/del/rate": del_loss,
-                    "loss/del/weighted": del_loss_weighted,
+                    "loss/del/action": do_del_loss,
                     "loss/ins/rate": ins_loss_rate,
                     "loss/ins/gmm": ins_loss_gmm,
                     "loss/ins/e": ins_loss_e,
@@ -593,18 +658,61 @@ class LightningModuleRates(pl.LightningModule):
 
         x_loss = x_loss[present_graphs_mask].mean()
 
+        # 4.5 Compute global budget losses (graph-level classifiers)
+        # Target: n_ins_missing and n_del_missing computed during interpolation
+        # These are the counts of insertions/deletions still needed to reach the target
+        global_ins_budget_loss = torch.tensor(0.0, device=self.device)
+        global_del_budget_loss = torch.tensor(0.0, device=self.device)
+
+        if self.n_atoms_strategy != "fixed":
+            # Use precomputed graph-level counts from interpolation
+            # These are automatically batched by PyG as graph-level attributes
+            ins_budget_target = mols_t.n_ins_missing  # Shape: (num_graphs,)
+            del_budget_target = mols_t.n_del_missing  # Shape: (num_graphs,)
+
+            # Compute losses if heads are available
+            if global_ins_budget_pred is not None:
+                global_ins_budget_loss = self.global_budget_loss(
+                    global_ins_budget_pred,
+                    ins_budget_target,
+                    mols_t.num_graphs,
+                )
+
+            if global_del_budget_pred is not None:
+                global_del_budget_loss = self.global_budget_loss(
+                    global_del_budget_pred,
+                    del_budget_target,
+                    mols_t.num_graphs,
+                )
+
+            # Log global budget losses
+            self.log_dict(
+                {
+                    "loss/global_budget/ins": global_ins_budget_loss,
+                    "loss/global_budget/del": global_del_budget_loss,
+                    "stats/ins_budget_target_mean": ins_budget_target.float().mean(),
+                    "stats/del_budget_target_mean": del_budget_target.float().mean(),
+                },
+                prog_bar=False,
+                logger=True,
+            )
+
         # 5. Combine all losses using the unified wrapper
         loss_components = {
-            "sub_a_rate": sub_loss_a_rate,
-            "sub_a_class": sub_loss_a_class,
-            "sub_e_rate": sub_loss_e_rate,
-            "sub_e_class": sub_loss_e_class,
-            "del_rate": del_loss,
+            "do_sub_a": do_sub_a_loss,
+            "sub_a_class": sub_a_class_loss,
+            "do_sub_e": do_sub_e_loss,
+            "sub_e_class": sub_e_class_loss,
+            "do_del": do_del_loss,
+            "do_ins": do_ins_loss,
             "ins_rate": ins_loss_rate,
             "ins_gmm": ins_loss_gmm,
             "ins_e": ins_loss_e,
             "x": x_loss,
             "c": c_loss,
+            # Global budget losses
+            "global_ins_budget": global_ins_budget_loss,
+            "global_del_budget": global_del_budget_loss,
         }
         loss = self.loss_weight_wrapper(loss_components)
 
@@ -612,23 +720,24 @@ class LightningModuleRates(pl.LightningModule):
         if self.loss_weight_wrapper.use_learnable:
             self.log_dict(
                 {
-                    "learnable_weight/sub/a/rate": weights["sub_a_rate"],
+                    "learnable_weight/sub/a/rate": weights["do_sub_a"],
                     "learnable_weight/sub/a/class": weights["sub_a_class"],
-                    "learnable_weight/sub/e/rate": weights["sub_e_rate"],
+                    "learnable_weight/sub/e/rate": weights["do_sub_e"],
                     "learnable_weight/sub/e/class": weights["sub_e_class"],
-                    "learnable_weight/del/rate": weights["del_rate"],
+                    "learnable_weight/del/rate": weights["do_del"],
+                    "learnable_weight/ins/action": weights["do_ins"],
                     "learnable_weight/ins/rate": weights["ins_rate"],
                     "learnable_weight/ins/gmm": weights["ins_gmm"],
                     "learnable_weight/ins/e": weights["ins_e"],
-                    "learnable_weight/x": weights["x"],
-                    "learnable_weight/c": weights["c"],
+                    "learnable_weight/x": weights["l_x"],
+                    "learnable_weight/c": weights["l_c"],
                 },
                 prog_bar=False,
                 logger=True,
             )
 
         # For backward compatibility, compute edit_flow_loss and x_loss_weighted for logging
-        del_loss_weighted = weights["del_rate"] * del_loss
+        del_loss_weighted = weights["do_del"] * do_del_loss
         ins_loss_weighted = (
             weights["ins_rate"] * ins_loss_rate
             + weights["ins_gmm"] * ins_loss_gmm
@@ -685,6 +794,7 @@ class LightningModuleRates(pl.LightningModule):
             except Exception as e:
                 print(f"Error converting molecule to RDKit: {e}")
                 rdkit_mols.append(None)
+
         eval_metrics = calc_metrics_(rdkit_mols, self.metrics)
         print(eval_metrics)
 
@@ -715,9 +825,11 @@ class LightningModuleRates(pl.LightningModule):
         Args:
             batch: Batch of data (for now, we'll use batch size to determine number of graphs)
             batch_idx: Batch index
+            return_traj: If True, return trajectory for each molecule. If False, return final state only.
 
         Returns:
-            Dictionary containing final samples
+            If return_traj is False: MoleculeBatch - final sampled molecules
+            If return_traj is True: List[List[MoleculeData]] - trajectory for each molecule
         """
         self.model.set_inference()
         if self.vocab.atom_tokens is None:
@@ -787,33 +899,110 @@ class LightningModuleRates(pl.LightningModule):
 
             gmm_dict_pred = preds["gmm_head"]
 
-            # Process rates
-            ins_rate_pred = preds["ins_rate_head"]
-            del_rate_pred = preds["del_rate_head"]
-            sub_rate_pred_a = preds["sub_rate_a_head"]
-            sub_rate_pred_e = preds["sub_rate_e_head"]
+            # Extract decision heads (scalar logits, will be passed through sigmoid in integration)
+            do_sub_a_logits = preds["do_sub_a_head"]  # Shape (N, 1) or (N,)
+            do_sub_e_logits = preds["do_sub_e_head"]  # Shape (E, 1) or (E,)
+            do_del_logits = preds["do_del_head"]  # Shape (N, 1) or (N,)
+            do_ins_logits = preds["do_ins_head"]  # Shape (N, 1) or (N,)
+
+            # Ensure logits are 1D
+            if do_sub_a_logits.ndim > 1:
+                do_sub_a_logits = do_sub_a_logits.squeeze(-1)
+            if do_sub_e_logits.ndim > 1:
+                do_sub_e_logits = do_sub_e_logits.squeeze(-1)
+            if do_del_logits.ndim > 1:
+                do_del_logits = do_del_logits.squeeze(-1)
+            if do_ins_logits.ndim > 1:
+                do_ins_logits = do_ins_logits.squeeze(-1)
+
+            # Apply sigmoid to convert logits to probabilities
+            do_sub_a_probs = torch.sigmoid(do_sub_a_logits)
+            do_sub_e_probs = torch.sigmoid(do_sub_e_logits)
+            do_del_probs = torch.sigmoid(do_del_logits)
+            do_ins_probs = torch.sigmoid(do_ins_logits)
+
+            # Extract insertion rate prediction (number of insertions per node)
+            # Note: do_ins is computed inside integrate_step_gnn from num_ins_pred
+            ins_rate_output = preds["ins_rate_head"]  # Shape depends on strategy
+
+            if self.ins_rate_strategy == "classification":
+                # Classification: sample from categorical distribution
+                # ins_rate_output shape: (N, num_classes) - logits
+                ins_probs = F.softmax(ins_rate_output, dim=-1)
+                num_ins_pred = (
+                    torch.distributions.Categorical(probs=ins_probs).sample().float()
+                )
+            else:
+                # Poisson: use the predicted rate directly
+                num_ins_pred = ins_rate_output  # Shape (N, 1) or (N,)
+                # Ensure num_ins_pred has correct shape
+                if num_ins_pred.ndim > 1:
+                    num_ins_pred = num_ins_pred.squeeze(-1)
 
             # if we fix the number of atoms, we will not use the jump process
             if self.n_atoms_strategy == "fixed":
-                ins_rate_pred = torch.zeros_like(ins_rate_pred)
-                del_rate_pred = torch.zeros_like(del_rate_pred)
+                num_ins_pred = torch.zeros_like(num_ins_pred)
+                do_del_probs = torch.zeros_like(do_del_probs)
 
             # Get insertion edge head if available
             ins_edge_head = getattr(self.model, "ins_edge_head", None)
 
+            # Extract global insertion budget prediction (graph-level)
+            global_ins_budget = None
+            global_ins_budget_logits = preds.get("global_ins_budget_head", None)
+            if (
+                global_ins_budget_logits is not None
+                and self.n_atoms_strategy != "fixed"
+            ):
+                # TODO add temperature sampling to take higher confidence predictions
+                temperature = 0.7
+                global_ins_budget_logits = global_ins_budget_logits / temperature
+
+                # Sample from categorical distribution to get the predicted budget
+                ins_budget_probs = F.softmax(global_ins_budget_logits, dim=-1)
+                global_ins_budget = (
+                    torch.distributions.Categorical(probs=ins_budget_probs)
+                    .sample()
+                    .float()
+                )  # Shape: (num_graphs,)
+
+            global_del_budget = None
+            global_del_budget_logits = preds.get("global_del_budget_head", None)
+            if (
+                global_del_budget_logits is not None
+                and self.n_atoms_strategy != "fixed"
+            ):
+                # TODO add temperature sampling to take higher confidence predictions
+                temperature = 0.7
+                global_del_budget_logits = global_del_budget_logits / temperature
+
+                # Sample from categorical distribution to get the predicted budget
+                del_budget_probs = F.softmax(global_del_budget_logits, dim=-1)
+                global_del_budget = (
+                    torch.distributions.Categorical(probs=del_budget_probs)
+                    .sample()
+                    .float()
+                )  # Shape: (num_graphs,)
+
+            # print(global_del_budget)
+
             # Integrate one step (edge prediction happens inside if head is provided)
+            # Note: do_ins is computed inside integrate_step_gnn from num_ins_pred or global_ins_budget
             mol_t = self.integrator.integrate_step_gnn(
                 mol_t=mol_t.clone(),
                 mol_1_pred=mol_1_pred.clone(),
-                sub_rate_a=sub_rate_pred_a,
-                sub_rate_e=sub_rate_pred_e,
-                del_rate=del_rate_pred,
-                ins_rate=ins_rate_pred,
+                do_sub_a_probs=do_sub_a_probs,
+                do_sub_e_probs=do_sub_e_probs,
+                do_del_probs=do_del_probs,
+                do_ins_probs=do_ins_probs,
+                num_ins_pred=num_ins_pred,
                 ins_gmm_preds=gmm_dict_pred,
                 t=t,
                 dt=step_size,
                 h_latent=preds.get("h_latent"),
                 ins_edge_head=ins_edge_head,
+                global_ins_budget=global_ins_budget,
+                global_del_budget=global_del_budget,
             )
 
             # Validate: check for cross-batch edges after integration step
@@ -830,22 +1019,12 @@ class LightningModuleRates(pl.LightningModule):
             # Number of graphs stays constant (batch_size)
             t = t + step_size
 
-            if torch.all(t >= 1.0):
-                # correct the coordinates
-                mol_1_pred_cloned = mol_1_pred.clone()
-                mol_1_pred_cloned.x = (
-                    mol_1_pred_cloned.x * self.distributions.coordinate_std
-                )
+            # correct the coordinates
+            mol_t_cloned = mol_t.clone()
+            mol_t_cloned.x = mol_t_cloned.x * self.distributions.coordinate_std
 
-                # save final predicted state to trajectory
-                mol_traj.append(mol_1_pred_cloned)
-            else:
-                # correct the coordinates
-                mol_t_cloned = mol_t.clone()
-                mol_t_cloned.x = mol_t_cloned.x * self.distributions.coordinate_std
-
-                # Save  state to trajectory
-                mol_traj.append(mol_t_cloned)
+            # Save  state to trajectory
+            mol_traj.append(mol_t_cloned)
 
         if return_traj:
             # rectify the trajectory such that we get a traj for each molecule
@@ -853,8 +1032,8 @@ class LightningModuleRates(pl.LightningModule):
 
             traj_per_mol = [[] for _ in range(batch_size)]
             for i in range(batch_size):
-                for mol_t in traj_lists:
-                    traj_per_mol[i].append(mol_t[i])
+                for mol_traj_i in traj_lists:
+                    traj_per_mol[i].append(mol_traj_i[i])
 
             # Return results
             return traj_per_mol
