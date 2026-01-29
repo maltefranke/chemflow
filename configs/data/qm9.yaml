@@ -3,12 +3,12 @@
 root_path: ${oc.env:PROJECT_ROOT}/data
 preprocess_workers: 0
 
-n_atoms_strategy: "flexible" # "fixed"
+n_atoms_strategy: "flexible" # "fixed", "approx"
 cat_strategy: "uniform-sample" #"mask" # "uniform-sample"
 optimal_transport: "equivariant"
 ins_noise_scale: 0.5
-t_end_del: 0.95
-t_end_ins: 0.95
+# t_end_del: 0.975
+#t_end_ins: 0.975
 
 # Preprocessing configuration - computes tokens from data and distributions from training dataset only
 preprocessing:
@@ -32,8 +32,8 @@ interpolator:
   distributions: None
   optimal_transport: ${data.optimal_transport}
   ins_noise_scale: ${data.ins_noise_scale}
-  t_end_del: ${data.t_end_del}
-  t_end_ins: ${data.t_end_ins}
+  #t_end_del: ${data.t_end_del}
+  #t_end_ins: ${data.t_end_ins}
 
 datamodule:
   _target_: chemflow.dataset.lightning_datamodule.LightningDataModule

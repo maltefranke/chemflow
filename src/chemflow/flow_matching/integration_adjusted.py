@@ -19,7 +19,7 @@ from chemflow.dataset.molecule_data import (
     filter_nodes,
 )
 from chemflow.dataset.vocab import Vocab, Distributions
-from chemflow.flow_matching.schedules import BetaSchedule
+from chemflow.flow_matching.schedules import FastPowerSchedule
 
 
 class RateIntegrator:
@@ -52,8 +52,8 @@ class RateIntegrator:
         time_strategy="log",
         t_end_ins=1.0,
         t_end_del=1.0,
-        del_schedule: BetaSchedule = None,
-        ins_schedule: BetaSchedule = None,
+        del_schedule: FastPowerSchedule = None,
+        ins_schedule: FastPowerSchedule = None,
         device="cuda" if torch.cuda.is_available() else "cpu",
     ):
         self.vocab = vocab
@@ -69,12 +69,12 @@ class RateIntegrator:
         self.t_end_del = t_end_del
 
         if del_schedule is None:
-            self.del_schedule = BetaSchedule(k_alpha=1.0, k_beta=1.5)
+            self.del_schedule = FastPowerSchedule(beta=1.5)
         else:
             self.del_schedule = del_schedule
 
         if ins_schedule is None:
-            self.ins_schedule = BetaSchedule(k_alpha=1.0, k_beta=1.5)
+            self.ins_schedule = FastPowerSchedule(beta=1.5)
         else:
             self.ins_schedule = ins_schedule
 

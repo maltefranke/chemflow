@@ -18,10 +18,10 @@ integrator:
   cat_strategy: ${data.cat_strategy}
   n_atoms_strategy: ${data.n_atoms_strategy}
   #ins_rate_strategy: ${model.ins_rate_strategy}
-  time_strategy: log # "linear" or "log"
+  time_strategy: linear # "linear" or "log"
   num_integration_steps: 200
-  t_end_ins: ${data.t_end_ins}
-  t_end_del: ${data.t_end_del}
+  # t_end_ins: ${data.t_end_ins}
+  # t_end_del: ${data.t_end_del}
 
 beta_sched:
   # Beta distribution for time scheduling. 1.0 , 1.0 is equivalent to uniform distribution.
