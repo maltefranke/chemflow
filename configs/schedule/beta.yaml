@@ -1,0 +1,3 @@
+_target_: chemflow.flow_matching.schedules.BetaSchedule
+k_alpha: 1.0
+k_beta: 1.5

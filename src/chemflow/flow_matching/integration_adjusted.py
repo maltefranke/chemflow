@@ -19,7 +19,7 @@ from chemflow.dataset.molecule_data import (
     filter_nodes,
 )
 from chemflow.dataset.vocab import Vocab, Distributions
-from chemflow.flow_matching.schedules import FastPowerSchedule
+from chemflow.flow_matching.schedules import FastPowerSchedule, KappaSchedule
 
 
 class RateIntegrator:
@@ -50,10 +50,8 @@ class RateIntegrator:
         n_atoms_strategy="flexible",
         num_integration_steps=100,
         time_strategy="log",
-        t_end_ins=1.0,
-        t_end_del=1.0,
-        del_schedule: FastPowerSchedule = None,
-        ins_schedule: FastPowerSchedule = None,
+        del_schedule: KappaSchedule | None = None,
+        ins_schedule: KappaSchedule | None = None,
         device="cuda" if torch.cuda.is_available() else "cpu",
     ):
         self.vocab = vocab
@@ -65,16 +63,13 @@ class RateIntegrator:
         self.num_integration_steps = num_integration_steps
         self.device = device
 
-        self.t_end_ins = t_end_ins
-        self.t_end_del = t_end_del
-
         if del_schedule is None:
-            self.del_schedule = FastPowerSchedule(beta=1.5)
+            self.del_schedule = FastPowerSchedule(beta=2.5)
         else:
             self.del_schedule = del_schedule
 
         if ins_schedule is None:
-            self.ins_schedule = FastPowerSchedule(beta=1.5)
+            self.ins_schedule = FastPowerSchedule(beta=2.5)
         else:
             self.ins_schedule = ins_schedule
 
@@ -287,22 +282,12 @@ class RateIntegrator:
         rate_node = rate[batch_id]
 
         # graph-wise rate for insertion
-        """ins_rate = torch.where(
-            t < self.t_end_ins,
-            1 / (self.t_end_ins - t).clamp(min=eps, max=1.0 - eps),
-            torch.tensor(0.0, device=t.device, dtype=t.dtype),
-        )"""
         ins_rate = self.ins_schedule.rate(t)
+        ins_rate_node = ins_rate[batch_id]
 
         # node-wise rate for deletion
-        """del_rate = torch.where(
-            t < self.t_end_del,
-            1 / (self.t_end_del - t).clamp(min=eps, max=1.0 - eps),
-            torch.tensor(0.0, device=t.device, dtype=t.dtype),
-        )
-        del_rate = del_rate[batch_id]"""
         del_rate = self.del_schedule.rate(t)
-        del_rate = del_rate[batch_id]
+        del_rate_node = del_rate[batch_id]
 
         # 1. Update positions (Euler-Maruyama scheme)
 
@@ -369,57 +354,15 @@ class RateIntegrator:
             do_ins = torch.rand_like(p_ins) < p_ins
 
             # for insertion, we will then sample from the poisson distribution
-            ins_rate = num_ins_pred * ins_rate[batch_id] * dt
-            num_ins = torch.poisson(ins_rate)
+            expected_num_ins = num_ins_pred * ins_rate_node * dt
+            num_ins = torch.poisson(expected_num_ins)
             do_ins = do_ins & (num_ins > 0)
 
-        """# 2. Deletion OR Substitution
-
-        # Use probabilities directly (sigmoid already applied in sample())
-        p_sub_a = do_sub_a_probs.view(-1)
-        do_sub_a = torch.rand_like(p_sub_a) < p_sub_a
-
-        p_del = do_del_probs.view(-1)
-        do_del = torch.rand_like(p_del) < p_del
-
-        p_mod = rate_node * dt
-        p_mod = p_mod.view(-1)
-
-        # independently decide on deletion and substitution
-        do_mod_sub = torch.rand_like(p_mod) < p_mod
-        do_mod_del = torch.rand_like(p_mod) < p_mod
-
-        # We gate the modification via the predicted mask
-        do_sub_a = do_sub_a & do_mod_sub
-        do_del = do_del & do_mod_del
-
-        conflict_mask = do_del & do_sub_a
-
-        # Only process the positions where a modification actually occurred
-        # This saves computation and strictly follows the "exclusive" logic
-        if conflict_mask.any():
-            # Select del with p = lambda_del / (lambda_del + lambda_sub)
-            # Extract rates only for the active indices using boolean indexing (like original)
-            curr_p_del = p_del[conflict_mask]
-            curr_p_sub_a = p_sub_a[conflict_mask]
-            p_mod_tot = curr_p_del + curr_p_sub_a
-
-            p_cond_del = curr_p_del / (p_mod_tot + 1e-8)
-
-            # Sample the decision
-            is_deletion = torch.rand_like(p_cond_del) < p_cond_del
-
-            # Assign back to the main masks
-            do_del[conflict_mask] = is_deletion
-            do_sub_a[conflict_mask] = ~is_deletion
-
-        # Do substitution
-        a[do_sub_a] = a_1[do_sub_a]"""
-
+        """DELETION or SUBSTITUTION"""
         # 1. Scale probabilities by time (converting prob -> rate * dt)
         # rate_node is 1 / (1 - t)
         p_sub_scaled = do_sub_a_probs.view(-1) * rate_node * dt
-        p_del_scaled = do_del_probs.view(-1) * del_rate * dt
+        p_del_scaled = do_del_probs.view(-1) * del_rate_node * dt
 
         # 2. Sum rates first (Paper Formulation)
         # "probability of ANY edit is h(lambda_sub + lambda_del)"
@@ -505,6 +448,20 @@ class RateIntegrator:
             # Build index mapping: original_idx -> post_deletion_idx (or -1 if deleted)
             N_original = mol.num_nodes
             keep_mask = ~do_del
+
+            # Fail-safe: prevent deletion of entire sample (keep at least 2 nodes per batch_id)
+            num_graphs_safe = batch_id.max().item() + 1
+            for g in range(num_graphs_safe):
+                graph_mask = batch_id == g
+                n_kept = (keep_mask & graph_mask).sum().item()
+                if n_kept < 2:
+                    n_to_restore = 2 - n_kept
+                    deleted_in_graph_idx = torch.where(graph_mask & do_del)[0]
+                    n_restore = min(n_to_restore, deleted_in_graph_idx.shape[0])
+                    if n_restore > 0:
+                        restore_indices = deleted_in_graph_idx[:n_restore]
+                        keep_mask[restore_indices] = True
+
             original_to_postdel = torch.full(
                 (N_original,), -1, dtype=torch.long, device=self.device
             )

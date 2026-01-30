@@ -1,7 +1,8 @@
 defaults:
   - _self_
   - data: qm9
-  - model: egnn_qm9
+  - model: egnn_adjusted_qm9
+  - schedule: fast_power
   - trainer: trainer
   - callbacks: callbacks
   - logging: wandb_logger

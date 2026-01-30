@@ -32,8 +32,8 @@ interpolator:
   distributions: None
   optimal_transport: ${data.optimal_transport}
   ins_noise_scale: ${data.ins_noise_scale}
-  #t_end_del: ${data.t_end_del}
-  #t_end_ins: ${data.t_end_ins}
+  del_schedule: ${schedule}
+  ins_schedule: ${schedule}
 
 datamodule:
   _target_: chemflow.dataset.lightning_datamodule.LightningDataModule

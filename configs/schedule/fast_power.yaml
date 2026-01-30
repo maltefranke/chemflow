@@ -1,0 +1,3 @@
+# Default kappa schedule: FastPowerSchedule with beta=2.5
+_target_: chemflow.flow_matching.schedules.FastPowerSchedule
+beta: 2.5

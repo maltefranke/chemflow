@@ -1,10 +1,36 @@
+from abc import ABC, abstractmethod
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
 from scipy.stats import beta
 
 
-class BetaSchedule(nn.Module):
+class KappaSchedule(nn.Module, ABC):
+    """
+    Abstract base class for flow-matching time schedules (kappa schedules).
+
+    A schedule maps time t in [0, 1] to kappa(t) (CDF) and provides the rate
+    kappa'(t) / (1 - kappa(t)) used in rate-based flow matching.
+    """
+
+    @abstractmethod
+    def kappa_t(self, t: torch.Tensor) -> torch.Tensor:
+        """Maps t to kappa(t) (CDF)."""
+        ...
+
+    @abstractmethod
+    def kappa_t_dot(self, t: torch.Tensor) -> torch.Tensor:
+        """Derivative of kappa w.r.t. t (PDF)."""
+        ...
+
+    @abstractmethod
+    def rate(self, t: torch.Tensor, epsilon: float = 1e-6) -> torch.Tensor:
+        """Rate: kappa_t_dot(t) / (1 - kappa_t(t))."""
+        ...
+
+
+class BetaSchedule(KappaSchedule):
     def __init__(self, k_alpha: float, k_beta: float):
         """
         Beta schedule using scipy.stats for guaranteed stability.
@@ -59,7 +85,7 @@ class BetaSchedule(nn.Module):
         return k_t_dot / denominator
 
 
-class CubicSchedule(nn.Module):
+class CubicSchedule(KappaSchedule):
     def __init__(self):
         super().__init__()
 
@@ -69,11 +95,12 @@ class CubicSchedule(nn.Module):
     def kappa_t_dot(self, t: torch.Tensor) -> torch.Tensor:
         return 3 * t**2
 
-    def rate(self, t: torch.Tensor) -> torch.Tensor:
-        return 3 * t**2 / (1 - t**3)
+    def rate(self, t: torch.Tensor, epsilon: float = 1e-6) -> torch.Tensor:
+        denom = torch.clamp(1 - t**3, min=epsilon)
+        return 3 * t**2 / denom
 
 
-class LinearSchedule(nn.Module):
+class LinearSchedule(KappaSchedule):
     def __init__(self):
         super().__init__()
 
@@ -83,11 +110,12 @@ class LinearSchedule(nn.Module):
     def kappa_t_dot(self, t: torch.Tensor) -> torch.Tensor:
         return 1
 
-    def rate(self, t: torch.Tensor) -> torch.Tensor:
-        return 1 / (1 - t)
+    def rate(self, t: torch.Tensor, epsilon: float = 1e-6) -> torch.Tensor:
+        denom = torch.clamp(1 - t, min=epsilon)
+        return 1 / denom
 
 
-class FastPowerSchedule(nn.Module):
+class FastPowerSchedule(KappaSchedule):
     """
     Optimized Beta Schedule specifically for Alpha=1.0
     """

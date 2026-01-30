@@ -232,6 +232,7 @@ class LightningModuleRates(pl.LightningModule):
         num_total = do_action.shape[0]
         num_no_action = num_total - num_total_actions
 
+        # TODO we could add an exponential moving averate of the pos weight for stability
         pos_weight = num_no_action / num_total_actions if num_total_actions > 0 else 1.0
         pos_weight = torch.tensor(pos_weight, device=self.device)
 
@@ -581,14 +582,29 @@ class LightningModuleRates(pl.LightningModule):
 
                 ins_loss_gmm = ins_loss_gmm[batch_has_inserts].mean()
 
-            # Compute insertion edge loss if available
-            # Validate indices are within bounds
-            # n_nodes = mols_t.num_nodes
-            spawn_idx = ins_targets.ins_edge_spawn_idx
-            target_idx = ins_targets.ins_edge_target_idx
+                self.log_dict(
+                    {
+                        "loss/ins/gmm": ins_loss_gmm,
+                        "loss/ins/gmm_weighted": weights["ins_gmm"] * ins_loss_gmm,
+                    },
+                    prog_bar=False,
+                    logger=True,
+                )
 
-            # make sure there are insertions to predict edges for
-            if spawn_idx.numel() > 0 and target_idx.numel() > 0:
+                # Compute insertion edge loss if available
+                # Validate indices are within bounds
+                # n_nodes = mols_t.num_nodes
+                spawn_idx = ins_targets.ins_edge_spawn_idx
+                target_idx = ins_targets.ins_edge_target_idx
+
+                # make sure there are insertions to predict edges for
+                assert spawn_idx.numel() > 0, (
+                    "No insertions spawn points to predict edges for"
+                )
+                assert target_idx.numel() > 0, (
+                    "No insertions target points to predict edges for"
+                )
+
                 # Get edge predictions using the insertion edge head
                 ins_edge_logits = self.model.predict_insertion_edges(
                     out_dict=preds,
@@ -617,25 +633,33 @@ class LightningModuleRates(pl.LightningModule):
 
                     ins_loss_e = ins_loss_e[batch_has_inserts].mean()
 
-            # Compute weighted components for logging using wrapper weights
-            del_loss_weighted = weights["do_del"] * do_del_loss
-            ins_loss_weighted = (
-                weights["ins_rate"] * ins_loss_rate
-                + weights["ins_gmm"] * ins_loss_gmm
-                + weights["ins_e"] * ins_loss_e
-            )
+                    self.log_dict(
+                        {
+                            "loss/ins/e": ins_loss_e,
+                            "loss/ins/e_weighted": weights["ins_e"] * ins_loss_e,
+                        },
+                        prog_bar=False,
+                        logger=True,
+                    )
+
+            else:
+                # NOTE edge_head and gmm_head unused, throws an error (unused_params)
+                # NOTE therefore we add a dummy loss wrt. edge_head and gmm_head
+                edge_head_loss = sum(
+                    p.sum() for p in self.model.ins_edge_head.parameters()
+                )
+                gmm_head_loss = sum(
+                    p.sum() for p in self.model.ins_gmm_head.parameters()
+                )
+                ins_loss_e = 0.0 * edge_head_loss
+                ins_loss_gmm = 0.0 * gmm_head_loss
 
             # Log insertion and deletion losses with subgroups
             self.log_dict(
                 {
                     "loss/del/action": do_del_loss,
                     "loss/ins/rate": ins_loss_rate,
-                    "loss/ins/gmm": ins_loss_gmm,
-                    "loss/ins/e": ins_loss_e,
-                    "loss/ins/weighted": ins_loss_weighted,
                     "loss/ins/rate_weighted": weights["ins_rate"] * ins_loss_rate,
-                    "loss/ins/gmm_weighted": weights["ins_gmm"] * ins_loss_gmm,
-                    "loss/ins/e_weighted": weights["ins_e"] * ins_loss_e,
                 },
                 prog_bar=False,
                 logger=True,
@@ -643,6 +667,7 @@ class LightningModuleRates(pl.LightningModule):
 
         # 4. Calculate the flow matching loss
         # Only compute the loss for nodes that are not to be deleted
+        # TODO edge case all deletes would lead to unused params error, but is highly unlikely
         to_delete_mask = mols_t.lambda_del > 0.0
         x_loss = F.mse_loss(
             x_pred[~to_delete_mask], mols_1.x[~to_delete_mask], reduction="none"
@@ -695,6 +720,13 @@ class LightningModuleRates(pl.LightningModule):
                 },
                 prog_bar=False,
                 logger=True,
+            )
+        else:
+            global_ins_budget_loss = 0.0 * sum(
+                p.sum() for p in self.model.global_ins_budget_head.parameters()
+            )
+            global_del_budget_loss = 0.0 * sum(
+                p.sum() for p in self.model.global_del_budget_head.parameters()
             )
 
         # 5. Combine all losses using the unified wrapper

@@ -22,7 +22,7 @@ from chemflow.dataset.molecule_data import (
 
 from chemflow.dataset.vocab import Vocab, Distributions
 
-from chemflow.flow_matching.schedules import FastPowerSchedule
+from chemflow.flow_matching.schedules import FastPowerSchedule, KappaSchedule
 
 
 class Interpolator:
@@ -34,8 +34,8 @@ class Interpolator:
         n_atoms_strategy="flexible",
         optimal_transport="equivariant",
         ins_noise_scale=1.0,
-        ins_schedule: FastPowerSchedule = None,
-        del_schedule: FastPowerSchedule = None,
+        ins_schedule: KappaSchedule | None = None,
+        del_schedule: KappaSchedule | None = None,
         c_move=1.0,
         c_sub=0.0,
         c_ins=1e8,
@@ -49,12 +49,12 @@ class Interpolator:
         self.ins_noise_scale = ins_noise_scale
 
         if del_schedule is None:
-            self.del_schedule = FastPowerSchedule(beta=1.5)
+            self.del_schedule = FastPowerSchedule(beta=2.5)
         else:
             self.del_schedule = del_schedule
 
         if ins_schedule is None:
-            self.ins_schedule = FastPowerSchedule(beta=1.5)
+            self.ins_schedule = FastPowerSchedule(beta=2.5)
         else:
             self.ins_schedule = ins_schedule
 
@@ -204,37 +204,28 @@ class Interpolator:
             # We will do substitution during the whole interpolation.
             inst_rate_sub = 1 / torch.clamp(1 - t_i, min=1e-8)
 
-            # Only do deletion and insertions until some threshold t_end.
-            # NOTE: if t_i > t_end, rates will be 0, so inst_rate is irrelevant.
-            # tau_del = torch.rand(N, 1, device=device) * self.t_end_del
-            # inst_rate_del = 1 / torch.clamp(self.t_end_del - t_i, min=1e-8)
-
             tau_del = torch.rand(N, 1, device=device)
             t_del = self.del_schedule.kappa_t(t_i)
             inst_rate_del = self.del_schedule.rate(t_i)
-
-            # tau_ins = torch.rand(N, 1, device=device) * self.t_end_ins
-            # inst_rate_ins = 1 / torch.clamp(self.t_end_ins - t_i, min=1e-8)
 
             tau_ins = torch.rand(N, 1, device=device)
             t_ins = self.ins_schedule.kappa_t(t_i)
             inst_rate_ins = self.ins_schedule.rate(t_i)
 
-            # Determine distinct states based on t
-            # Alive Substitute: Always active
-            # Alive Delete: Active if t < tau (needs to be deleted)
-            # Alive Insert: Active if t > tau (has been inserted)
-
+            # Substitution nodes (always active)
             mask_keep_sub = is_sub
+
+            # Deletion nodes that have not been deleted yet
             mask_keep_del = is_del & (t_del < tau_del).squeeze()
+
+            # Insertion nodes that have already been inserted
             mask_keep_ins = is_ins & (t_ins > tau_ins).squeeze()
+
+            # Future insertion nodes waiting to be born
+            mask_future_ins = is_ins & (t_ins <= tau_ins).squeeze()
 
             # The mask of all nodes that exist in the INTERPOLATED state
             mask_exists = mask_keep_sub | mask_keep_del | mask_keep_ins
-
-            # Future Birth: Inactive now (t < tau), but will be born later
-            # The mask for nodes that are WAITING to be born
-            mask_future_ins = is_ins & (t_ins <= tau_ins).squeeze()
 
             # --- 4. Interpolation Logic ---
 

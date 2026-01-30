@@ -20,8 +20,9 @@ integrator:
   #ins_rate_strategy: ${model.ins_rate_strategy}
   time_strategy: linear # "linear" or "log"
   num_integration_steps: 200
-  # t_end_ins: ${data.t_end_ins}
-  # t_end_del: ${data.t_end_del}
+  del_schedule: ${data.interpolator.del_schedule}
+  ins_schedule: ${data.interpolator.ins_schedule}
+  
 
 beta_sched:
   # Beta distribution for time scheduling. 1.0 , 1.0 is equivalent to uniform distribution.
