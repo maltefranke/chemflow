@@ -22,6 +22,32 @@ from chemflow.model.learnable_loss import UnifiedWeightedLoss
 
 
 class LightningModuleRates(pl.LightningModule):
+    """
+    This model implements an EditFlow model with adjustments for stability inspired by OneFlow.
+    Crucially, we do not use the rate k_t_dot / (1 - k_t) directly in the formulation.
+
+    Specifically, we have the following adjustments:
+    - Insertion:
+            Binary predictor (do insert or not?)
+            Rate predictor (how many insertions per node?) for nodes requiring insertions.
+                This can either be a classifier (CE loss) or a Poisson regression (Poisson NLL loss).
+            GMM predictor (what atom type, charge and where)
+            Edge predictor (what edge type and where) depending on GMM predictions.
+                Is realized via Gumbel-Softmax trick to differentiate through sampling
+    - Deletion:
+            Binary predictor (do delete or not?) for nodes that require deletions.
+    - Substitution:
+            Binary predictor (do substitute or not?) for nodes that require substitutions.
+            Atom type and edge type predictor (what atom type, charge and edge type and where)
+
+    - Charge prediction
+    - Position prediction
+
+    For regularization:
+    - Number of deletions predicted globally for each graph.
+    - Number of insertions predicted globally for each graph.
+    """
+
     def __init__(
         self,
         model: DictConfig = None,
@@ -505,6 +531,8 @@ class LightningModuleRates(pl.LightningModule):
         ins_loss_gmm = torch.tensor(0.0, device=self.device)
         ins_loss_e = torch.tensor(0.0, device=self.device)
         if self.n_atoms_strategy != "fixed":
+            # TODO maybe we should weight the deletion loss and insertion loss by their number of deletions and insertions?
+            # TODO e.g. w = n_del / (n_del + n_ins)
             # 2. Handle deletions (no class changes here!)
             do_del_loss = self.do_action_loss(
                 do_del_head, mols_t.lambda_del, mols_t.batch, mols_t.num_graphs
@@ -667,7 +695,7 @@ class LightningModuleRates(pl.LightningModule):
 
         # 4. Calculate the flow matching loss
         # Only compute the loss for nodes that are not to be deleted
-        # TODO edge case all deletes would lead to unused params error, but is highly unlikely
+        # NOTE Edge case all deletes would lead to unused params error, but is highly unlikely
         to_delete_mask = mols_t.lambda_del > 0.0
         x_loss = F.mse_loss(
             x_pred[~to_delete_mask], mols_1.x[~to_delete_mask], reduction="none"
@@ -986,7 +1014,7 @@ class LightningModuleRates(pl.LightningModule):
                 global_ins_budget_logits is not None
                 and self.n_atoms_strategy != "fixed"
             ):
-                # TODO add temperature sampling to take higher confidence predictions
+                # TODO make temperature sampling hyperparam
                 temperature = 0.7
                 global_ins_budget_logits = global_ins_budget_logits / temperature
 
@@ -1004,7 +1032,7 @@ class LightningModuleRates(pl.LightningModule):
                 global_del_budget_logits is not None
                 and self.n_atoms_strategy != "fixed"
             ):
-                # TODO add temperature sampling to take higher confidence predictions
+                # TODO make temperature sampling hyperparam
                 temperature = 0.7
                 global_del_budget_logits = global_del_budget_logits / temperature
 

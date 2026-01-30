@@ -359,6 +359,9 @@ class RateIntegrator:
             do_ins = do_ins & (num_ins > 0)
 
         """DELETION or SUBSTITUTION"""
+        # TODO implement multinomial sampling for deletion like above for insertions
+        # TODO this should take into account the logic below (conflicts with substitution)
+
         # 1. Scale probabilities by time (converting prob -> rate * dt)
         # rate_node is 1 / (1 - t)
         p_sub_scaled = do_sub_a_probs.view(-1) * rate_node * dt

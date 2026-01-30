@@ -261,6 +261,7 @@ class LightningModuleRates(pl.LightningModule):
         )
 
         # Rate Loss Calculation
+        # TODO need to double check if target_rate is the actual rate, or number of actions
         rate_loss = F.poisson_nll_loss(
             rate_pred.view(-1),
             target_rate.view(-1),
@@ -276,7 +277,7 @@ class LightningModuleRates(pl.LightningModule):
         # Class Loss Calculation
         class_loss_val = torch.tensor(0.0, device=self.device)
 
-        if class_pred is not None and class_target is not None:
+        if class_pred is not None and class_target is not None:  # noqa: SIM102
             # 1. Slice: Only process nodes that are actually modified
             # This makes the operation O(N_modified) instead of O(N_total)
             if is_modified.any():
@@ -440,10 +441,11 @@ class LightningModuleRates(pl.LightningModule):
         ins_loss_gmm = torch.tensor(0.0, device=self.device)
         ins_loss_e = torch.tensor(0.0, device=self.device)
         if self.n_atoms_strategy != "fixed":
+            # TODO need to add weighting between deletion and insertion loss
             # 2. Handle deletions (no class changes here!)
             del_loss, _ = self.edit_flow_loss(
                 del_rate_pred,
-                mols_t.lambda_del,
+                mols_t.lambda_del,  # TODO rate or number of actions?
                 mols_t.batch,
                 mols_t.num_graphs,
             )
@@ -452,7 +454,7 @@ class LightningModuleRates(pl.LightningModule):
             # mask indicating which nodes are focal for insertion
             ins_loss_rate, _ = self.edit_flow_loss(
                 ins_rate_pred,
-                mols_t.lambda_ins,
+                mols_t.lambda_ins,  # TODO rate or number of actions?
                 mols_t.batch,
                 mols_t.num_graphs,
             )
@@ -460,6 +462,7 @@ class LightningModuleRates(pl.LightningModule):
             ins_loss_gmm = torch.tensor(0.0, device=self.device)
             ins_loss_e = torch.tensor(0.0, device=self.device)
 
+            # TODO need to add fail-safe for no insertions like in the adjusted model
             if ins_targets.spawn_node_idx.numel() > 0:
                 # spawn_node_idx: indices of nodes in mol_t that spawn/predict each insertion
                 spawn_node_idx = ins_targets.spawn_node_idx

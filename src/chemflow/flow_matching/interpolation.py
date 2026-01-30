@@ -48,6 +48,8 @@ class Interpolator:
         self.optimal_transport = optimal_transport
         self.ins_noise_scale = ins_noise_scale
 
+        # TODO could add a schedule for substitution (node, edge) and positions
+
         if del_schedule is None:
             self.del_schedule = FastPowerSchedule(beta=2.5)
         else:
@@ -195,13 +197,10 @@ class Interpolator:
             is_del = is_del.squeeze()
             is_ins = is_ins.squeeze()
 
-            # Sanity check: Dummies mapping to Dummies should have been filtered by OT already,
-            # but we can ignore them safely via these masks.
-
             # --- 3. Scheduling (Vectorized) ---
-            # Assign a random event time tau_i ~ U[0,t_end] to every node.
+            # Assign a random event time tau_i ~ U[0,1] to every node.
+            # We then determine if the event happens with kappa_t.
 
-            # We will do substitution during the whole interpolation.
             inst_rate_sub = 1 / torch.clamp(1 - t_i, min=1e-8)
 
             tau_del = torch.rand(N, 1, device=device)
@@ -212,6 +211,10 @@ class Interpolator:
             t_ins = self.ins_schedule.kappa_t(t_i)
             inst_rate_ins = self.ins_schedule.rate(t_i)
 
+            """
+            The following masks are used to determine:
+            Which nodes are present in the interpolated state and which are not.
+            """
             # Substitution nodes (always active)
             mask_keep_sub = is_sub
 
@@ -240,7 +243,7 @@ class Interpolator:
             if mask_keep_ins.any():
                 n_ins = mask_keep_ins.sum()
 
-                # Once born, they appear around the target position
+                # Once born, they appear around the target position w/ shrinking variance
                 # NOTE this will likely break the optimal transport!
                 sample.x[mask_keep_ins] = (
                     target.x[mask_keep_ins]
