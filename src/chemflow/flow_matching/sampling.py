@@ -16,10 +16,7 @@ def sample_prior_graph(
     p_n_atoms = Categorical(probs=distributions.n_atoms_distribution)
 
     # sample number of atoms from train distribution
-    if n_atoms:
-        N_atoms = n_atoms
-    else:
-        N_atoms = p_n_atoms.sample()
+    N_atoms = n_atoms if n_atoms is not None else p_n_atoms.sample()
 
     # sample atom types from train distribution
     atom_types = p_atom_types.sample(sample_shape=(N_atoms,))

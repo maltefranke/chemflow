@@ -2,6 +2,7 @@
 
 import os
 from concurrent.futures import ProcessPoolExecutor
+from typing import Literal
 
 import torch
 from rdkit import Chem
@@ -9,6 +10,67 @@ from torchmetrics import Metric
 from torchmetrics import MetricCollection
 
 from chemflow import rdkit as chemflowRD
+
+
+def atom_count_distribution_metrics(
+    mols: list,
+    target_distribution: torch.Tensor,
+    device: torch.device | str,
+    eps: float = 1e-8,
+) -> dict[str, torch.Tensor]:
+    """Compare generated atom-count distribution to a target atom-count distribution."""
+    if len(mols) == 0:
+        zero = torch.tensor(0.0, device=device)
+        return {
+            "atom_count_dist_tvd": zero,
+            "atom_count_dist_l1": zero,
+            "atom_count_dist_kl": zero,
+            "atom_count_mean_abs_diff": zero,
+        }
+
+    n_atoms_gen = torch.tensor(
+        [mol.num_nodes for mol in mols],
+        device=device,
+        dtype=torch.long,
+    )
+    max_gen = int(n_atoms_gen.max().item())
+
+    target = target_distribution.to(device=device, dtype=torch.float32)
+    min_len = max(max_gen + 1, target.numel())
+    gen_hist = torch.bincount(n_atoms_gen, minlength=min_len)
+    gen = gen_hist.to(dtype=torch.float32)
+    gen = gen / gen.sum().clamp(min=1.0)
+
+    if target.numel() < gen.numel():
+        target = torch.cat(
+            [target, torch.zeros(gen.numel() - target.numel(), device=device)],
+            dim=0,
+        )
+    elif target.numel() > gen.numel():
+        gen = torch.cat(
+            [gen, torch.zeros(target.numel() - gen.numel(), device=device)],
+            dim=0,
+        )
+
+    target = target / target.sum().clamp(min=eps)
+
+    l1 = torch.sum(torch.abs(gen - target))
+    tvd = 0.5 * l1
+    kl = torch.sum(
+        gen * (torch.log(gen.clamp(min=eps)) - torch.log(target.clamp(min=eps)))
+    )
+
+    support = torch.arange(gen.numel(), device=device, dtype=torch.float32)
+    mean_gen = torch.sum(gen * support)
+    mean_target = torch.sum(target * support)
+    mean_abs_diff = torch.abs(mean_gen - mean_target)
+
+    return {
+        "atom_count_dist_tvd": tvd,
+        "atom_count_dist_l1": l1,
+        "atom_count_dist_kl": kl,
+        "atom_count_mean_abs_diff": mean_abs_diff,
+    }
 
 def calc_atom_stabilities(mol):
     problems = Chem.DetectChemistryProblems(mol)
@@ -87,6 +149,81 @@ class MoleculeStability(Metric):
 
     def compute(self) -> torch.Tensor:
         return self.mol_stable.float() / self.total
+
+
+class AtomCountDistributionMetric(GenerativeMetric):
+    """Distribution metric comparing generated atom counts to target distribution."""
+
+    def __init__(
+        self,
+        target_distribution: torch.Tensor,
+        metric_type: Literal["tvd", "l1", "kl", "mean_abs_diff"],
+        eps: float = 1e-8,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        if metric_type not in {"tvd", "l1", "kl", "mean_abs_diff"}:
+            raise ValueError(f"Unknown metric_type: {metric_type}")
+
+        target = target_distribution.detach().to(dtype=torch.float32)
+        target = target / target.sum().clamp(min=eps)
+
+        self.metric_type = metric_type
+        self.eps = eps
+        self.target_len = int(target.numel())
+
+        self.register_buffer("target_distribution", target)
+        self.add_state(
+            "gen_hist",
+            default=torch.zeros(self.target_len, dtype=torch.float32),
+            dist_reduce_fx="sum",
+        )
+        self.add_state("n_total", default=torch.tensor(0.0), dist_reduce_fx="sum")
+
+    def update(self, mols: list[Chem.rdchem.Mol]) -> None:
+        counts = [mol.GetNumAtoms() for mol in mols if mol is not None]
+        if len(counts) == 0:
+            return
+
+        counts_t = torch.tensor(
+            counts,
+            device=self.gen_hist.device,
+            dtype=torch.long,
+        )
+        counts_t = counts_t.clamp(min=0, max=self.target_len - 1)
+
+        hist = torch.bincount(counts_t, minlength=self.target_len).to(dtype=torch.float32)
+        self.gen_hist += hist
+        self.n_total += float(len(counts))
+
+    def compute(self) -> torch.Tensor:
+        if self.n_total <= 0:
+            return torch.tensor(0.0, device=self.gen_hist.device)
+
+        gen = self.gen_hist / self.gen_hist.sum().clamp(min=1.0)
+        target = self.target_distribution
+        target = target / target.sum().clamp(min=self.eps)
+
+        l1 = torch.sum(torch.abs(gen - target))
+        if self.metric_type == "l1":
+            return l1
+
+        if self.metric_type == "tvd":
+            return 0.5 * l1
+
+        if self.metric_type == "kl":
+            return torch.sum(
+                gen
+                * (
+                    torch.log(gen.clamp(min=self.eps))
+                    - torch.log(target.clamp(min=self.eps))
+                )
+            )
+
+        support = torch.arange(self.target_len, device=gen.device, dtype=torch.float32)
+        mean_gen = torch.sum(gen * support)
+        mean_target = torch.sum(target * support)
+        return torch.abs(mean_gen - mean_target)
 
 
 class Validity(GenerativeMetric):
@@ -335,7 +472,7 @@ class AverageOptRmsd(GenerativeMetric):
         return self.total_rmsd / self.n_valid
 
 
-def init_metrics(train_mols=None):
+def init_metrics(train_mols=None, target_n_atoms_distribution: torch.Tensor | None = None):
 
     metrics = {
         "validity": Validity(),
@@ -349,6 +486,23 @@ def init_metrics(train_mols=None):
         "strain-per-atom": AverageStrainEnergy(per_atom=True),
         "opt-rmsd": AverageOptRmsd(),
     }
+    if target_n_atoms_distribution is not None:
+        metrics["atom_count_dist_tvd"] = AtomCountDistributionMetric(
+            target_distribution=target_n_atoms_distribution,
+            metric_type="tvd",
+        )
+        metrics["atom_count_dist_l1"] = AtomCountDistributionMetric(
+            target_distribution=target_n_atoms_distribution,
+            metric_type="l1",
+        )
+        metrics["atom_count_dist_kl"] = AtomCountDistributionMetric(
+            target_distribution=target_n_atoms_distribution,
+            metric_type="kl",
+        )
+        metrics["atom_count_mean_abs_diff"] = AtomCountDistributionMetric(
+            target_distribution=target_n_atoms_distribution,
+            metric_type="mean_abs_diff",
+        )
     stability_metrics = {
         "atom-stability": AtomStability(),
         "molecule-stability": MoleculeStability(),
@@ -360,10 +514,31 @@ def init_metrics(train_mols=None):
     return metrics, stability_metrics
 
 
-def calc_metrics_(rdkit_mols, metrics, stab_metrics=None, mol_stabs=None):
+def calc_metrics_(
+    rdkit_mols,
+    metrics,
+    stab_metrics=None,
+    mol_stabs=None,
+    mols=None,
+    target_n_atoms_distribution: torch.Tensor | None = None,
+    device: torch.device | str | None = None,
+):
     metrics.reset()
     metrics.update(rdkit_mols)
     results = metrics.compute()
+
+    if mols is not None and target_n_atoms_distribution is not None:
+        if device is None:
+            if isinstance(target_n_atoms_distribution, torch.Tensor):
+                device = target_n_atoms_distribution.device
+            else:
+                device = "cpu"
+        atom_count_results = atom_count_distribution_metrics(
+            mols=mols,
+            target_distribution=target_n_atoms_distribution,
+            device=device,
+        )
+        results = {**results, **atom_count_results}
 
     if stab_metrics is None:
         return results

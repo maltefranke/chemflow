@@ -136,3 +136,38 @@ class FastPowerSchedule(KappaSchedule):
         # Analytical Rate for Alpha=1: beta / (1-t)
         denom = torch.clamp(1 - t, min=epsilon)
         return self.beta / denom
+
+
+class SmoothstepSchedule(KappaSchedule):
+    """
+    A simple polynomial schedule that concentrates edits in a bell shape.
+    - shift = 1.0 : Edits peak perfectly in the middle.
+    - shift < 1.0 : Edits happen earlier (pushes the peak towards t=0).
+    - shift > 1.0 : Edits happen later (pushes the peak towards t=1).
+    - scale       : Modulates the overall height/intensity of the edits.
+    """
+
+    def __init__(self, shift: float = 1.0):
+        super().__init__()
+        self.shift = shift
+
+    def kappa_t(self, t: torch.Tensor) -> torch.Tensor:
+        # Standard smoothstep is 3t^2 - 2t^3.
+        # By raising t to the power of 'shift' (p), we warp time to move the peak.
+        p = self.shift
+        return 3 * t ** (2 * p) - 2 * t ** (3 * p)
+
+    def kappa_t_dot(self, t: torch.Tensor) -> torch.Tensor:
+        p = self.shift
+        # We clamp t slightly above 0 to prevent NaN errors when shift < 0.5
+        t_safe = torch.clamp(t, min=1e-7)
+
+        # The exact mathematical derivative of kappa_t
+        return 6 * p * (t_safe ** (2 * p - 1) - t_safe ** (3 * p - 1))
+
+    def rate(self, t: torch.Tensor, epsilon: float = 1e-6) -> torch.Tensor:
+        # Standard flow-matching rate formulation
+        k_t = self.kappa_t(t)
+        k_dot = self.kappa_t_dot(t)
+        denom = torch.clamp(1.0 - k_t, min=epsilon)
+        return k_dot / denom

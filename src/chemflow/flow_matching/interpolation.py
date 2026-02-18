@@ -22,7 +22,11 @@ from chemflow.dataset.molecule_data import (
 
 from chemflow.dataset.vocab import Vocab, Distributions
 
-from chemflow.flow_matching.schedules import FastPowerSchedule, KappaSchedule
+from chemflow.flow_matching.schedules import (
+    FastPowerSchedule,
+    KappaSchedule,
+    LinearSchedule,
+)
 
 
 class Interpolator:
@@ -36,6 +40,7 @@ class Interpolator:
         ins_noise_scale=1.0,
         ins_schedule: KappaSchedule | None = None,
         del_schedule: KappaSchedule | None = None,
+        sub_schedule: KappaSchedule | None = None,
         c_move=1.0,
         c_sub=0.0,
         c_ins=1e8,
@@ -59,6 +64,11 @@ class Interpolator:
             self.ins_schedule = FastPowerSchedule(beta=2.5)
         else:
             self.ins_schedule = ins_schedule
+
+        if sub_schedule is None:
+            self.sub_schedule = LinearSchedule()
+        else:
+            self.sub_schedule = sub_schedule
 
         self.c_move = c_move
         self.c_sub = c_sub
@@ -96,9 +106,12 @@ class Interpolator:
         assert torch.all(edge_index_0 == edge_index_1), "Edge indices must be the same"
 
         x_t = self.interpolate_continuous(x_0, x_1, t)
-        a_t = self.interpolate_discrete(a_0, a_1, t)
-        c_t = self.interpolate_discrete(c_0, c_1, t)
-        e_t = self.interpolate_discrete(e_0, e_1, t)
+
+        # take kappa_t for discrete variables
+        t_kappa = self.sub_schedule.kappa_t(t)
+        a_t = self.interpolate_discrete(a_0, a_1, t_kappa)
+        c_t = self.interpolate_discrete(c_0, c_1, t_kappa)
+        e_t = self.interpolate_discrete(e_0, e_1, t_kappa)
 
         # NOTE edge_index is the same for both m_0 and m_1, just take the first one
         # we make sure they are the same with the assert above
@@ -166,6 +179,8 @@ class Interpolator:
             mol_1: MoleculeBatch - batch of target molecules
             ins_targets: MoleculeBatch - batch of insertion targets
         """
+        device = t.device
+
         # 1. Transport & Alignment (Uses your existing helpers)
         # Returns list of (AugmentedMoleculeData, AugmentedMoleculeData)
         aligned_pairs = partial_optimal_transport(
@@ -183,7 +198,6 @@ class Interpolator:
 
         total_num_nodes_mol_t = 0
         for (sample, target), t_i in zip(aligned_pairs, t):
-            device = sample.x.device
             N = sample.x.shape[0]
 
             # --- 2. Classification ---
@@ -201,7 +215,7 @@ class Interpolator:
             # Assign a random event time tau_i ~ U[0,1] to every node.
             # We then determine if the event happens with kappa_t.
 
-            inst_rate_sub = 1 / torch.clamp(1 - t_i, min=1e-8)
+            inst_rate_sub = self.sub_schedule.rate(t_i)
 
             tau_del = torch.rand(N, 1, device=device)
             t_del = self.del_schedule.kappa_t(t_i)

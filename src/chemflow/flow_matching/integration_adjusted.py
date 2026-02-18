@@ -19,7 +19,11 @@ from chemflow.dataset.molecule_data import (
     filter_nodes,
 )
 from chemflow.dataset.vocab import Vocab, Distributions
-from chemflow.flow_matching.schedules import FastPowerSchedule, KappaSchedule
+from chemflow.flow_matching.schedules import (
+    FastPowerSchedule,
+    KappaSchedule,
+    LinearSchedule,
+)
 
 
 class RateIntegrator:
@@ -52,6 +56,7 @@ class RateIntegrator:
         time_strategy="log",
         del_schedule: KappaSchedule | None = None,
         ins_schedule: KappaSchedule | None = None,
+        sub_schedule: KappaSchedule | None = None,
         device="cuda" if torch.cuda.is_available() else "cpu",
     ):
         self.vocab = vocab
@@ -73,11 +78,19 @@ class RateIntegrator:
         else:
             self.ins_schedule = ins_schedule
 
+        if sub_schedule is None:
+            self.sub_schedule = LinearSchedule()
+        else:
+            self.sub_schedule = sub_schedule
+
         if self.cat_strategy == "mask":
             self.edge_mask_index = token_to_index(self.vocab.edge_tokens, "<MASK>")
             self.atom_mask_index = token_to_index(self.vocab.atom_tokens, "<MASK>")
 
         self.edge_aligner = EdgeAligner()
+
+        n_atoms_distribution = self.distributions.n_atoms_distribution
+        self.max_atoms = len(n_atoms_distribution) + 1
 
     def get_time_steps(self, num_steps: int | None = None) -> list[float]:
         if num_steps is None:
@@ -101,82 +114,6 @@ class RateIntegrator:
 
         return step_sizes
 
-    def discrete_integration_step_gnn(
-        self,
-        class_curr: torch.Tensor,
-        class_probs_1: torch.Tensor,
-        t: torch.Tensor,
-        batch_idx: torch.Tensor,
-        dt: float,
-        noise_scale: float = 0.0,
-        mask: torch.Tensor = None,
-    ) -> torch.Tensor:
-        """
-        Performs a single Euler-Forward integration step for Discrete Flow Matching
-        adapted for Graph Neural Networks (stacked node batching).
-
-        Args:
-            class_curr (Tensor): Current node token indices. Shape [N, 1] or [N].
-            class_probs_1 (Tensor): Predicted target probabilities. Shape [N, Vocab].
-            t (Tensor): Current time per graph. Shape [Batch_Size].
-            batch_idx (Tensor): Batch index for each node (e.g., from PyG Data.batch). Shape [N].
-            dt (float): Integration timestep size.
-            noise_scale (float): Additive uniform noise rate.
-            mask (Tensor, optional): Boolean mask (True to ignore node). Shape [N, 1] or [N].
-
-        Returns:
-            a_next (Tensor): Updated node tokens. Shape [N, 1].
-        """
-        # 0. Standardization
-        # Ensure a_curr is [N, 1] for scatter consistency, but we often need [N] for logic
-        if class_curr.ndim == 1:
-            class_curr = class_curr.unsqueeze(-1)  # [N, 1]
-
-        # 1. Broadcast Time to Nodes
-        # t is [Batch_Size], we need [N, 1] to match a_1_probs
-        # t[batch_idx] expands it to [N], then view adds the vocab dim
-        times = t[batch_idx].view(-1, 1).clamp(min=1e-5, max=1.0 - 1e-5)
-
-        # 2. Calculate Deterministic Rate: Rate = p_1(y) / (1 - t)
-        # rate_scalar will be [N, 1]
-        rate_scalar = 1.0 / (1.0 - times)
-        rates = class_probs_1 * rate_scalar
-
-        # 3. Add Stochastic Noise (Optional)
-        if noise_scale > 0:
-            rates = rates + noise_scale
-
-        # 4. Zero out the Diagonal (Self-transitions)
-        # rates is [N, Vocab], a_curr is [N, 1]
-        # We set the rate of staying (x -> x) to 0 temporarily
-        rates.scatter_(-1, class_curr, 0.0)
-
-        # 5. Convert Rates to Probabilities
-        step_probs = rates * dt
-
-        # 6. Calculate Probability to Stay
-        # P(stay) = 1 - sum(P(jump to y))
-        off_diag_sum = step_probs.sum(dim=-1, keepdim=True)
-        stay_prob = (1.0 - off_diag_sum).clamp(min=0.0)
-
-        # Insert stay probability back into the current token's position
-        step_probs.scatter_(-1, class_curr, stay_prob)
-
-        # 7. Sample Next State
-        # Categorical samples from [N, Vocab] -> returns [N]
-        class_pred = torch.distributions.Categorical(probs=step_probs).sample()
-
-        # Reshape back to [N, 1] to maintain input shape consistency
-        class_pred = class_pred.view(-1, 1)
-
-        # 8. Apply Mask (if provided)
-        if mask is not None:
-            if mask.ndim == 1:
-                mask = mask.unsqueeze(-1)
-            class_pred = torch.where(mask, class_curr, class_pred)
-
-        return class_pred
-
     def sample_insertions(
         self,
         ins_gmm_dict: dict,
@@ -194,7 +131,7 @@ class RateIntegrator:
         Returns:
             new_atoms: PointCloud - new atoms
         """
-        # We will only do one insertion at a time
+        # We will only do one insertion per provided GMM at a time
         num_ins = 1
 
         # Sample from GMM for this graph
@@ -278,39 +215,42 @@ class RateIntegrator:
         x, a, c, e, edge_index, batch_id = mol_t.unpack()
         x_1, a_1, c_1, e_1, edge_index_1, _ = mol_1_pred.unpack()
 
-        rate = 1 / (1 - t).clamp(min=eps, max=1.0 - eps)
-        rate_node = rate[batch_id]
+        # Rate for movement
+        # TODO if we change the position interpolation, need to change this
+        move_rate = 1 / (1 - t).clamp(min=eps, max=1.0 - eps)
+        move_rate_node = move_rate[batch_id]
 
-        # graph-wise rate for insertion
+        # Rate for substitution
+        sub_rate = self.sub_schedule.rate(t)
+        sub_rate_node = sub_rate[batch_id]
+
+        # Rate for insertion
         ins_rate = self.ins_schedule.rate(t)
         ins_rate_node = ins_rate[batch_id]
 
-        # node-wise rate for deletion
+        # Rate for deletion
         del_rate = self.del_schedule.rate(t)
         del_rate_node = del_rate[batch_id]
 
         # 1. Update positions (Euler-Maruyama scheme)
 
-        velocity = (x_1 - x) * rate_node.view(-1, 1)
+        velocity = (x_1 - x) * move_rate_node.view(-1, 1)
         x = x + velocity * dt
 
         # 1. Handle insertions using global budget (velocity-based) or local Poisson
         num_graphs = t.shape[0]
+
+        global_ins_budget = None
 
         if global_ins_budget is not None:
             # Use velocity-based budget allocation strategy
             # global_ins_budget: Shape (num_graphs,) - predicted N_missing per graph
 
             # Expected number of insertions for this specific step
-            step_budget_float = (
-                global_ins_budget * ins_rate * dt
-            )  # Shape: (num_graphs,)
+            exp_num_inserts = global_ins_budget * ins_rate * dt  # Shape: (num_graphs,)
 
-            # Stochastic rounding: e.g., 1.3 inserts -> 30% chance of 2, 70% chance of 1
-            floor = torch.floor(step_budget_float)
-            prob_ceil = step_budget_float - floor
-            extra = (torch.rand_like(prob_ceil) < prob_ceil).float()
-            num_inserts_per_graph = (floor + extra).long()  # Shape: (num_graphs,)
+            num_inserts_per_graph = torch.poisson(exp_num_inserts)
+            num_inserts_per_graph = num_inserts_per_graph.long()
 
             # Now use multinomial sampling to select which nodes spawn insertions
             # Scale local insertion logits (do_ins_probs) to probabilities
@@ -355,8 +295,29 @@ class RateIntegrator:
 
             # for insertion, we will then sample from the poisson distribution
             expected_num_ins = num_ins_pred * ins_rate_node * dt
-            num_ins = torch.poisson(expected_num_ins)
-            do_ins = do_ins & (num_ins > 0)
+            # NOTE in OneFlow, instead of sampling Poisson, they sample Bernoulli
+            ins_sampled = torch.rand_like(expected_num_ins) < expected_num_ins
+
+            # do_ins = do_ins & (num_ins > 0)
+            do_ins = do_ins & ins_sampled
+
+        # Fail-safe: ensure that the number of atoms per graph won't be greater than the max number of atoms
+        if do_ins.any():
+            for g in range(num_graphs):
+                graph_mask = batch_id == g
+                n_atoms_g = x[graph_mask].shape[0]
+                n_inserts_g = do_ins[graph_mask].sum().item()
+
+                if n_atoms_g + n_inserts_g > self.max_atoms:
+                    # pick random insertions until n_max_atoms is reached
+                    n_to_remove = n_atoms_g + n_inserts_g - self.max_atoms
+                    removed_indices = torch.where(graph_mask & do_ins)[0]
+                    # random permutation of the indices
+                    removed_indices = removed_indices[
+                        torch.randperm(removed_indices.shape[0])
+                    ]
+                    removed_indices = removed_indices[:n_to_remove]
+                    do_ins[removed_indices] = False
 
         """DELETION or SUBSTITUTION"""
         # TODO implement multinomial sampling for deletion like above for insertions
@@ -364,15 +325,18 @@ class RateIntegrator:
 
         # 1. Scale probabilities by time (converting prob -> rate * dt)
         # rate_node is 1 / (1 - t)
-        p_sub_scaled = do_sub_a_probs.view(-1) * rate_node * dt
+        """do_sub_a = torch.rand_like(do_sub_a_probs) < do_sub_a_probs
+        do_del = torch.rand_like(do_del_probs) < do_del_probs
+
+        p_sub_scaled = do_sub_a.long().view(-1) * sub_rate_node * dt
+        p_del_scaled = do_del.long().view(-1) * del_rate_node * dt"""
+
+        p_sub_scaled = do_sub_a_probs.view(-1) * sub_rate_node * dt
         p_del_scaled = do_del_probs.view(-1) * del_rate_node * dt
 
         # 2. Sum rates first (Paper Formulation)
         # "probability of ANY edit is h(lambda_sub + lambda_del)"
         p_any_edit = p_sub_scaled + p_del_scaled
-
-        # Clamp to 1.0 to prevent numerical explosion near t=1
-        # p_any_edit = torch.clamp(p_any_edit, max=1.0)
 
         # 3. Sample "Does an edit happen?" (1 Random Sample)
         do_edit = torch.rand_like(p_any_edit) < p_any_edit
@@ -390,6 +354,25 @@ class RateIntegrator:
 
         # An edit occurs AND it is NOT a deletion type (therefore substitution)
         do_sub_a = do_edit & (~is_deletion_type)
+
+        """# 1. Modulate base rates with the neural network's continuous probabilities
+        lambda_sub = do_sub_a_probs.view(-1) * sub_rate_node
+        lambda_del = do_del_probs.view(-1) * del_rate_node
+
+        # 2. Calculate safe bounds for the independent probabilities
+        prob_sub = 1.0 - torch.exp(-lambda_sub * dt)
+        prob_del = 1.0 - torch.exp(-lambda_del * dt)
+
+        # 3. Sample the independent events (Coin flips)
+        do_sub_raw = torch.rand_like(prob_sub) < prob_sub
+        do_del_raw = torch.rand_like(prob_del) < prob_del
+
+        # 4. Apply "Sub over Deletion" conflict resolution
+        # Substitution gets absolute priority.
+        do_sub_a = do_sub_raw
+
+        # Deletion only happens if it triggered AND substitution did not.
+        do_del = do_del_raw & (~do_sub_raw)"""
 
         # 6. Apply
         # a_1 is your predicted token values from Step 2
@@ -415,7 +398,7 @@ class RateIntegrator:
         batch_id_edge = batch_id[edge_index_triu[0]]
 
         # Calculate rate for edges (same as for nodes)
-        rate_edge = rate[batch_id_edge].unsqueeze(-1)
+        rate_edge = sub_rate[batch_id_edge].unsqueeze(-1)
         p_mod_e = rate_edge * dt
         p_mod_e = p_mod_e.view(-1)
 

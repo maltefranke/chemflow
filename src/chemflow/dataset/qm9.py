@@ -19,6 +19,7 @@ from torch_geometric.utils import one_hot, scatter
 from chemflow.dataset.molecule_data import MoleculeData
 from chemflow.dataset.vocab import Vocab, Distributions
 from chemflow.rdkit import mol_is_valid, sanitize_mol_correctly, BOND_IDX_MAP
+from scipy.spatial.transform import Rotation
 
 
 class QM9Charges(QM9):
@@ -192,17 +193,27 @@ class FlowMatchingQM9Dataset(QM9Charges):
         distributions: Distributions,
         transform=None,
         pre_transform=None,
+        rotate=False,
     ):
         super().__init__(root, transform, pre_transform)
 
         self.vocab = vocab
         self.distributions = distributions
 
+        self.rotate = rotate
+
     def __getitem__(self, index):
         data = super().__getitem__(index)
 
         # remove center of mass
         coord = data.pos - data.pos.mean(dim=0)
+
+        if self.rotate:
+            # do a random rotation
+            rotation = Rotation.random(1)
+            coord = coord @ rotation.as_matrix()[0]
+            coord = coord.to(dtype=data.pos.dtype)
+
         if self.distributions.coordinate_std is not None:
             coord = coord / self.distributions.coordinate_std
 

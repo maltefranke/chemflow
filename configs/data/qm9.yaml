@@ -34,6 +34,7 @@ interpolator:
   ins_noise_scale: ${data.ins_noise_scale}
   del_schedule: ${schedule}
   ins_schedule: ${schedule}
+  sub_schedule: ${schedule}
 
 datamodule:
   _target_: chemflow.dataset.lightning_datamodule.LightningDataModule
@@ -48,31 +49,34 @@ datamodule:
       root: ${data.root_path}/qm9
       vocab: ${data.vocab}
       distributions: None
+      rotate: ${model.rotate}
       
     val:
       - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
         root: ${data.root_path}/qm9
         vocab: ${data.vocab}
         distributions: None
+        rotate: ${model.rotate}
 
     test:
       - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
         root: ${data.root_path}/qm9
         vocab: ${data.vocab}
         distributions: None
+        rotate: ${model.rotate}
   
   interpolator: ${data.interpolator}
   
   num_workers:
-    train: 6
-    val: 6
-    test: 6
-    predict: 6
+    train: 10
+    val: 10
+    test: 10
+    predict: 10
 
   batch_size:
     train: 256
-    val: 256
-    test: 8
+    val: 128
+    test: 32
 
   n_atoms_strategy: ${data.n_atoms_strategy}
   cat_strategy: ${data.cat_strategy}

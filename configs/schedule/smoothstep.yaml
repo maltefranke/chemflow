@@ -1,0 +1,2 @@
+_target_: chemflow.flow_matching.schedules.SmoothstepSchedule
+shift: 0.65

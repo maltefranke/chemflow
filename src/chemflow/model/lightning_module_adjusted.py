@@ -16,7 +16,10 @@ from external_code.egnn import unsorted_segment_mean, unsorted_segment_sum
 
 from chemflow.dataset.molecule_data import MoleculeBatch
 from chemflow.dataset.vocab import Vocab, Distributions
-from chemflow.metrics import calc_metrics_, init_metrics
+from chemflow.metrics import (
+    calc_metrics_,
+    init_metrics,
+)
 from lightning.pytorch.utilities import grad_norm
 from chemflow.model.learnable_loss import UnifiedWeightedLoss
 
@@ -64,6 +67,8 @@ class LightningModuleRates(pl.LightningModule):
         distributions: Distributions = None,
         ins_noise_scale: float = 0.5,
         use_learnable_loss_weights: bool = False,
+        edit_loss_ema_decay: float = 0.99,
+        edit_loss_ema_eps: float = 1e-8,
     ):
         super().__init__()
 
@@ -72,6 +77,8 @@ class LightningModuleRates(pl.LightningModule):
 
         self.cat_weighting = cat_weighting
         self.ins_noise_scale = ins_noise_scale
+        self.edit_loss_ema_decay = float(edit_loss_ema_decay)
+        self.edit_loss_ema_eps = float(edit_loss_ema_eps)
 
         self.gmm_params = gmm_params
         self.n_atoms_strategy = n_atoms_strategy
@@ -179,7 +186,17 @@ class LightningModuleRates(pl.LightningModule):
         )
         self.register_buffer("charge_token_weights", charge_weights)
 
-        self.metrics, self.stability_metrics = init_metrics()
+        self.metrics, self.stability_metrics = init_metrics(
+            target_n_atoms_distribution=self.distributions.n_atoms_distribution
+        )
+
+        # EMA counts used to smooth insertion/deletion loss balancing.
+        self.register_buffer("ema_n_ins", torch.tensor(1.0))
+        self.register_buffer("ema_n_del", torch.tensor(1.0))
+        self.register_buffer("ema_do_ins_pos", torch.tensor(1.0))
+        self.register_buffer("ema_do_ins_neg", torch.tensor(1.0))
+        self.register_buffer("ema_do_del_pos", torch.tensor(1.0))
+        self.register_buffer("ema_do_del_neg", torch.tensor(1.0))
 
         self.save_hyperparameters()
         self.model = hydra.utils.instantiate(model)
@@ -211,6 +228,28 @@ class LightningModuleRates(pl.LightningModule):
 
         self.is_compiled = False
 
+    def _get_ema_edit_weights(
+        self, n_inserts: torch.Tensor, n_deletes: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return EMA-smoothed balancing weights for insertion and deletion losses."""
+        n_inserts = n_inserts.detach().to(
+            device=self.device, dtype=self.ema_n_ins.dtype
+        )
+        n_deletes = n_deletes.detach().to(
+            device=self.device, dtype=self.ema_n_del.dtype
+        )
+
+        if self.training:
+            decay = self.edit_loss_ema_decay
+            one_minus_decay = 1.0 - decay
+            self.ema_n_ins.mul_(decay).add_(n_inserts * one_minus_decay)
+            self.ema_n_del.mul_(decay).add_(n_deletes * one_minus_decay)
+
+        denom = (self.ema_n_ins + self.ema_n_del).clamp(min=self.edit_loss_ema_eps)
+        w_ins = self.ema_n_ins / denom
+        w_del = self.ema_n_del / denom
+        return w_ins, w_del
+
     def compile(self):
         """Compile the model using torch.compile."""
         if self.is_compiled:
@@ -241,7 +280,14 @@ class LightningModuleRates(pl.LightningModule):
             )
         return loss
 
-    def do_action_loss(self, do_action_pred, num_actions, batch, num_graphs):
+    def do_action_loss(
+        self,
+        do_action_pred,
+        num_actions,
+        batch,
+        num_graphs,
+        ema_key: str | None = None,
+    ):
         """Calculate the do action loss for the given do action predictions.
         Is used for all actions (substitutions, deletions, insertions).
 
@@ -250,17 +296,42 @@ class LightningModuleRates(pl.LightningModule):
             num_actions: The number of actions for each node.
             batch: The batch indices for each node.
             num_graphs: The number of graphs in the batch.
+            ema_key: Optional key for EMA-balanced BCE `pos_weight`.
+                Supported values are "ins" and "del".
         """
         do_action = num_actions > 0.0
 
         # calculate dynamic weighting for the rate loss
-        num_total_actions = do_action.sum()
-        num_total = do_action.shape[0]
-        num_no_action = num_total - num_total_actions
+        dtype = do_action_pred.dtype
+        num_total_actions = do_action.sum().detach().to(device=self.device, dtype=dtype)
+        num_total = torch.tensor(
+            float(do_action.shape[0]), device=self.device, dtype=dtype
+        )
+        num_no_action = (num_total - num_total_actions).clamp(min=0.0)
 
-        # TODO we could add an exponential moving averate of the pos weight for stability
-        pos_weight = num_no_action / num_total_actions if num_total_actions > 0 else 1.0
-        pos_weight = torch.tensor(pos_weight, device=self.device)
+        if ema_key in {"ins", "del"}:
+            pos_name = f"ema_do_{ema_key}_pos"
+            neg_name = f"ema_do_{ema_key}_neg"
+            ema_pos = getattr(self, pos_name)
+            ema_neg = getattr(self, neg_name)
+
+            if self.training:
+                decay = self.edit_loss_ema_decay
+                one_minus_decay = 1.0 - decay
+                ema_pos.mul_(decay).add_(
+                    num_total_actions.to(ema_pos.dtype) * one_minus_decay
+                )
+                ema_neg.mul_(decay).add_(
+                    num_no_action.to(ema_neg.dtype) * one_minus_decay
+                )
+
+            pos_weight = ema_neg / ema_pos.clamp(min=self.edit_loss_ema_eps)
+            pos_weight = pos_weight.to(device=self.device, dtype=dtype)
+        else:
+            pos_weight = num_no_action / num_total_actions.clamp(
+                min=self.edit_loss_ema_eps
+            )
+            pos_weight = pos_weight.to(device=self.device, dtype=dtype)
 
         # NOTE: we use BCEWithLogitsLoss for scalar logit predictions
         # do_action_pred is shape (N,) with logits
@@ -527,6 +598,8 @@ class LightningModuleRates(pl.LightningModule):
 
         del_loss_weighted = torch.tensor(0.0, device=self.device)
         ins_loss_weighted = torch.tensor(0.0, device=self.device)
+        do_del_loss = torch.tensor(0.0, device=self.device)
+        do_ins_loss = torch.tensor(0.0, device=self.device)
         ins_loss_rate = torch.tensor(0.0, device=self.device)
         ins_loss_gmm = torch.tensor(0.0, device=self.device)
         ins_loss_e = torch.tensor(0.0, device=self.device)
@@ -535,12 +608,27 @@ class LightningModuleRates(pl.LightningModule):
             # TODO e.g. w = n_del / (n_del + n_ins)
             # 2. Handle deletions (no class changes here!)
             do_del_loss = self.do_action_loss(
-                do_del_head, mols_t.lambda_del, mols_t.batch, mols_t.num_graphs
+                do_del_head,
+                mols_t.lambda_del,
+                mols_t.batch,
+                mols_t.num_graphs,
+                ema_key="del",
             )
 
             # 3. Handle insertions
             do_ins_loss = self.do_action_loss(
-                do_ins_head, mols_t.lambda_ins, mols_t.batch, mols_t.num_graphs
+                do_ins_head,
+                mols_t.lambda_ins,
+                mols_t.batch,
+                mols_t.num_graphs,
+                ema_key="ins",
+            )
+            self.log_dict(
+                {
+                    "loss/ins/action": do_ins_loss,
+                },
+                prog_bar=False,
+                logger=True,
             )
 
             # Count number of insertions per node
@@ -560,6 +648,15 @@ class LightningModuleRates(pl.LightningModule):
                 # mask indicating which nodes are focal for insertion
                 ins_loss_rate = self.rate_loss(
                     ins_rate_pred, num_inserts_per_node, mols_t.batch, mols_t.num_graphs
+                )
+
+                self.log_dict(
+                    {
+                        "loss/ins/rate": ins_loss_rate,
+                        "loss/ins/rate_weighted": weights["ins_rate"] * ins_loss_rate,
+                    },
+                    prog_bar=False,
+                    logger=True,
                 )
 
                 # mask indicating in which graph we have inserts
@@ -671,23 +768,26 @@ class LightningModuleRates(pl.LightningModule):
                     )
 
             else:
-                # NOTE edge_head and gmm_head unused, throws an error (unused_params)
+                # NOTE ins_rate_head,edge_head, gmm_head unused, throws an error (unused_params)
                 # NOTE therefore we add a dummy loss wrt. edge_head and gmm_head
+                ins_rate_head_loss = sum(
+                    p.sum() for p in self.model.ins_rate_head.parameters()
+                )
                 edge_head_loss = sum(
                     p.sum() for p in self.model.ins_edge_head.parameters()
                 )
                 gmm_head_loss = sum(
                     p.sum() for p in self.model.ins_gmm_head.parameters()
                 )
+
                 ins_loss_e = 0.0 * edge_head_loss
                 ins_loss_gmm = 0.0 * gmm_head_loss
+                ins_loss_rate = 0.0 * ins_rate_head_loss
 
             # Log insertion and deletion losses with subgroups
             self.log_dict(
                 {
                     "loss/del/action": do_del_loss,
-                    "loss/ins/rate": ins_loss_rate,
-                    "loss/ins/rate_weighted": weights["ins_rate"] * ins_loss_rate,
                 },
                 prog_bar=False,
                 logger=True,
@@ -757,17 +857,22 @@ class LightningModuleRates(pl.LightningModule):
                 p.sum() for p in self.model.global_del_budget_head.parameters()
             )
 
+        n_inserts = (mols_t.lambda_ins > 0.0).sum().float()
+        n_deletes = (mols_t.lambda_del > 0.0).sum().float()
+        w_ins, w_del = self._get_ema_edit_weights(n_inserts, n_deletes)
+
         # 5. Combine all losses using the unified wrapper
+        # Balance insertion/deletion components with EMA-smoothed activity weights.
         loss_components = {
             "do_sub_a": do_sub_a_loss,
             "sub_a_class": sub_a_class_loss,
             "do_sub_e": do_sub_e_loss,
             "sub_e_class": sub_e_class_loss,
-            "do_del": do_del_loss,
-            "do_ins": do_ins_loss,
-            "ins_rate": ins_loss_rate,
-            "ins_gmm": ins_loss_gmm,
-            "ins_e": ins_loss_e,
+            "do_del": w_del * do_del_loss,
+            "do_ins": w_ins * do_ins_loss,
+            "ins_rate": w_ins * ins_loss_rate,
+            "ins_gmm": w_ins * ins_loss_gmm,
+            "ins_e": w_ins * ins_loss_e,
             "x": x_loss,
             "c": c_loss,
             # Global budget losses
@@ -797,8 +902,8 @@ class LightningModuleRates(pl.LightningModule):
             )
 
         # For backward compatibility, compute edit_flow_loss and x_loss_weighted for logging
-        del_loss_weighted = weights["do_del"] * do_del_loss
-        ins_loss_weighted = (
+        del_loss_weighted = w_del * weights["do_del"] * do_del_loss
+        ins_loss_weighted = w_ins * (
             weights["ins_rate"] * ins_loss_rate
             + weights["ins_gmm"] * ins_loss_gmm
             + weights["ins_e"] * ins_loss_e
@@ -809,8 +914,7 @@ class LightningModuleRates(pl.LightningModule):
         loss = self.safe_loss(loss)
 
         # Log final losses and statistics
-        n_inserts = (mols_t.lambda_ins > 0.0).sum()
-        n_deletes = (mols_t.lambda_del > 0.0).sum()
+
         self.log_dict(
             {
                 "loss/sub": sub_loss_weighted,
@@ -822,6 +926,14 @@ class LightningModuleRates(pl.LightningModule):
                 "loss/move": x_loss_weighted,
                 "stats/n_ins": n_inserts,
                 "stats/n_del": n_deletes,
+                "stats/loss_weight_ins_ema": w_ins,
+                "stats/loss_weight_del_ema": w_del,
+                "stats/ema_n_ins": self.ema_n_ins,
+                "stats/ema_n_del": self.ema_n_del,
+                "stats/ema_do_ins_pos": self.ema_do_ins_pos,
+                "stats/ema_do_ins_neg": self.ema_do_ins_neg,
+                "stats/ema_do_del_pos": self.ema_do_del_pos,
+                "stats/ema_do_del_neg": self.ema_do_del_neg,
             },
             prog_bar=False,
             logger=True,
@@ -988,6 +1100,8 @@ class LightningModuleRates(pl.LightningModule):
             if self.ins_rate_strategy == "classification":
                 # Classification: sample from categorical distribution
                 # ins_rate_output shape: (N, num_classes) - logits
+                temperature = 0.1
+                ins_rate_output = ins_rate_output / temperature
                 ins_probs = F.softmax(ins_rate_output, dim=-1)
                 num_ins_pred = (
                     torch.distributions.Categorical(probs=ins_probs).sample().float()
@@ -1015,7 +1129,7 @@ class LightningModuleRates(pl.LightningModule):
                 and self.n_atoms_strategy != "fixed"
             ):
                 # TODO make temperature sampling hyperparam
-                temperature = 0.7
+                temperature = 1.0
                 global_ins_budget_logits = global_ins_budget_logits / temperature
 
                 # Sample from categorical distribution to get the predicted budget
@@ -1033,7 +1147,7 @@ class LightningModuleRates(pl.LightningModule):
                 and self.n_atoms_strategy != "fixed"
             ):
                 # TODO make temperature sampling hyperparam
-                temperature = 0.7
+                temperature = 0.1
                 global_del_budget_logits = global_del_budget_logits / temperature
 
                 # Sample from categorical distribution to get the predicted budget
@@ -1043,8 +1157,6 @@ class LightningModuleRates(pl.LightningModule):
                     .sample()
                     .float()
                 )  # Shape: (num_graphs,)
-
-            # print(global_del_budget)
 
             # Integrate one step (edge prediction happens inside if head is provided)
             # Note: do_ins is computed inside integrate_step_gnn from num_ins_pred or global_ins_budget
