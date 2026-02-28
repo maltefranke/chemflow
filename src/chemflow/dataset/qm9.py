@@ -240,10 +240,16 @@ class FlowMatchingQM9Dataset(QM9Charges):
         ]
         charges = torch.tensor(charges, dtype=torch.long)
 
-        data = MoleculeData(
+        mol = MoleculeData(
             x=coord, a=atom_types, e=edge_types, c=charges, edge_index=data.edge_index
         )
-        return data
+
+        # Carry through molecular properties if available (shape: [1, num_properties])
+        # Keep 2D so PyG batching concatenates along dim 0 → [batch_size, num_properties]
+        if hasattr(data, "y") and data.y is not None:
+            mol.y = data.y if data.y.dim() == 2 else data.y.unsqueeze(0)
+
+        return mol
 
 
 if __name__ == "__main__":

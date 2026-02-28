@@ -418,35 +418,6 @@ def filter_nodes(
     # Fail-safe: Ensure at least one atom remains
     mask = mask.clone()  # Work on a copy to avoid modifying the original
 
-    """if hasattr(mol, "batch") and mol.batch is not None:
-        # For batched data: ensure each molecule (batch_id) has at least one atom remaining
-        unique_batch_ids = mol.batch.unique()
-
-        for batch_id in unique_batch_ids:
-            batch_mask = mol.batch == batch_id
-            nodes_in_batch = batch_mask.sum().item()
-
-            # Check if all nodes in this batch would be removed
-            nodes_to_keep_in_batch = mask[batch_mask].sum().item()
-
-            if nodes_to_keep_in_batch == 0 and nodes_in_batch > 0:
-                # All nodes would be removed - keep a random one
-                batch_node_indices = torch.where(batch_mask)[0]
-                random_idx = torch.randint(
-                    0, len(batch_node_indices), (1,), device=device
-                ).item()
-                node_to_keep = batch_node_indices[random_idx]
-                mask[node_to_keep] = True
-    else:
-        # For non-batched data: ensure at least one atom remains overall
-        nodes_to_keep = mask.sum().item()
-        total_nodes = mask.shape[0]
-
-        if nodes_to_keep == 0 and total_nodes > 0:
-            # All nodes would be removed - keep a random one
-            random_idx = torch.randint(0, total_nodes, (1,), device=device).item()
-            mask[random_idx] = True"""
-
     # 1. Update Topology
     # Check for both edge_index AND e to prevent crashes
     has_edges = mol.edge_index is not None and mol.edge_index.numel() > 0

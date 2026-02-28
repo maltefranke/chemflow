@@ -36,6 +36,8 @@ module:
     concentration1: 2.0
     concentration0: 1.0
   integrator: ${model.integrator}
+  ema_decay: 0.9999
+  use_ema_for_eval: true
 
   vocab: ${data.vocab}
   

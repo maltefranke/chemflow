@@ -18,11 +18,11 @@ def sample_prior_graph(
     # sample number of atoms from train distribution
     N_atoms = n_atoms if n_atoms is not None else p_n_atoms.sample()
 
-    # sample atom types from train distribution
+    # sample atom types from configured distribution
     atom_types = p_atom_types.sample(sample_shape=(N_atoms,))
     atom_types = atom_types.to(torch.long)
 
-    # sample charge types from train distribution
+    # sample charge types from configured distribution
     charge_types = p_charge_types.sample(sample_shape=(N_atoms,))
     charge_types = charge_types.to(torch.long)
 

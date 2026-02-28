@@ -7,6 +7,7 @@ from chemflow.flow_matching.gmm import (
 from chemflow.utils import (
     token_to_index,
     EdgeAligner,
+    validate_no_cross_batch_edges,
 )
 
 from chemflow.dataset.molecule_data import (
@@ -16,13 +17,34 @@ from chemflow.dataset.molecule_data import (
     join_molecules_with_atoms,
     join_molecules_with_predicted_edges,
     filter_nodes,
-    validate_no_cross_batch_edges,
 )
 from chemflow.dataset.vocab import Vocab, Distributions
-from chemflow.flow_matching.schedules import BetaSchedule
+from chemflow.flow_matching.schedules import (
+    FastPowerSchedule,
+    KappaSchedule,
+    LinearSchedule,
+)
 
 
 class RateIntegrator:
+    """
+    Integrator for flow matching with discrete and continuous updates.
+
+    Handles integration steps for molecular generation using rate-based processes
+    for substitutions, deletions, and insertions. Supports both typed and untyped
+    categorical strategies and flexible/fixed atom count strategies.
+
+    Args:
+        vocab: Vocabulary containing atom, edge, and charge tokens
+        distributions: Distribution statistics for the dataset
+        gmm_params: Parameters for Gaussian Mixture Model used in insertions
+        cat_strategy: Categorical strategy ("uniform-sample" or "mask")
+        n_atoms_strategy: Strategy for number of atoms ("flexible" or "fixed")
+        num_integration_steps: Number of integration steps from t=0 to t=1
+        time_strategy: Time scheduling strategy ("linear" or "log")
+        device: Device to run computations on
+    """
+
     def __init__(
         self,
         vocab: Vocab,
@@ -32,8 +54,10 @@ class RateIntegrator:
         n_atoms_strategy="flexible",
         num_integration_steps=100,
         time_strategy="log",
-        del_schedule: BetaSchedule = None,
-        ins_schedule: BetaSchedule = None,
+        del_schedule: KappaSchedule | None = None,
+        ins_schedule: KappaSchedule | None = None,
+        sub_schedule: KappaSchedule | None = None,
+        sub_e_schedule: KappaSchedule | None = None,
         device="cuda" if torch.cuda.is_available() else "cpu",
     ):
         self.vocab = vocab
@@ -46,20 +70,33 @@ class RateIntegrator:
         self.device = device
 
         if del_schedule is None:
-            self.del_schedule = BetaSchedule(k_alpha=1.0, k_beta=1.5)
+            self.del_schedule = FastPowerSchedule(beta=2.5)
         else:
             self.del_schedule = del_schedule
 
         if ins_schedule is None:
-            self.ins_schedule = BetaSchedule(k_alpha=1.0, k_beta=1.5)
+            self.ins_schedule = FastPowerSchedule(beta=2.5)
         else:
             self.ins_schedule = ins_schedule
+
+        if sub_schedule is None:
+            self.sub_schedule = LinearSchedule()
+        else:
+            self.sub_schedule = sub_schedule
+
+        if sub_e_schedule is None:
+            self.sub_e_schedule = self.sub_schedule
+        else:
+            self.sub_e_schedule = sub_e_schedule
 
         if self.cat_strategy == "mask":
             self.edge_mask_index = token_to_index(self.vocab.edge_tokens, "<MASK>")
             self.atom_mask_index = token_to_index(self.vocab.atom_tokens, "<MASK>")
 
         self.edge_aligner = EdgeAligner()
+
+        n_atoms_distribution = self.distributions.n_atoms_distribution
+        self.max_atoms = len(n_atoms_distribution) + 1
 
     def get_time_steps(self, num_steps: int | None = None) -> list[float]:
         if num_steps is None:
@@ -83,82 +120,6 @@ class RateIntegrator:
 
         return step_sizes
 
-    def discrete_integration_step_gnn(
-        self,
-        class_curr: torch.Tensor,
-        class_probs_1: torch.Tensor,
-        t: torch.Tensor,
-        batch_idx: torch.Tensor,
-        dt: float,
-        noise_scale: float = 0.0,
-        mask: torch.Tensor = None,
-    ) -> torch.Tensor:
-        """
-        Performs a single Euler-Forward integration step for Discrete Flow Matching
-        adapted for Graph Neural Networks (stacked node batching).
-
-        Args:
-            class_curr (Tensor): Current node token indices. Shape [N, 1] or [N].
-            class_probs_1 (Tensor): Predicted target probabilities. Shape [N, Vocab].
-            t (Tensor): Current time per graph. Shape [Batch_Size].
-            batch_idx (Tensor): Batch index for each node (e.g., from PyG Data.batch). Shape [N].
-            dt (float): Integration timestep size.
-            noise_scale (float): Additive uniform noise rate.
-            mask (Tensor, optional): Boolean mask (True to ignore node). Shape [N, 1] or [N].
-
-        Returns:
-            a_next (Tensor): Updated node tokens. Shape [N, 1].
-        """
-        # 0. Standardization
-        # Ensure a_curr is [N, 1] for scatter consistency, but we often need [N] for logic
-        if class_curr.ndim == 1:
-            class_curr = class_curr.unsqueeze(-1)  # [N, 1]
-
-        # 1. Broadcast Time to Nodes
-        # t is [Batch_Size], we need [N, 1] to match a_1_probs
-        # t[batch_idx] expands it to [N], then view adds the vocab dim
-        times = t[batch_idx].view(-1, 1).clamp(min=1e-5, max=1.0 - 1e-5)
-
-        # 2. Calculate Deterministic Rate: Rate = p_1(y) / (1 - t)
-        # rate_scalar will be [N, 1]
-        rate_scalar = 1.0 / (1.0 - times)
-        rates = class_probs_1 * rate_scalar
-
-        # 3. Add Stochastic Noise (Optional)
-        if noise_scale > 0:
-            rates = rates + noise_scale
-
-        # 4. Zero out the Diagonal (Self-transitions)
-        # rates is [N, Vocab], a_curr is [N, 1]
-        # We set the rate of staying (x -> x) to 0 temporarily
-        rates.scatter_(-1, class_curr, 0.0)
-
-        # 5. Convert Rates to Probabilities
-        step_probs = rates * dt
-
-        # 6. Calculate Probability to Stay
-        # P(stay) = 1 - sum(P(jump to y))
-        off_diag_sum = step_probs.sum(dim=-1, keepdim=True)
-        stay_prob = (1.0 - off_diag_sum).clamp(min=0.0)
-
-        # Insert stay probability back into the current token's position
-        step_probs.scatter_(-1, class_curr, stay_prob)
-
-        # 7. Sample Next State
-        # Categorical samples from [N, Vocab] -> returns [N]
-        class_pred = torch.distributions.Categorical(probs=step_probs).sample()
-
-        # Reshape back to [N, 1] to maintain input shape consistency
-        class_pred = class_pred.view(-1, 1)
-
-        # 8. Apply Mask (if provided)
-        if mask is not None:
-            if mask.ndim == 1:
-                mask = mask.unsqueeze(-1)
-            class_pred = torch.where(mask, class_curr, class_pred)
-
-        return class_pred
-
     def sample_insertions(
         self,
         ins_gmm_dict: dict,
@@ -176,7 +137,7 @@ class RateIntegrator:
         Returns:
             new_atoms: PointCloud - new atoms
         """
-        # We will only do one insertion at a time
+        # We will only do one insertion per provided GMM at a time
         num_ins = 1
 
         # Sample from GMM for this graph
@@ -212,18 +173,20 @@ class RateIntegrator:
         self,
         mol_t: MoleculeData,
         mol_1_pred: MoleculeData,
-        sub_rate_a: torch.Tensor,
-        # sub_rate_c: torch.Tensor,
-        sub_rate_e: torch.Tensor,
-        del_rate: torch.Tensor,
-        ins_rate: torch.Tensor,
+        do_sub_a_probs: torch.Tensor,
+        do_sub_e_probs: torch.Tensor,
+        do_del_probs: torch.Tensor,
+        do_ins_probs: torch.Tensor,
+        num_ins_pred: torch.Tensor,
         ins_gmm_preds: torch.Tensor,
         t: torch.Tensor,
         dt: float,
         eps: float = 1e-6,
         h_latent: torch.Tensor = None,
         ins_edge_head=None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        global_ins_budget: torch.Tensor = None,
+        global_del_budget: torch.Tensor = None,
+    ) -> MoleculeBatch:
         """
         Integrate one step of the stochastic process for GNN models.
 
@@ -231,125 +194,235 @@ class RateIntegrator:
         All tensors are flat (no padding).
 
         Args:
-            mol_t: MoleculeData - current molecule
-            mol_1_pred: MoleculeData - predicted molecule
-            sub_rate_a: Shape (N,) - node-level atom type substitution rates
-            sub_rate_c: Shape (N,) - node-level charge substitution rates
-            sub_rate_e: Shape (E,) - edge-level edge type substitution rates
-            del_rate: Shape (N,) - node-level deletion rates
-            ins_rate: Shape (N,) - node-level insertion rates
-            ins_gmm_preds:       - GMM parameters for each node
-            t: Shape (num_graphs,) - current time for each graph
-            dt: Time step
-            eps: Small epsilon value for numerical stability
-            h_latent: Shape (N, hidden_dim) - latent node features for edge prediction
-            ins_edge_head: InsertionEdgeHead instance for predicting edges (or None)
+            mol_t: Current molecule state at time t
+            mol_1_pred: Predicted molecule state at time t=1
+            do_sub_a_probs: Shape (N,) - probabilities for atom type substitution decisions (scalar per node)
+            do_sub_e_probs: Shape (E,) - probabilities for edge type substitution decisions (scalar per edge)
+            do_del_probs: Shape (N,) - probabilities for deletion decisions (scalar per node)
+            do_ins_probs: Shape (N,) - probabilities for insertion decisions (scalar per node)
+            num_ins_pred: Shape (N,) - predicted number of insertions per node (used to compute insertion probability)
+            ins_gmm_preds: Dict with GMM parameters (mu, sigma, pi, a_probs, c_probs) for each node
+            t: Shape (num_graphs,) - current time for each graph in the batch
+            dt: Time step size
+            eps: Small epsilon value for numerical stability (default: 1e-6)
+            h_latent: Shape (N, hidden_dim) - latent node features for edge prediction (optional)
+            ins_edge_head: InsertionEdgeHead instance for predicting edges (optional)
+            global_ins_budget: Shape (num_graphs,) - predicted total number of insertions remaining
+                              for each graph (from global_ins_budget_head). If provided, uses
+                              velocity-based budget allocation instead of per-node Poisson sampling.
+            global_del_budget: Shape (num_graphs,) - predicted total number of deletions remaining
+                              for each graph (from global_del_budget_head). If provided, uses
+                              velocity-based budget allocation instead of per-node Poisson sampling.
 
         Returns:
-            mol_t_final: MoleculeData - updated molecule with the new atoms
+            mol_t_final: MoleculeBatch - updated molecule after one integration step
         """
 
-        x, a, c, e, edge_index, batch_id = mol_t.unpack()
+        x_t, a_t, c_t, e_t, edge_index, batch_id = mol_t.unpack()
         x_1, a_1, c_1, e_1, edge_index_1, _ = mol_1_pred.unpack()
 
-        # 1. Update positions (Euler-Maruyama scheme)
-        velocity = (x_1 - x) / (1 - t[batch_id].unsqueeze(-1)).clamp(
-            min=eps, max=1.0 - eps
-        )
-        x = x + velocity * dt
+        # Rate for movement
+        # TODO if we change the position interpolation, need to change this
+        move_rate = 1 / (1 - t).clamp(min=eps, max=1.0 - eps)
+        move_rate_node = move_rate[batch_id]
 
-        # 1. Independent Insertion (as per text)
+        # Rate for atom-level substitution
+        sub_rate = self.sub_schedule.rate(t)
+        sub_rate_node = sub_rate[batch_id]
+
+        # Rate for edge-level substitution (separate schedule)
+        sub_e_rate = self.sub_e_schedule.rate(t)
+
+        # Rate for insertion
+        ins_rate = self.ins_schedule.rate(t)
+        ins_rate_node = ins_rate[batch_id]
+
+        # Rate for deletion
+        del_rate = self.del_schedule.rate(t)
+        del_rate_node = del_rate[batch_id]
+
+        # 1. Update positions (Euler-Maruyama scheme)
+        x_t_original = x_t
+
+        velocity = (x_1 - x_t) * move_rate_node.view(-1, 1)
+        x_t = x_t + velocity * dt
+
+        # 1. Handle insertions using global budget (velocity-based) or local Poisson
+        num_graphs = t.shape[0]
+
+        # Per-node Poisson sampling
         # Sample whether to insert with probability h * lambda_ins
-        p_ins = ins_rate * dt
-        p_ins = p_ins.squeeze(-1)
+        p_ins = do_ins_probs
+        p_ins = p_ins.view(-1)
         do_ins = torch.rand_like(p_ins) < p_ins
 
-        # 2. Deletion OR Substitution (Hierarchical Step)
-        # Sample whether to delete or substitute with probability h(lambda_del + lambda_sub)
-        total_sub_rate = sub_rate_a  # + sub_rate_c
-        total_mod_rate = del_rate + total_sub_rate
+        # for insertion, we will then sample from the poisson distribution
+        expected_num_ins = num_ins_pred * ins_rate_node * dt
+        # NOTE in OneFlow, instead of sampling Poisson, they sample Bernoulli
+        ins_sampled = torch.rand_like(expected_num_ins) < expected_num_ins
 
-        p_mod = total_mod_rate * dt
-        p_mod = p_mod.squeeze(-1)
-        do_mod = torch.rand_like(p_mod) < p_mod
+        # do_ins = do_ins & (num_ins > 0)
+        do_ins = do_ins & ins_sampled
 
-        # Initialize masks
-        do_del = torch.zeros_like(do_mod)
-        # mask for general substitution
-        do_sub = torch.zeros_like(do_mod)
-        # mask for atom type & chargesubstitution
-        do_sub_a = torch.zeros_like(do_mod)
-        do_sub_c = torch.zeros_like(do_mod)
+        # Fail-safe: ensure that the number of atoms per graph won't be greater than the max number of atoms
+        if do_ins.any():
+            for g in range(num_graphs):
+                graph_mask = batch_id == g
+                n_atoms_g = x_t[graph_mask].shape[0]
+                n_inserts_g = do_ins[graph_mask].sum().item()
 
-        # Only process the positions where a modification actually occurred
-        # This saves computation and strictly follows the "exclusive" logic
-        mod_indices = torch.nonzero(do_mod)
+                if n_atoms_g + n_inserts_g > self.max_atoms:
+                    # pick random insertions until n_max_atoms is reached
+                    n_to_remove = n_atoms_g + n_inserts_g - self.max_atoms
+                    removed_indices = torch.where(graph_mask & do_ins)[0]
+                    # random permutation of the indices
+                    removed_indices = removed_indices[
+                        torch.randperm(removed_indices.shape[0])
+                    ]
+                    removed_indices = removed_indices[:n_to_remove]
+                    do_ins[removed_indices] = False
 
-        if len(mod_indices) > 0:
-            # Select del with p = lambda_del / (lambda_del + lambda_sub)
-            # Extract rates only for the active indices to save memory/compute
-            curr_del_rate = del_rate[do_mod].squeeze(-1)
-            curr_total_rate = total_mod_rate[do_mod].squeeze(-1)
+        """DELETION or SUBSTITUTION"""
+        # TODO implement multinomial sampling for deletion like above for insertions
+        # TODO this should take into account the logic below (conflicts with substitution)
 
-            # Calculate conditional split w/ epsilon for stability
-            p_cond_del = curr_del_rate / (curr_total_rate + 1e-8)
+        # 1. Scale probabilities by time (converting prob -> rate * dt)
+        # rate_node is 1 / (1 - t)
+        """do_sub_a = torch.rand_like(do_sub_a_probs) < do_sub_a_probs
+        do_del = torch.rand_like(do_del_probs) < do_del_probs
 
-            # Sample the decision
-            is_deletion = torch.rand_like(p_cond_del) < p_cond_del
+        p_sub_scaled = do_sub_a.long().view(-1) * sub_rate_node * dt
+        p_del_scaled = do_del.long().view(-1) * del_rate_node * dt"""
 
-            # Assign back to the main masks
-            do_del[do_mod] = is_deletion
-            do_sub[do_mod] = ~is_deletion
+        p_sub_scaled = do_sub_a_probs.view(-1) * sub_rate_node * dt
+        p_del_scaled = do_del_probs.view(-1) * del_rate_node * dt
 
-            """# now select if we should change the charge or atom type with
-            # p = lambda_sub_c / (lambda_sub_a + lambda_sub_c)
-            p_sub_c = sub_rate_c.squeeze(-1) / (total_sub_rate.squeeze(-1) + 1e-8)
-            do_sub_c = torch.rand_like(p_sub_c) < p_sub_c
-            do_sub_a = ~do_sub_c
+        # 2. Sum rates first (Paper Formulation)
+        # "probability of ANY edit is h(lambda_sub + lambda_del)"
+        p_any_edit = p_sub_scaled + p_del_scaled
 
-            do_sub_c = do_sub_c & do_sub
-            do_sub_a = do_sub_a & do_sub"""
+        # 3. Sample "Does an edit happen?" (1 Random Sample)
+        do_edit = torch.rand_like(p_any_edit) < p_any_edit
 
-        # Do substitution
-        # TODO should we sample them both at the same time, or separate c?
-        a[do_sub] = a_1[do_sub]
-        # c[do_sub_c] = c_1[do_sub_c]
+        # 4. If edit happens, decide Which Type (1 Random Sample)
+        # We only need to compute this splitting logic where edits actually happen,
+        # but doing it globally and masking is usually faster than indexing on GPUs
+        # due to memory fragmentation.
+        prob_cond_del = p_del_scaled / (p_any_edit + 1e-8)
+        is_deletion_type = torch.rand_like(prob_cond_del) < prob_cond_del
+
+        # 5. Assign Final Masks
+        # An edit occurs AND it is a deletion type
+        do_del = do_edit & is_deletion_type
+
+        # An edit occurs AND it is NOT a deletion type (therefore substitution)
+        do_sub_a = do_edit & (~is_deletion_type)
+
+        """# 1. Modulate base rates with the neural network's continuous probabilities
+        lambda_sub = do_sub_a_probs.view(-1) * sub_rate_node
+        lambda_del = do_del_probs.view(-1) * del_rate_node
+
+        # 2. Calculate safe bounds for the independent probabilities
+        prob_sub = 1.0 - torch.exp(-lambda_sub * dt)
+        prob_del = 1.0 - torch.exp(-lambda_del * dt)
+
+        # 3. Sample the independent events (Coin flips)
+        do_sub_raw = torch.rand_like(prob_sub) < prob_sub
+        do_del_raw = torch.rand_like(prob_del) < prob_del
+
+        # 4. Apply "Sub over Deletion" conflict resolution
+        # Substitution gets absolute priority.
+        do_sub_a = do_sub_raw
+
+        # Deletion only happens if it triggered AND substitution did not.
+        do_del = do_del_raw & (~do_sub_raw)"""
+
+        # 6. Apply
+        # a_1 is your predicted token values from Step 2
+        a_t[do_sub_a] = a_1[do_sub_a]
 
         # 2.5. Update edge types
         # Get current edge types (already indices)
 
         # we will deal with only the triu edge types and symmetrize later
         edge_infos = self.edge_aligner.align_edges(
-            source_group=(edge_index, [e, sub_rate_e]),
+            source_group=(edge_index, [e_t, do_sub_e_probs]),
             target_group=(edge_index_1, [e_1]),
         )
-        e_triu, sub_rate_e_triu, e_1_triu = edge_infos["edge_attr"]
+        e_triu, do_sub_e_probs_triu, e_1_triu = edge_infos["edge_attr"]
         edge_index_triu, _ = edge_infos["edge_index"]
 
-        p_sub_e = sub_rate_e_triu * dt
-        p_sub_e = p_sub_e.squeeze(-1)
+        """# Use probabilities directly (sigmoid already applied in sample())
+        p_sub_e = do_sub_e_probs_triu.view(-1)
         do_sub_e = torch.rand_like(p_sub_e) < p_sub_e
+
+        # Get batch_id for edges from the source nodes of the edges
+        # edge_index_triu[0] gives the source node indices for each edge
+        batch_id_edge = batch_id[edge_index_triu[0]]
+
+        # Calculate rate for edges using the separate edge substitution schedule
+        rate_edge = sub_e_rate[batch_id_edge].unsqueeze(-1)
+        p_mod_e = rate_edge * dt
+        p_mod_e = p_mod_e.view(-1)
+
+        do_mod_e = torch.rand_like(p_mod_e) < p_mod_e
+
+        do_sub_e = do_sub_e & do_mod_e"""
+
+        # Use probabilities directly (sigmoid already applied in sample())
+        p_sub_e = do_sub_e_probs_triu.view(-1)
+
+        # Get batch_id for edges from the source nodes of the edges
+        # edge_index_triu[0] gives the source node indices for each edge
+        batch_id_edge = batch_id[edge_index_triu[0]]
+
+        # Calculate rate for edges using the separate edge substitution schedule
+        sub_e_rate_triu = sub_e_rate[batch_id_edge]
+        p_mod_e = p_sub_e * sub_e_rate_triu * dt
+        p_mod_e = p_mod_e.view(-1)
+        do_sub_e = torch.rand_like(p_mod_e) < p_mod_e
         e_triu[do_sub_e] = e_1_triu[do_sub_e]
 
         # Finally, symmetrize the edge types
         edge_index, e_attrs = self.edge_aligner.symmetrize_edges(
             edge_index_triu, [e_triu]
         )
-        e = e_attrs[0]
+        e_t = e_attrs[0]
 
         mol = MoleculeBatch(
-            x=x,
-            a=a,
-            c=c_1,  # always take the predicted charge
-            e=e,
+            x=x_t,
+            a=a_t,
+            c=c_1,  # always take the predicted charge, c not interpolated
+            e=e_t,
             edge_index=edge_index,
             batch=batch_id,
         )
+
+        # Validate: check for cross-batch edges after edge symmetrization
+        is_cb = validate_no_cross_batch_edges(
+            edge_index, batch_id, "integration_adjusted: after edge symmetrization"
+        )
+        if not is_cb:
+            exit()
 
         if self.n_atoms_strategy != "fixed":
             # Build index mapping: original_idx -> post_deletion_idx (or -1 if deleted)
             N_original = mol.num_nodes
             keep_mask = ~do_del
+
+            # Fail-safe: prevent deletion of entire sample (keep at least 2 nodes per batch_id)
+            num_graphs_safe = batch_id.max().item() + 1
+            for g in range(num_graphs_safe):
+                graph_mask = batch_id == g
+                n_kept = (keep_mask & graph_mask).sum().item()
+                if n_kept < 2:
+                    n_to_restore = 2 - n_kept
+                    deleted_in_graph_idx = torch.where(graph_mask & do_del)[0]
+                    n_restore = min(n_to_restore, deleted_in_graph_idx.shape[0])
+                    if n_restore > 0:
+                        restore_indices = deleted_in_graph_idx[:n_restore]
+                        keep_mask[restore_indices] = True
+
             original_to_postdel = torch.full(
                 (N_original,), -1, dtype=torch.long, device=self.device
             )
@@ -361,6 +434,14 @@ class RateIntegrator:
             # 3. Remove the deleted nodes
             if do_del.any():
                 mol = filter_nodes(mol, keep_mask)
+                # Validate: check for cross-batch edges after filtering
+                is_cb = validate_no_cross_batch_edges(
+                    mol.edge_index,
+                    mol.batch,
+                    "integration_adjusted: after filter_nodes",
+                )
+                if not is_cb:
+                    exit()
 
             # 4. Add the new insertions
             # Allow insertions from ALL nodes, including deleted ones.
@@ -412,11 +493,10 @@ class RateIntegrator:
                 ins_edge_target_idx = None
 
                 if ins_edge_head is not None and h_latent is not None:
-                    # Predict using original indices (h_latent uses original indexing)
                     orig_spawn_idx, orig_target_idx, ins_edge_logits = (
                         ins_edge_head.predict_edges_for_insertion(
                             h=h_latent,
-                            x=x_1,
+                            x=x_t_original,
                             gmm_dict=ins_gmm_preds,
                             batch=batch_id,
                             insertion_mask=do_ins_valid,
@@ -469,8 +549,9 @@ class RateIntegrator:
                     # Fall back to random edge sampling
                     mol = join_molecules_with_atoms(mol, new_atoms, edge_dist)
 
+                # Validate: check for cross-batch edges after joining
                 validate_no_cross_batch_edges(
-                    mol.edge_index, mol.batch, "integration: after joining"
+                    mol.edge_index, mol.batch, "integration_adjusted: after joining"
                 )
 
         return mol

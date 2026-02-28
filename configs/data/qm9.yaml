@@ -35,6 +35,11 @@ interpolator:
   del_schedule: ${schedule}
   ins_schedule: ${schedule}
   sub_schedule: ${schedule}
+  # sub_e_schedule: ${schedule}
+  sub_e_schedule: 
+    # _target_: chemflow.flow_matching.schedules.CubicSchedule
+    _target_: chemflow.flow_matching.schedules.SmoothstepSchedule
+    shift: 1.0
 
 datamodule:
   _target_: chemflow.dataset.lightning_datamodule.LightningDataModule

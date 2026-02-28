@@ -1,0 +1,316 @@
+## Transformer backbone for QM9 (adjusted)
+gmm_params:
+    K: 5
+    D: 3
+
+rotate: true
+
+is_typed: ${if:${eq:${data.cat_strategy},uniform-sample},true,false}
+output_dim_typed: ${oc.eval:"${model.gmm_params.K} * (2 + ${model.gmm_params.D} + ${len:${data.vocab.atom_tokens}} + ${len:${data.vocab.charge_tokens}})"}
+output_dim_untyped: ${oc.eval:"${model.gmm_params.K} * (3 +  ${model.gmm_params.D})"}
+
+# Insertion rate strategy: "poisson" (regression with Poisson NLL) or "classification" (cross-entropy)
+ins_rate_strategy: "poisson"
+
+integrator:
+  _target_: chemflow.flow_matching.integration.RateIntegrator
+  vocab: ${data.vocab}
+  distributions: None
+  gmm_params: ${model.gmm_params}
+  cat_strategy: ${data.cat_strategy}
+  n_atoms_strategy: ${data.n_atoms_strategy}
+  # strategy used for sampling time during **integration**
+  # NOTE can be different from the time strategy used for the model (see below)
+  time_strategy: linear # "linear" or "log"
+  num_integration_steps: 200
+  del_schedule: ${data.interpolator.del_schedule}
+  ins_schedule: ${data.interpolator.ins_schedule}
+  sub_schedule: ${data.interpolator.sub_schedule}
+  sub_e_schedule: ${data.interpolator.sub_e_schedule}
+  
+
+beta_sched:
+  # Beta distribution for time scheduling. 1.0 , 1.0 is equivalent to uniform distribution.
+  # SEMLAFLOW uses 2.0, 1.0
+  _target_: torch.distributions.Beta
+  concentration1: 2.0
+  concentration0: 1.0
+
+linear_sched:
+  _target_: torch.distributions.Uniform
+  low: 0.0
+  high: 1.0
+
+# strategy used for sampling time during **training**
+sample_time_strategy: linear
+
+module:
+  _target_: chemflow.model.lightning_module_transformer.LightningModuleRatesTransformer
+  # args and kwargs 
+  # tokens and atom_type_distribution will be passed from preprocessing in run.py
+  gmm_params: ${model.gmm_params}
+  n_atoms_strategy: ${data.n_atoms_strategy}
+  ins_rate_strategy: ${model.ins_rate_strategy}
+  type_loss_token_weights: training
+  cat_weighting:
+    _target_: DictConfig
+    cat_strategy: ${data.cat_strategy}
+    weight_alpha: 0.4
+  ins_noise_scale: ${data.ins_noise_scale}
+  edit_loss_ema_decay: 0.99
+  edit_loss_ema_eps: 1.0e-8
+  ema_decay: 0.9999
+  use_ema_for_eval: true
+  time_dist: ${if:${eq:${model.sample_time_strategy}, log}, ${model.beta_sched}, ${model.linear_sched}}
+  integrator: ${model.integrator}
+
+  cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.dropout_prob}, 0.0}
+  cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.guidance_scale}, 0.0}
+
+  natoms_cfg_dropout_prob: ${if:${model.do_natoms_cfg}, ${model.natoms_cfg.dropout_prob}, 0.0}
+  natoms_cfg_guidance_scale: ${if:${model.do_natoms_cfg}, ${model.natoms_cfg.guidance_scale}, 0.0}
+
+  vocab: ${data.vocab}
+  
+  # Loss component weights
+  use_learnable_loss_weights: false
+  loss_weights:
+    l_do_sub_a: 1.0 # 1.2
+    l_sub_a_class: 1.0
+    l_do_sub_e: 1.0
+    l_sub_e_class: 1.0
+    l_do_del: 2.0
+    l_do_ins: 2.0
+    l_ins_rate: 1.0
+    l_ins_gmm: 1.0
+    l_ins_e: 1.0
+    l_x: 20.0
+    l_c: 1.0
+    # Global budget prediction losses (cross-entropy classifiers)
+    l_global_ins_budget: 0.001  # Used for sampling
+    l_global_del_budget: 0.001  # Regularizer only (not used in sampling)
+
+  # Optimizer configuration
+  # MuonWithAuxAdam: Muon for 2D transformer weights, AdamW for the rest.
+  optimizer_config:
+    # Muon hyperparams (applied to 2D backbone weights)
+    optimizer:
+      lr: 0.02
+      momentum: 0.95
+      weight_decay: 0.01
+
+    # AdamW hyperparams (applied to embeddings, heads, biases, norms)
+    aux_optimizer:
+      lr: 3e-4
+      betas: [0.9, 0.95]
+      eps: 1e-10
+      weight_decay: 0.0
+
+    scheduler:
+      _target_: chemflow.schedulers.MultiGroupCosineWarmupLR
+      # We don't pass 'optimizer' here; we inject it in the Python script.
+      warmup_steps: 1000        # Typically 2-5% of total_steps
+      total_steps: 50000        # The total number of training iterations
+      min_lr_fraction: 0.1      # Decays to 10% of the peak base_lrs defined in your optimizer
+      last_epoch: -1
+
+    interval: step
+    monitor: null
+
+  # The 'model' key below is an argument to your LightningModule
+  model:
+    _target_: chemflow.model.model.BackboneWithHeads
+    _recursive_: false
+
+    atom_type_embedding_args: ${model.atom_type_embedding}
+    edge_type_embedding_args: ${model.edge_type_embedding}
+    time_embedding_args: ${model.time_embedding}
+    node_count_embedding_args: ${model.node_count_embedding}
+
+    backbone_model_args: ${model.backbone}
+
+    heads_args: ${model.heads}
+    ins_gmm_head_args: ${model.gmm_head_args}
+    property_embedding_args: ${model.property_embedding}
+    bond_degree_embedding_args: ${model.bond_degree_embedding}
+    natoms_cfg_embedding_args: ${model.natoms_cfg_embedding}
+    ins_edge_head_args:
+      _target_: chemflow.model.heads.InsertionEdgeHead
+      _recursive_: false
+      hidden_dim: ${model.backbone.out_node_nf}
+      n_edge_types: ${len:${data.vocab.edge_tokens}} # Your number of edge types
+      n_atom_types: ${len:${data.vocab.atom_tokens}}  # Your number of atom types
+      n_charge_types: ${len:${data.vocab.charge_tokens}}  # Your number of charge types
+      rbf_embedding_args:
+        _target_: chemflow.model.embedding.RBFEmbedding
+        num_rbf: 128
+        rbf_dmax: 3.5
+        out_dim: 64
+        dropout: 0.05
+        trainable: false
+
+atom_type_embedding:
+  _target_: chemflow.model.embedding.Embedding
+  num_embeddings: ${len:${data.vocab.atom_tokens}}
+  embedding_dim: 64
+  out_dim: 128
+
+edge_type_embedding:
+  _target_: chemflow.model.embedding.Embedding
+  num_embeddings: ${len:${data.vocab.edge_tokens}}
+  embedding_dim: 64
+  out_dim: 128
+
+time_embedding:
+  _target_: chemflow.model.embedding.TimeEmbedding
+  embedding_dim: 64
+  out_dim: 128
+
+node_count_embedding:
+  _target_: chemflow.model.embedding.CountEmbedding
+  embedding_dim: 64
+  out_dim: 128
+
+# ── Classifier-free guidance master switch (property conditioning) ──
+do_cfg: false
+
+cfg:
+  dropout_prob: 0.15
+  guidance_scale: 1.5
+  property_embed_dim: 128
+  property_embedding:
+    _target_: chemflow.model.embedding.PropertyEmbedding
+    num_properties: 19
+    embedding_dim: 128
+    out_dim: 128
+
+property_embedding: ${if:${model.do_cfg}, ${model.cfg.property_embedding}, null}
+property_embed_dim: ${if:${model.do_cfg}, ${model.cfg.property_embed_dim}, 0}
+
+# ── Classifier-free guidance for target n_atoms (enabled by default) ──
+do_natoms_cfg: true
+
+natoms_cfg:
+  dropout_prob: 0.15
+  guidance_scale: 1.5
+  embed_dim: 128
+  embedding:
+    _target_: chemflow.model.embedding.NAtomsCFGEmbedding
+    embedding_dim: 64
+    out_dim: 128
+
+natoms_cfg_embedding: ${if:${model.do_natoms_cfg}, ${model.natoms_cfg.embedding}, null}
+natoms_cfg_embed_dim: ${if:${model.do_natoms_cfg}, ${model.natoms_cfg.embed_dim}, 0}
+
+bond_degree_embedding:
+  _target_: chemflow.model.embedding.BondDegreeEmbedding
+  n_edge_types: ${len:${data.vocab.edge_tokens}}
+  out_dim: 128
+bond_degree_embed_dim: 128
+
+backbone:
+  _target_: chemflow.model.backbones.transformer.Transformer
+  _recursive_: false
+  in_node_nf: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.property_embed_dim} + ${model.natoms_cfg_embed_dim} + ${model.bond_degree_embed_dim}"}
+  out_node_nf: 256
+  in_edge_nf: ${model.edge_type_embedding.out_dim}
+  rbf_embedding_args:
+    _target_: chemflow.model.embedding.RBFEmbedding
+    num_rbf: 128
+    rbf_dmax: 3.5
+    out_dim: 64
+    dropout: 0.05
+    trainable: false
+  d_model: 512
+  nhead: 16
+  dim_feedforward: 1024
+  activation: gelu
+  dropout: 0.0
+  norm_first: true
+  bias: true
+  num_layers: 8
+
+heads:
+  _target_: chemflow.model.heads.MultiHeadModule
+
+  heads_configs:
+    # Aggregation method for all graph heads
+    graph_aggregation: mean  # Options: mean, sum, max
+    
+    node_heads:
+      atom_type_head:
+        input_dim: ${model.backbone.out_node_nf}
+        output_dim: ${len:${data.vocab.atom_tokens}}
+        hidden_dim: 128
+
+      charge_head:
+        input_dim: ${model.backbone.out_node_nf}
+        output_dim: ${len:${data.vocab.charge_tokens}}
+        hidden_dim: 128
+
+      # Insertion rate head: output_dim depends on strategy
+      # - For "poisson": output_dim = 1 (regression)
+      # - For "classification": output_dim = max_n_atoms (number of classes)
+      # max_n_atoms will be determined at runtime from the n_atoms_distribution
+      ins_rate_head:
+        input_dim: ${model.backbone.out_node_nf}
+        output_dim: ${if:${eq:${model.ins_rate_strategy},classification},30,1}
+        hidden_dim: 128
+
+      do_ins_head:
+        input_dim: ${model.backbone.out_node_nf}
+        output_dim: 1
+        hidden_dim: 128
+
+      do_del_head:
+        input_dim: ${model.backbone.out_node_nf}
+        output_dim: 1
+        hidden_dim: 128
+
+      do_sub_a_head:
+        input_dim: ${model.backbone.out_node_nf}
+        output_dim: 1
+        hidden_dim: 128
+    
+    # Graph-level heads for global budget prediction
+    graph_heads:
+      # Predicts total number of insertions remaining to reach target size
+      # Used during sampling to determine step-level insertion budget
+      global_ins_budget_head:
+        input_dim: ${model.backbone.out_node_nf}
+        output_dim: 30  # Max possible insertions (same as ins_rate_head classes)
+        hidden_dim: 128
+
+      # Predicts total number of deletions remaining to reach target size
+      # Only used during training as a regularizer, not during sampling
+      global_del_budget_head:
+        input_dim: ${model.backbone.out_node_nf}
+        output_dim: 30  # Max possible deletions
+        hidden_dim: 128
+      
+    edge_heads:
+
+      edge_type_head:
+        input_dim: ${model.backbone.out_node_nf}
+        output_dim: ${len:${data.vocab.edge_tokens}}
+        hidden_dim: 128
+
+      do_sub_e_head:
+        input_dim: ${model.backbone.out_node_nf}
+        output_dim: 1
+        hidden_dim: 128
+
+gmm_head_args:
+  _target_: chemflow.model.heads.EquivariantGMMHead
+  _recursive_: false
+  hidden_dim: ${model.backbone.out_node_nf}
+  K: ${model.gmm_params.K}
+  N_a: ${len:${data.vocab.atom_tokens}}
+  N_c: ${len:${data.vocab.charge_tokens}}
+  rbf_embedding_args:
+    _target_: chemflow.model.embedding.RBFEmbedding
+    num_rbf: 128
+    rbf_dmax: 3.5
+    out_dim: 64
+    dropout: 0.05
+    trainable: false

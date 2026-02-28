@@ -71,3 +71,39 @@ class CosineWarmupLR(_LRScheduler):
             self.min_lr + (self.max_lr - self.min_lr) * cosine_decay
             for _ in self.base_lrs
         ]
+
+
+class MultiGroupCosineWarmupLR(_LRScheduler):
+    """
+    Linearly increases LR from 0 to each group's base_lr over warmup_steps,
+    then decays to a fraction of the base_lr using a cosine schedule.
+    """
+
+    def __init__(
+        self, optimizer, warmup_steps, total_steps, min_lr_fraction=0.1, last_epoch=-1
+    ):
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.min_lr_fraction = (
+            min_lr_fraction  # e.g., 0.1 means decay to 10% of base_lr
+        )
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        # 1. Linear Warmup Phase
+        if self.last_epoch < self.warmup_steps:
+            alpha = (self.last_epoch + 1) / max(1, self.warmup_steps)
+            return [base_lr * alpha for base_lr in self.base_lrs]
+
+        # 2. Cosine Decay Phase
+        progress = (self.last_epoch - self.warmup_steps) / max(
+            1, self.total_steps - self.warmup_steps
+        )
+        progress = min(progress, 1.0)  # Clip to ensure we don't go past end
+
+        cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+
+        # Calculate the multiplier scale (between min_lr_fraction and 1.0)
+        multiplier = self.min_lr_fraction + (1.0 - self.min_lr_fraction) * cosine_decay
+
+        return [base_lr * multiplier for base_lr in self.base_lrs]

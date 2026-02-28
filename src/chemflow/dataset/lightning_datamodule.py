@@ -155,6 +155,10 @@ class LightningDataModule(pl.LightningDataModule):
                 t,
             )
 
+            # Propagate molecular properties from targets for property conditioning
+            if hasattr(targets_batched, "y") and targets_batched.y is not None:
+                mols_t.y = targets_batched.y
+
             # Validate: check for cross-batch edges after interpolation
             validate_no_cross_batch_edges(
                 mols_t.edge_index, mols_t.batch, "collate_fn train mols_t"

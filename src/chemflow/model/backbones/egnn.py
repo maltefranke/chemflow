@@ -27,6 +27,10 @@ class EGNNWithEdgeType(EGNN):
         )
 
     def forward(self, h, x, edges, edge_attr, batch):
+
+        # store current coordinates for distance calculation
+        coord = x
+
         h = self.embedding_in(h)
         for i in range(0, self.n_layers):
             h, x, _ = self._modules["gcl_%d" % i](h, edges, x, edge_attr=edge_attr)
@@ -40,7 +44,7 @@ class EGNNWithEdgeType(EGNN):
         h_j = h[cols]  # [E, hidden]
 
         # Calculate final distances (actual distance, not squared)
-        dist_vec = x[rows] - x[cols]  # [E, 3]
+        dist_vec = coord[rows] - coord[cols]  # [E, 3]
         dist = torch.norm(dist_vec, dim=1)  # [E]
 
         # Embed distances using RBF

@@ -120,7 +120,7 @@ class CountEmbedding(nn.Module):
     """
 
     def __init__(
-        self, embedding_dim: int, out_dim: int = None, max_period: float = 10000.0
+        self, embedding_dim: int, out_dim: int = None, max_period: float = 500.0
     ):
         super().__init__()
         if out_dim is None:
@@ -156,7 +156,7 @@ class TimeEmbedding(nn.Module):
             out_dim = embedding_dim
         # For time in [0,1], max_period=10000 ensures high precision
         # for even very small time steps.
-        self.encoder = SinusoidalEncoding(embedding_dim, max_period=10000.0)
+        self.encoder = SinusoidalEncoding(embedding_dim, max_period=5000.0)
 
         # Standard MLP block for Diffusion/Flow models
         # Projects the fixed sinusoids into the learnable semantic space
@@ -174,6 +174,128 @@ class TimeEmbedding(nn.Module):
         times = times * 1000.0
         t_enc = self.encoder(times)
         return self.mlp(t_enc)
+
+
+class PropertyEmbedding(nn.Module):
+    """
+    Embeds continuous molecular property vectors for classifier-free guidance.
+
+    Includes a learnable null embedding for the unconditional case (CFG dropout).
+    Properties are graph-level features that get broadcast to all nodes in the graph.
+
+    Input:  Float Tensor [Batch, num_properties] (e.g., QM9 has 19 properties)
+    Output: Float Tensor [Batch, out_dim]
+    """
+
+    def __init__(
+        self,
+        num_properties: int,
+        embedding_dim: int,
+        out_dim: int = None,
+    ):
+        super().__init__()
+        if out_dim is None:
+            out_dim = embedding_dim
+
+        self.out_dim = out_dim
+
+        self.mlp = nn.Sequential(
+            nn.Linear(num_properties, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+            nn.SiLU(),
+            nn.Linear(embedding_dim, out_dim),
+        )
+
+        self.null_embedding = nn.Parameter(torch.randn(out_dim) * 0.02)
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.mlp.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(
+        self,
+        properties: torch.Tensor | None,
+        drop_mask: torch.Tensor | None = None,
+        batch_size: int | None = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            properties: [batch_size, num_properties] or None.
+                        If None, returns null embeddings.
+            drop_mask:  [batch_size] bool. True = use null (unconditional).
+            batch_size: Explicit batch size for the null embedding when
+                        both properties and drop_mask are None.
+        """
+        if properties is None:
+            if batch_size is None:
+                batch_size = drop_mask.shape[0] if drop_mask is not None else 1
+            return self.null_embedding.unsqueeze(0).expand(batch_size, -1)
+
+        emb = self.mlp(properties)
+
+        if drop_mask is not None and drop_mask.any():
+            null = self.null_embedding.unsqueeze(0).expand_as(emb)
+            emb = torch.where(drop_mask.unsqueeze(-1), null, emb)
+
+        return emb
+
+
+class NAtomsCFGEmbedding(nn.Module):
+    """Embeds a target atom count with classifier-free guidance dropout.
+
+    Wraps :class:`CountEmbedding` (sinusoidal encoding + learned MLP) and adds
+    a learnable null embedding for the unconditional case.  API mirrors
+    :class:`PropertyEmbedding` so the two can coexist independently.
+
+    Input:  Long/Float Tensor [Batch] (target atom counts, e.g. [5, 20, 10])
+    Output: Float Tensor [Batch, out_dim]
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        out_dim: int = None,
+        max_period: float = 500.0,
+    ):
+        super().__init__()
+        if out_dim is None:
+            out_dim = embedding_dim
+        self.out_dim = out_dim
+
+        self.count_embedding = CountEmbedding(
+            embedding_dim=embedding_dim, out_dim=out_dim, max_period=max_period
+        )
+        self.null_embedding = nn.Parameter(torch.randn(out_dim) * 0.02)
+
+    def forward(
+        self,
+        target_n_atoms: torch.Tensor | None,
+        drop_mask: torch.Tensor | None = None,
+        batch_size: int | None = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            target_n_atoms: [batch_size] integer counts, or None for fully
+                            unconditional (returns null embeddings).
+            drop_mask:      [batch_size] bool.  True → use null (unconditional).
+            batch_size:     Explicit size when both inputs are None.
+        """
+        if target_n_atoms is None:
+            if batch_size is None:
+                batch_size = drop_mask.shape[0] if drop_mask is not None else 1
+            return self.null_embedding.unsqueeze(0).expand(batch_size, -1)
+
+        emb = self.count_embedding(target_n_atoms)
+
+        if drop_mask is not None and drop_mask.any():
+            null = self.null_embedding.unsqueeze(0).expand_as(emb)
+            emb = torch.where(drop_mask.unsqueeze(-1), null, emb)
+
+        return emb
 
 
 class RBFEncoding(nn.Module):
@@ -300,3 +422,79 @@ class RBFEmbedding(nn.Module):
 
         # Apply projection
         return self.projection(rbf_enc)  # [N, out_dim]
+
+
+class BondDegreeEmbedding(nn.Module):
+    """Per-atom structural embedding based on bond-type degree histogram.
+
+    For each atom, counts how many edges of each type it has, then embeds
+    each count through a type-specific ``CountEmbedding`` (sinusoidal
+    encoding + learned projection).  This gives transformers explicit
+    awareness of local graph structure (e.g. detecting unattached atoms,
+    saturated vs unsaturated centres).
+    """
+
+    def __init__(
+        self,
+        n_edge_types: int,
+        out_dim: int,
+        per_type_dim: int = 16,
+    ):
+        super().__init__()
+        self.n_edge_types = n_edge_types
+
+        self.count_embeddings = nn.ModuleList(
+            [
+                CountEmbedding(
+                    embedding_dim=per_type_dim, out_dim=per_type_dim, max_period=100
+                )
+                for _ in range(n_edge_types)
+            ]
+        )
+        total_dim = n_edge_types * per_type_dim
+        self.proj = nn.Sequential(
+            nn.Linear(total_dim, out_dim),
+            nn.SiLU(),
+            nn.Linear(out_dim, out_dim),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.proj.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(
+        self,
+        e: torch.Tensor,
+        edge_index_row: torch.Tensor,
+        num_nodes: int,
+    ) -> torch.Tensor:
+        """
+        Args:
+            e: (E,) edge type indices
+            edge_index_row: (E,) source node index for each edge
+            num_nodes: total number of nodes in the batch
+
+        Returns:
+            (N, out_dim) structural embeddings per atom
+        """
+        e_onehot = torch.nn.functional.one_hot(
+            e.long(), self.n_edge_types
+        )  # (E, n_edge_types)
+        bond_hist = torch.zeros(
+            num_nodes, self.n_edge_types, dtype=torch.long, device=e.device
+        )
+        bond_hist.scatter_add_(
+            0,
+            edge_index_row.unsqueeze(1).expand_as(e_onehot),
+            e_onehot.long(),
+        )
+
+        type_embeds = [
+            self.count_embeddings[k](bond_hist[:, k]) for k in range(self.n_edge_types)
+        ]
+        combined = torch.cat(type_embeds, dim=-1)
+        return self.proj(combined)

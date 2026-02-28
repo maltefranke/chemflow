@@ -394,16 +394,16 @@ class InsertionEdgeHead(nn.Module):
         # ------------------------------------------------------------------
         # Slice the GMM dictionary for the relevant spawn nodes
         # pi: [E_ins, K]
-        pi_spawn = gmm_dict["pi"][spawn_node_idx]
+        pi_spawn = gmm_dict["pi"][spawn_node_idx].detach()
 
         # mu, sigma: [E_ins, K, 3]
-        mu_spawn = gmm_dict["mu"][spawn_node_idx]
+        mu_spawn = gmm_dict["mu"][spawn_node_idx].detach()
         # Ensure sigma is positive (softplus or exp usually done in model output)
-        sigma_spawn = gmm_dict["sigma"][spawn_node_idx]
+        sigma_spawn = gmm_dict["sigma"][spawn_node_idx].detach()
 
         # probs: [E_ins, K, n_types]
-        a_probs_spawn = gmm_dict["a_probs"][spawn_node_idx]
-        c_probs_spawn = gmm_dict["c_probs"][spawn_node_idx]
+        a_probs_spawn = gmm_dict["a_probs"][spawn_node_idx].detach()
+        c_probs_spawn = gmm_dict["c_probs"][spawn_node_idx].detach()
 
         # ------------------------------------------------------------------
         # 2. HIERARCHICAL SAMPLING
@@ -415,6 +415,7 @@ class InsertionEdgeHead(nn.Module):
         z_logits = torch.log(pi_spawn + 1e-9)
 
         # z: [E_ins, K] (One-hot if hard=True)
+        # NOTE: Since we detach, the differentiation through discrete types is actually not used
         z = F.gumbel_softmax(z_logits, tau=1.0, hard=hard_sampling)
 
         # B. Sample Position (x) - Gaussian Reparameterization
@@ -452,6 +453,8 @@ class InsertionEdgeHead(nn.Module):
         # ------------------------------------------------------------------
 
         # Get target positions and compute distance based on SAMPLED insertion_pos
+        # make sure gradients for edge prediction are not backpropagated to the pos predictions
+        x = x.detach()
         target_pos = x[target_node_idx]
         distances = torch.norm(insertion_pos - target_pos, dim=-1).clamp(min=1e-6)
         dist_features = self.rbf_embedding(distances)
@@ -506,19 +509,15 @@ class InsertionEdgeHead(nn.Module):
                 torch.empty(0, self.n_edge_types, device=device),
             )
 
-        # Build pairs: (spawn_node, all other nodes in same graph)
+        # Build pairs: (spawn_node, all nodes in same graph including spawn)
         spawn_list = []
         target_list = []
 
         for ins_idx in insertion_indices:
             graph_id = batch[ins_idx]
-            # Find all nodes in the same graph (excluding the spawn node itself)
-            same_graph_mask = (batch == graph_id) & (
-                torch.arange(len(batch), device=device) != ins_idx
-            )
+            same_graph_mask = batch == graph_id
             target_indices = torch.where(same_graph_mask)[0]
 
-            # Create pairs
             spawn_list.append(ins_idx.expand(len(target_indices)))
             target_list.append(target_indices)
 

@@ -96,8 +96,10 @@ class CubicSchedule(KappaSchedule):
         return 3 * t**2
 
     def rate(self, t: torch.Tensor, epsilon: float = 1e-6) -> torch.Tensor:
-        denom = torch.clamp(1 - t**3, min=epsilon)
-        return 3 * t**2 / denom
+        k_t = self.kappa_t(t)
+        k_t_dot = self.kappa_t_dot(t)
+        denom = torch.clamp(1 - k_t, min=epsilon)
+        return k_t_dot / denom
 
 
 class LinearSchedule(KappaSchedule):

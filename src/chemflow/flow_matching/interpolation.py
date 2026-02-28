@@ -41,6 +41,7 @@ class Interpolator:
         ins_schedule: KappaSchedule | None = None,
         del_schedule: KappaSchedule | None = None,
         sub_schedule: KappaSchedule | None = None,
+        sub_e_schedule: KappaSchedule | None = None,
         c_move=1.0,
         c_sub=0.0,
         c_ins=1e8,
@@ -52,8 +53,6 @@ class Interpolator:
 
         self.optimal_transport = optimal_transport
         self.ins_noise_scale = ins_noise_scale
-
-        # TODO could add a schedule for substitution (node, edge) and positions
 
         if del_schedule is None:
             self.del_schedule = FastPowerSchedule(beta=2.5)
@@ -69,6 +68,12 @@ class Interpolator:
             self.sub_schedule = LinearSchedule()
         else:
             self.sub_schedule = sub_schedule
+
+        # Separate schedule for edge type substitutions; falls back to sub_schedule
+        if sub_e_schedule is None:
+            self.sub_e_schedule = self.sub_schedule
+        else:
+            self.sub_e_schedule = sub_e_schedule
 
         self.c_move = c_move
         self.c_sub = c_sub
@@ -109,9 +114,11 @@ class Interpolator:
 
         # take kappa_t for discrete variables
         t_kappa = self.sub_schedule.kappa_t(t)
+        t_kappa_e = self.sub_e_schedule.kappa_t(t)
+
         a_t = self.interpolate_discrete(a_0, a_1, t_kappa)
         c_t = self.interpolate_discrete(c_0, c_1, t_kappa)
-        e_t = self.interpolate_discrete(e_0, e_1, t_kappa)
+        e_t = self.interpolate_discrete(e_0, e_1, t_kappa_e)
 
         # NOTE edge_index is the same for both m_0 and m_1, just take the first one
         # we make sure they are the same with the assert above
@@ -216,6 +223,7 @@ class Interpolator:
             # We then determine if the event happens with kappa_t.
 
             inst_rate_sub = self.sub_schedule.rate(t_i)
+            inst_rate_sub_e = self.sub_e_schedule.rate(t_i)
 
             tau_del = torch.rand(N, 1, device=device)
             t_del = self.del_schedule.kappa_t(t_i)
@@ -490,7 +498,7 @@ class Interpolator:
 
             interp_state.lambda_a_sub = need_a_sub * inst_rate_sub
             interp_state.lambda_c_sub = need_c_sub * inst_rate_sub
-            interp_state.lambda_e_sub = need_e_sub * inst_rate_sub
+            interp_state.lambda_e_sub = need_e_sub * inst_rate_sub_e
 
             # Graph-level counts of insertions and deletions still missing
             # These are used by the global budget heads for graph-level predictions

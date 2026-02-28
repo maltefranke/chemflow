@@ -1,5 +1,7 @@
-from chemflow.model.lightning_module_adjusted import LightningModuleRates
-from external_code.muon import MuonWithAuxAdam
+import torch.distributed as dist
+
+from chemflow.model.lightning_module import LightningModuleRates
+from external_code.muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
 from omegaconf import OmegaConf
 import hydra
 
@@ -7,9 +9,7 @@ import hydra
 class LightningModuleRatesTransformer(LightningModuleRates):
     def configure_optimizers(self):
         # Identify transformer backbone parameters by id
-        backbone_param_ids = {
-            id(p) for p in self.model.backbone.parameters()
-        }
+        backbone_param_ids = {id(p) for p in self.model.backbone.parameters()}
 
         # 2D backbone weights -> Muon
         # Everything else (backbone biases/norms, embeddings, heads) -> Adam
@@ -24,14 +24,10 @@ class LightningModuleRatesTransformer(LightningModuleRates):
         # Add learnable loss weight params to Adam group
         if (
             self.loss_weight_wrapper.use_learnable
-            and self.loss_weight_wrapper.learnable_wrapper
-            is not None
+            and self.loss_weight_wrapper.learnable_wrapper is not None
         ):
             adam_params.extend(
-                list(
-                    self.loss_weight_wrapper
-                    .learnable_wrapper.parameters()
-                )
+                list(self.loss_weight_wrapper.learnable_wrapper.parameters())
             )
 
         # Read hyperparameters from config
@@ -56,13 +52,14 @@ class LightningModuleRatesTransformer(LightningModuleRates):
             ),
         ]
 
-        optimizer = MuonWithAuxAdam(param_groups)
+        if dist.is_initialized():
+            optimizer = MuonWithAuxAdam(param_groups)
+        else:
+            optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
 
         # Instantiate scheduler from config
         scheduler_cfg = dict(
-            OmegaConf.to_container(
-                self.optimizer_config.scheduler, resolve=True
-            )
+            OmegaConf.to_container(self.optimizer_config.scheduler, resolve=True)
         )
         scheduler_cfg["optimizer"] = optimizer
         scheduler = hydra.utils.instantiate(scheduler_cfg)

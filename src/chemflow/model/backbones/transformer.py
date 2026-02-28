@@ -25,9 +25,7 @@ class Transformer(nn.Module):
         super().__init__()
 
         # RBF distance embedding for edge prediction
-        self.rbf_embedding = hydra.utils.instantiate(
-            rbf_embedding_args
-        )
+        self.rbf_embedding = hydra.utils.instantiate(rbf_embedding_args)
         rbf_out_dim = rbf_embedding_args.get(
             "out_dim", rbf_embedding_args.get("num_rbf", 16)
         )
@@ -88,27 +86,30 @@ class Transformer(nn.Module):
         h = h + self.pos_embedding(x)
 
         # Pad to dense batch and run transformer with padding mask
-        h_padded, atom_mask = to_dense_batch(h, batch)
+        h_padded, atom_mask = to_dense_batch(
+            h, batch, batch_size=batch.unique().shape[0]
+        )
         h_padded = self.model(h_padded, src_key_padding_mask=(~atom_mask))
         h = h_padded[atom_mask]
 
         # Project back to output dimension
         h = self.node_out(h)
 
-        x = self.pos_out(h)
+        x_out = self.pos_out(h)
 
         # Edge embeddings from src/tgt node feats + RBF distance
         rows, cols = edges
-        h_i = h[rows]   # (E, out_node_nf)
-        h_j = h[cols]   # (E, out_node_nf)
+        h_i = h[rows]  # (E, out_node_nf)
+        h_j = h[cols]  # (E, out_node_nf)
 
-        dist_vec = x[rows] - x[cols]          # (E, 3)
-        dist = torch.norm(dist_vec, dim=1)     # (E,)
-        dist_emb = self.rbf_embedding(dist)    # (E, rbf_out_dim)
+        dist_vec = x[rows] - x[cols]  # (E, 3)
+        dist = torch.norm(dist_vec, dim=1)  # (E,)
+        dist_emb = self.rbf_embedding(dist)  # (E, rbf_out_dim)
 
         edge_inputs = torch.cat(
-            [h_i, h_j, edge_attr, dist_emb], dim=-1,
+            [h_i, h_j, edge_attr, dist_emb],
+            dim=-1,
         )
         edge_emb = self.edge_output(edge_inputs)
 
-        return h, x, edge_emb
+        return h, x_out, edge_emb

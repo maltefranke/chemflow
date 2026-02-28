@@ -99,19 +99,16 @@ def typed_gmm_loss(
     # The helper returns a Categorical, so we can just grab the logits (normalized).
     log_prob_mix = mix_dist.logits  # Result: [N, 1, K]
 
-    # --- 5. Combine and Loss ---
-    # Sum log-probs: [N, 1, K]
-    log_joint = log_prob_mix + log_prob_x + log_prob_a + log_prob_c
+    # --- 5. Weight type log-probs only (not spatial) ---
+    a_weight = class_weights_a[target_a].view(N, 1, 1)
+    c_weight = class_weights_c[target_c].view(N, 1, 1)
+
+    log_joint = (
+        log_prob_mix + log_prob_x + log_prob_a * a_weight + log_prob_c * c_weight
+    )
 
     # LogSumExp over components (dim=-1): [N, 1]
     log_likelihood = torch.logsumexp(log_joint, dim=-1)
-
-    a_weight = class_weights_a[target_a].view(-1, 1)
-    c_weight = class_weights_c[target_c].view(-1, 1)
-
-    # Instead of multiplying the weights, we add them up to prevent exploding weight
-    weights = (a_weight + c_weight) / 2
-    log_likelihood = log_likelihood * weights
 
     # Average over nodes
     if reduction == "mean":
@@ -123,4 +120,4 @@ def typed_gmm_loss(
     else:
         raise ValueError(f"Invalid reduction: {reduction}")
 
-    return nll, weights
+    return nll, (a_weight, c_weight)

@@ -1,7 +1,7 @@
 defaults:
   - _self_
   - data: qm9
-  - model: egnn_adjusted_qm9
+  - model: dit
   - schedule: smoothstep
   - trainer: trainer
   - callbacks: callbacks
