@@ -11,7 +11,6 @@ from chemflow.utils import (
     token_to_index,
     compute_token_weights,
     EdgeAligner,
-    validate_no_cross_batch_edges,
 )
 from external_code.egnn import unsorted_segment_mean, unsorted_segment_sum
 
@@ -72,14 +71,14 @@ class LightningModuleRates(pl.LightningModule):
         edit_loss_ema_decay: float = 0.99,
         edit_loss_ema_eps: float = 1e-8,
         # Model EMA (exponential moving average of parameters for stable inference)
-        ema_decay: float = 0.9999,
+        ema_decay: float = 0.999,
         use_ema_for_eval: bool = True,
         # Classifier-free guidance parameters (property conditioning)
         cfg_dropout_prob: float = 0.0,
         cfg_guidance_scale: float = 0.0,
         # Classifier-free guidance parameters (target n_atoms conditioning)
         natoms_cfg_dropout_prob: float = 0.15,
-        natoms_cfg_guidance_scale: float = 1.5,
+        natoms_cfg_guidance_scale: float = 2.5,
     ):
         super().__init__()
 
@@ -228,14 +227,6 @@ class LightningModuleRates(pl.LightningModule):
         self.natoms_cfg_dropout_prob = float(natoms_cfg_dropout_prob)
         self.natoms_cfg_guidance_scale = float(natoms_cfg_guidance_scale)
 
-        # Keys whose predictions are guided during CFG inference
-        self._cfg_guided_keys = {
-            "pos_head",
-            "atom_type_head",
-            "charge_head",
-            "edge_type_head",
-        }
-
         self.save_hyperparameters()
         self.model = hydra.utils.instantiate(model)
 
@@ -293,9 +284,7 @@ class LightningModuleRates(pl.LightningModule):
         # NOTE inverse scaling, so w_ins should be high if n_del is high and vice versa
         w_ins = self.ema_n_del / denom
         w_del = self.ema_n_ins / denom
-        """w_min = torch.min(w_ins, w_del).clamp(min=self.edit_loss_ema_eps)
-        w_ins = w_ins / w_min
-        w_del = w_del / w_min"""
+
         return w_ins, w_del
 
     def compile(self):
@@ -364,24 +353,65 @@ class LightningModuleRates(pl.LightningModule):
             return None
         return torch.rand(batch_size, device=self.device) < self.natoms_cfg_dropout_prob
 
+    # Head categories for type-aware classifier-free guidance.
+    # Rule 1 & 2: linear extrapolation (positions, logits before softmax/sigmoid)
+    _cfg_linear_keys = {
+        "atom_type_head",
+        "charge_head",
+        "edge_type_head",
+        "do_ins_head",
+        "do_del_head",
+        "do_sub_a_head",
+        "do_sub_e_head",
+    }
+    # Rule 3: log-space CFG for strictly-positive rate outputs (post-softplus)
+    _cfg_rate_keys = {"ins_rate_head"}
+
+    # Rule 4: use conditional predictions for certain keys
+    _cfg_use_cond_keys = {"pos_head"}
+
     def _apply_cfg(
         self,
         preds_cond: dict,
         preds_uncond: dict,
         guidance_scale: float,
     ) -> dict:
-        """Blend conditional and unconditional predictions with CFG."""
+        """Type-aware classifier-free guidance."""
         guided = {}
         w = guidance_scale
-        for key, val in preds_cond.items():
-            if key in self._cfg_guided_keys:
-                guided[key] = (1.0 + w) * val - w * preds_uncond[key]
-            elif key == "gmm_head" and isinstance(val, dict):
-                guided[key] = {
-                    k: (1.0 + w) * v - w * preds_uncond[key][k] for k, v in val.items()
-                }
+
+        for key, v_cond in preds_cond.items():
+            v_uncond = preds_uncond[key]
+
+            if key in self._cfg_linear_keys:
+                guided[key] = v_uncond + w * (v_cond - v_uncond)
+
+            elif key in self._cfg_use_cond_keys:
+                guided[key] = v_cond
+
+            elif key in self._cfg_rate_keys:
+                log_cond = torch.log(v_cond.clamp_min(1e-12))
+                log_uncond = torch.log(v_uncond.clamp_min(1e-12))
+                guided[key] = torch.exp(log_uncond + w * (log_cond - log_uncond))
+
+            elif key == "gmm_head" and isinstance(v_cond, dict):
+                guided_gmm = {}
+                for k, gv_cond in v_cond.items():
+                    gv_uncond = v_uncond[k]
+                    if k in {"pi", "a_probs", "c_probs"}:
+                        cond_logits = torch.log(gv_cond.clamp_min(1e-12))
+                        uncond_logits = torch.log(gv_uncond.clamp_min(1e-12))
+                        guided_logits = uncond_logits + w * (
+                            cond_logits - uncond_logits
+                        )
+                        guided_gmm[k] = F.softmax(guided_logits, dim=-1)
+                    else:
+                        guided_gmm[k] = gv_cond
+                guided[key] = guided_gmm
+
             else:
-                guided[key] = val
+                guided[key] = v_cond
+
         return guided
 
     def forward(self, x):
@@ -578,32 +608,30 @@ class LightningModuleRates(pl.LightningModule):
 
         return class_loss
 
-    def global_budget_loss(self, budget_pred, target_budget, num_graphs):
+    def global_budget_loss(self, graph_rate_pred, target_budget):
         """
-        Calculate the global budget loss for graph-level predictions.
+        Calculate global budget loss from graph-level expected action counts.
 
-        This is a cross-entropy classification loss where we predict the total
-        number of insertions/deletions remaining to reach the target size.
+        Uses Poisson NLL between predicted expected counts (sum of node-wise rates)
+        and the target number of remaining actions per graph.
 
         Args:
-            budget_pred: Shape (num_graphs, num_classes) - logits for budget prediction
-            target_budget: Shape (num_graphs,) - target number of insertions/deletions
-            num_graphs: The number of graphs in the batch.
+            graph_rate_pred: Shape (num_graphs,) expected count per graph.
+            target_budget: Shape (num_graphs,) target count per graph.
 
         Returns:
-            loss: Scalar cross-entropy loss averaged over graphs
+            loss: Scalar Poisson NLL loss averaged over graphs.
         """
-        # Clamp target to valid range [0, num_classes - 1]
-        num_classes = budget_pred.shape[-1]
-        target_budget = target_budget.long().clamp(0, num_classes - 1)
-
-        # Cross-entropy loss
-        loss = F.cross_entropy(
-            budget_pred,
+        eps = 1e-8
+        graph_rate_pred = graph_rate_pred.float().clamp(min=eps)
+        target_budget = target_budget.float().clamp(min=0.0)
+        loss = F.poisson_nll_loss(
+            graph_rate_pred,
             target_budget,
+            log_input=False,
             reduction="mean",
+            full=True,
         )
-
         return loss
 
     def shared_step(self, batch, batch_idx):
@@ -615,14 +643,6 @@ class LightningModuleRates(pl.LightningModule):
             )
 
         mols_t, mols_1, ins_targets, t = batch
-
-        # Validate: check for cross-batch edges in training batch
-        validate_no_cross_batch_edges(
-            mols_t.edge_index, mols_t.batch, "training shared_step mols_t"
-        )
-        validate_no_cross_batch_edges(
-            mols_1.edge_index, mols_1.batch, "training shared_step mols_1"
-        )
 
         # randomized self-conditioning with p = 0.5 during training
         is_random_self_conditioning = (torch.rand(1) > 0.5).item()
@@ -657,10 +677,6 @@ class LightningModuleRates(pl.LightningModule):
         do_del_head = preds["do_del_head"]
         do_sub_a_head = preds["do_sub_a_head"]
         do_sub_e_head = preds["do_sub_e_head"]
-
-        # Global budget predictions (graph-level classifiers)
-        global_ins_budget_pred = preds.get("global_ins_budget_head", None)
-        global_del_budget_pred = preds.get("global_del_budget_head", None)
 
         # NOTE charges not in mol_t, so we need to predict them for all atoms
         pred_all_atoms = torch.ones_like(mols_1.c, dtype=torch.bool)
@@ -948,38 +964,45 @@ class LightningModuleRates(pl.LightningModule):
         else:
             x_loss = 0.0 * sum(p.sum() for p in self.model.pos_head.parameters())
 
-        # 4.5 Compute global budget losses (graph-level classifiers)
-        # Target: n_ins_missing and n_del_missing computed during interpolation
-        # These are the counts of insertions/deletions still needed to reach the target
+        # 4.5 Compute global budget losses from node-wise rates.
+        # Target: n_ins_missing and n_del_missing computed during interpolation.
         global_ins_budget_loss = torch.tensor(0.0, device=self.device)
         global_del_budget_loss = torch.tensor(0.0, device=self.device)
 
         if self.n_atoms_strategy != "fixed":
-            # Use precomputed graph-level counts from interpolation
-            # These are automatically batched by PyG as graph-level attributes
-            ins_budget_target = mols_t.n_ins_missing  # Shape: (num_graphs,)
-            del_budget_target = mols_t.n_del_missing  # Shape: (num_graphs,)
+            ins_budget_target = mols_t.n_ins_missing
+            del_budget_target = mols_t.n_del_missing
 
-            # Compute losses if heads are available
-            if global_ins_budget_pred is not None:
-                global_ins_budget_loss = self.global_budget_loss(
-                    global_ins_budget_pred,
-                    ins_budget_target,
-                    mols_t.num_graphs,
-                )
+            # Insertion node-wise rates: directly use the predicted rates.
+            ins_rate_node = ins_rate_pred.view(-1)
+            ins_rate_node = ins_rate_node.clamp(min=0.0)
+            ins_graph_expected = unsorted_segment_sum(
+                ins_rate_node.view(-1, 1),
+                mols_t.batch,
+                mols_t.num_graphs,
+            ).view(-1)
 
-            if global_del_budget_pred is not None:
-                global_del_budget_loss = self.global_budget_loss(
-                    global_del_budget_pred,
-                    del_budget_target,
-                    mols_t.num_graphs,
-                )
+            # Deletion node-wise rate: one deletion max per node -> Bernoulli expectation.
+            del_node_expected = torch.sigmoid(do_del_head.view(-1))
+            del_graph_expected = unsorted_segment_sum(
+                del_node_expected.view(-1, 1),
+                mols_t.batch,
+                mols_t.num_graphs,
+            ).view(-1)
 
-            # Log global budget losses
+            global_ins_budget_loss = self.global_budget_loss(
+                ins_graph_expected,
+                ins_budget_target,
+            )
+            global_del_budget_loss = self.global_budget_loss(
+                del_graph_expected,
+                del_budget_target,
+            )
+
             self.log_dict(
                 {
-                    "loss/global_budget/ins": global_ins_budget_loss,
-                    "loss/global_budget/del": global_del_budget_loss,
+                    "stats/ins_budget_pred_mean": ins_graph_expected.mean(),
+                    "stats/del_budget_pred_mean": del_graph_expected.mean(),
                     "stats/ins_budget_target_mean": ins_budget_target.float().mean(),
                     "stats/del_budget_target_mean": del_budget_target.float().mean(),
                 },
@@ -987,12 +1010,18 @@ class LightningModuleRates(pl.LightningModule):
                 logger=True,
             )
         else:
-            global_ins_budget_loss = 0.0 * sum(
-                p.sum() for p in self.model.global_ins_budget_head.parameters()
-            )
-            global_del_budget_loss = 0.0 * sum(
-                p.sum() for p in self.model.global_del_budget_head.parameters()
-            )
+            # Keep graph connectivity when the global budget terms are disabled.
+            global_ins_budget_loss = 0.0 * (do_ins_head.sum() + ins_rate_pred.sum())
+            global_del_budget_loss = 0.0 * do_del_head.sum()
+
+        self.log_dict(
+            {
+                "loss/global_budget/ins": global_ins_budget_loss,
+                "loss/global_budget/del": global_del_budget_loss,
+            },
+            prog_bar=False,
+            logger=True,
+        )
 
         n_inserts = (mols_t.lambda_ins > 0.0).sum().float()
         n_deletes = (mols_t.lambda_del > 0.0).sum().float()
@@ -1073,9 +1102,6 @@ class LightningModuleRates(pl.LightningModule):
                 "loss/edit_flow": edit_flow_loss,
                 "loss/move/x": x_loss,
                 "loss/move/x_weighted": x_loss_weighted,
-                "loss/move/c": c_loss,
-                "loss/move/c_weighted": c_loss_weighted,
-                "loss/move": x_loss_weighted + c_loss_weighted,
                 "loss/global_budget/weighted": global_budget_loss_weighted,
                 "stats/n_ins": n_inserts,
                 "stats/n_del": n_deletes,
@@ -1171,11 +1197,6 @@ class LightningModuleRates(pl.LightningModule):
 
         _ = mol_t.remove_com()
 
-        # Validate: check for cross-batch edges in initial sample
-        validate_no_cross_batch_edges(
-            mol_t.edge_index, mol_t.batch, "sample initial mol_t"
-        )
-
         # Start at t=0
         t = torch.zeros(batch_size, device=self.device)
         step_sizes = self.integrator.get_time_steps()
@@ -1206,36 +1227,40 @@ class LightningModuleRates(pl.LightningModule):
         for step_size in step_sizes:
             batch_id = mol_t.batch
 
-            # Get model predictions (conditional)
+            prev_preds = preds
+
+            # 1) Always start from unconditional predictions.
             preds = model(
                 mol_t,
                 t.view(-1, 1),
-                prev_outs=preds,
-                properties=properties,
-                target_n_atoms=target_n_atoms,
+                prev_outs=prev_preds,
+                properties=None,
+                target_n_atoms=None,
             )
 
-            # Apply n_atoms classifier-free guidance (separate from property CFG)
+            # 2) If n_atoms CFG is enabled, predict conditional and guide from uncond.
             if use_natoms_cfg:
-                preds_uncond_natoms = model(
+                preds_cond_natoms = model(
                     mol_t,
                     t.view(-1, 1),
-                    properties=properties,
-                    target_n_atoms=None,
-                )
-                preds = self._apply_cfg(
-                    preds, preds_uncond_natoms, self.natoms_cfg_guidance_scale
-                )
-
-            # Apply property classifier-free guidance
-            if use_cfg:
-                preds_uncond = model(
-                    mol_t,
-                    t.view(-1, 1),
+                    prev_outs=prev_preds,
                     properties=None,
                     target_n_atoms=target_n_atoms,
                 )
-                preds = self._apply_cfg(preds, preds_uncond, self.cfg_guidance_scale)
+                preds = self._apply_cfg(
+                    preds_cond_natoms, preds, self.natoms_cfg_guidance_scale
+                )
+
+            # 3) If property CFG is enabled, predict conditional and guide.
+            if use_cfg:
+                preds_cond = model(
+                    mol_t,
+                    t.view(-1, 1),
+                    prev_outs=prev_preds,
+                    properties=properties,
+                    target_n_atoms=target_n_atoms,
+                )
+                preds = self._apply_cfg(preds_cond, preds, self.cfg_guidance_scale)
 
             # Extract predictions
             x1_pred = preds["pos_head"]  # (N_total, D)
@@ -1315,43 +1340,6 @@ class LightningModuleRates(pl.LightningModule):
             # Get insertion edge head if available
             ins_edge_head = getattr(model, "ins_edge_head", None)
 
-            # Extract global insertion budget prediction (graph-level)
-            global_ins_budget = None
-            global_ins_budget_logits = preds.get("global_ins_budget_head", None)
-            if (
-                global_ins_budget_logits is not None
-                and self.n_atoms_strategy != "fixed"
-            ):
-                # TODO make temperature sampling hyperparam
-                temperature = 1.0
-                global_ins_budget_logits = global_ins_budget_logits / temperature
-
-                # Sample from categorical distribution to get the predicted budget
-                ins_budget_probs = F.softmax(global_ins_budget_logits, dim=-1)
-                global_ins_budget = (
-                    torch.distributions.Categorical(probs=ins_budget_probs)
-                    .sample()
-                    .float()
-                )  # Shape: (num_graphs,)
-
-            global_del_budget = None
-            global_del_budget_logits = preds.get("global_del_budget_head", None)
-            if (
-                global_del_budget_logits is not None
-                and self.n_atoms_strategy != "fixed"
-            ):
-                # TODO make temperature sampling hyperparam
-                temperature = 0.1
-                global_del_budget_logits = global_del_budget_logits / temperature
-
-                # Sample from categorical distribution to get the predicted budget
-                del_budget_probs = F.softmax(global_del_budget_logits, dim=-1)
-                global_del_budget = (
-                    torch.distributions.Categorical(probs=del_budget_probs)
-                    .sample()
-                    .float()
-                )  # Shape: (num_graphs,)
-
             # Integrate one step (edge prediction happens inside if head is provided)
             # Note: do_ins is computed inside integrate_step_gnn from num_ins_pred or global_ins_budget
             mol_t = self.integrator.integrate_step_gnn(
@@ -1367,15 +1355,6 @@ class LightningModuleRates(pl.LightningModule):
                 dt=step_size,
                 h_latent=preds.get("h_latent"),
                 ins_edge_head=ins_edge_head,
-                global_ins_budget=global_ins_budget,
-                global_del_budget=global_del_budget,
-            )
-
-            # Validate: check for cross-batch edges after integration step
-            validate_no_cross_batch_edges(
-                mol_t.edge_index,
-                mol_t.batch,
-                f"sample after integrate_step t={t[0].item():.3f}",
             )
 
             # remove mean from xt for each batch

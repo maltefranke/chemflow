@@ -4,7 +4,7 @@ from torch_geometric.utils import to_dense_adj
 from rdkit import Chem
 import numpy as np
 
-from chemflow.utils import index_to_token, EdgeAligner, validate_no_cross_batch_edges
+from chemflow.utils import index_to_token, EdgeAligner
 from external_code.egnn import unsorted_segment_mean
 
 from torch_geometric.utils import sort_edge_index
@@ -463,7 +463,6 @@ def filter_nodes(
         batch = mol.batch[mask]
 
     if isinstance(mol, MoleculeBatch):
-        validate_no_cross_batch_edges(edge_index, batch, "filter_nodes")
         return MoleculeBatch(
             x=x,
             a=a,
@@ -541,12 +540,6 @@ def sort_nodes_by_batch(data):
         if edge_attr is not None:
             data.e = sorted_edge_attr
 
-    # Validate
-    if hasattr(data, "edge_index") and hasattr(data, "batch"):
-        validate_no_cross_batch_edges(
-            data.edge_index, data.batch, "sort_nodes_by_batch"
-        )
-
     return data
 
 
@@ -573,11 +566,6 @@ def join_molecules_with_atoms(
 
     device = mol.x.device
     edge_aligner = EdgeAligner()
-
-    # Validate: check incoming mol doesn't have cross-batch edges
-    validate_no_cross_batch_edges(
-        mol.edge_index, mol.batch, "join_molecules_with_atoms INPUT mol"
-    )
 
     # 1. Concatenate node features
     new_x = torch.cat([mol.x, atoms.x], dim=0)
@@ -682,11 +670,6 @@ def join_molecules_with_atoms(
         batch=new_batch,
     )
 
-    # Validate: check for cross-batch edges BEFORE sort
-    validate_no_cross_batch_edges(
-        combined_edge_index, new_batch, "join_molecules_with_atoms BEFORE sort"
-    )
-
     result = sort_nodes_by_batch(result)
 
     return result
@@ -725,11 +708,6 @@ def join_molecules_with_predicted_edges_old(
     num_existing_nodes = mol.x.shape[0]
     num_new_atoms = new_atoms.x.shape[0]
     edge_aligner = EdgeAligner()
-
-    # Validate: check incoming mol doesn't have cross-batch edges
-    validate_no_cross_batch_edges(
-        mol.edge_index, mol.batch, "join_molecules_with_predicted_edges INPUT mol"
-    )
 
     # 1. Concatenate node features
     new_x = torch.cat([mol.x, new_atoms.x], dim=0)
@@ -849,13 +827,6 @@ def join_molecules_with_predicted_edges_old(
         batch=new_batch,
     )
 
-    # Validate: check for cross-batch edges BEFORE sort
-    validate_no_cross_batch_edges(
-        combined_edge_index,
-        new_batch,
-        "join_molecules_with_predicted_edges BEFORE sort",
-    )
-
     result = sort_nodes_by_batch(result)
 
     return result
@@ -875,10 +846,6 @@ def join_molecules_with_predicted_edges(
     num_existing_nodes = mol.x.shape[0]
     # num_new_atoms = new_atoms.x.shape[0] # Not strictly needed with new logic, but good for debug
     edge_aligner = EdgeAligner()
-
-    validate_no_cross_batch_edges(
-        mol.edge_index, mol.batch, "join_molecules_with_predicted_edges INPUT mol"
-    )
 
     # 1. Concatenate node features
     new_x = torch.cat([mol.x, new_atoms.x], dim=0)
@@ -1028,12 +995,6 @@ def join_molecules_with_predicted_edges(
         e=combined_e,
         edge_index=combined_edge_index,
         batch=new_batch,
-    )
-
-    validate_no_cross_batch_edges(
-        combined_edge_index,
-        new_batch,
-        "join_molecules_with_predicted_edges BEFORE sort",
     )
 
     # Ensure this function correctly updates edge_index permutations!

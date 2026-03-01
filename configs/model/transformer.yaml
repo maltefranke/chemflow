@@ -59,7 +59,7 @@ module:
   ins_noise_scale: ${data.ins_noise_scale}
   edit_loss_ema_decay: 0.99
   edit_loss_ema_eps: 1.0e-8
-  ema_decay: 0.9999
+  ema_decay: 0.999
   use_ema_for_eval: true
   time_dist: ${if:${eq:${model.sample_time_strategy}, log}, ${model.beta_sched}, ${model.linear_sched}}
   integrator: ${model.integrator}

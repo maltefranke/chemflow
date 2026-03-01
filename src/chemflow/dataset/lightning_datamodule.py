@@ -7,7 +7,7 @@ from functools import partial
 
 from chemflow.dataset.molecule_data import MoleculeBatch
 from chemflow.flow_matching.sampling import sample_prior_graph
-from chemflow.utils import token_to_index, validate_no_cross_batch_edges
+from chemflow.utils import token_to_index
 
 
 class LightningDataModule(pl.LightningDataModule):
@@ -159,28 +159,9 @@ class LightningDataModule(pl.LightningDataModule):
             if hasattr(targets_batched, "y") and targets_batched.y is not None:
                 mols_t.y = targets_batched.y
 
-            # Validate: check for cross-batch edges after interpolation
-            validate_no_cross_batch_edges(
-                mols_t.edge_index, mols_t.batch, "collate_fn train mols_t"
-            )
-            validate_no_cross_batch_edges(
-                mols_1.edge_index, mols_1.batch, "collate_fn train mols_1"
-            )
-
             return mols_t, mols_1, ins_targets, t
 
         else:
-            # Validate: check for cross-batch edges in validation batches
-            validate_no_cross_batch_edges(
-                samples_batched.edge_index,
-                samples_batched.batch,
-                "collate_fn val samples",
-            )
-            validate_no_cross_batch_edges(
-                targets_batched.edge_index,
-                targets_batched.batch,
-                "collate_fn val targets",
-            )
             return samples_batched, targets_batched
 
     def train_dataloader(self):

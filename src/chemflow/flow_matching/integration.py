@@ -7,7 +7,6 @@ from chemflow.flow_matching.gmm import (
 from chemflow.utils import (
     token_to_index,
     EdgeAligner,
-    validate_no_cross_batch_edges,
 )
 
 from chemflow.dataset.molecule_data import (
@@ -88,10 +87,6 @@ class RateIntegrator:
             self.sub_e_schedule = self.sub_schedule
         else:
             self.sub_e_schedule = sub_e_schedule
-
-        if self.cat_strategy == "mask":
-            self.edge_mask_index = token_to_index(self.vocab.edge_tokens, "<MASK>")
-            self.atom_mask_index = token_to_index(self.vocab.atom_tokens, "<MASK>")
 
         self.edge_aligner = EdgeAligner()
 
@@ -184,8 +179,6 @@ class RateIntegrator:
         eps: float = 1e-6,
         h_latent: torch.Tensor = None,
         ins_edge_head=None,
-        global_ins_budget: torch.Tensor = None,
-        global_del_budget: torch.Tensor = None,
     ) -> MoleculeBatch:
         """
         Integrate one step of the stochastic process for GNN models.
@@ -207,12 +200,6 @@ class RateIntegrator:
             eps: Small epsilon value for numerical stability (default: 1e-6)
             h_latent: Shape (N, hidden_dim) - latent node features for edge prediction (optional)
             ins_edge_head: InsertionEdgeHead instance for predicting edges (optional)
-            global_ins_budget: Shape (num_graphs,) - predicted total number of insertions remaining
-                              for each graph (from global_ins_budget_head). If provided, uses
-                              velocity-based budget allocation instead of per-node Poisson sampling.
-            global_del_budget: Shape (num_graphs,) - predicted total number of deletions remaining
-                              for each graph (from global_del_budget_head). If provided, uses
-                              velocity-based budget allocation instead of per-node Poisson sampling.
 
         Returns:
             mol_t_final: MoleculeBatch - updated molecule after one integration step
@@ -261,7 +248,6 @@ class RateIntegrator:
         # NOTE in OneFlow, instead of sampling Poisson, they sample Bernoulli
         ins_sampled = torch.rand_like(expected_num_ins) < expected_num_ins
 
-        # do_ins = do_ins & (num_ins > 0)
         do_ins = do_ins & ins_sampled
 
         # Fail-safe: ensure that the number of atoms per graph won't be greater than the max number of atoms
@@ -398,13 +384,6 @@ class RateIntegrator:
             batch=batch_id,
         )
 
-        # Validate: check for cross-batch edges after edge symmetrization
-        is_cb = validate_no_cross_batch_edges(
-            edge_index, batch_id, "integration_adjusted: after edge symmetrization"
-        )
-        if not is_cb:
-            exit()
-
         if self.n_atoms_strategy != "fixed":
             # Build index mapping: original_idx -> post_deletion_idx (or -1 if deleted)
             N_original = mol.num_nodes
@@ -434,14 +413,6 @@ class RateIntegrator:
             # 3. Remove the deleted nodes
             if do_del.any():
                 mol = filter_nodes(mol, keep_mask)
-                # Validate: check for cross-batch edges after filtering
-                is_cb = validate_no_cross_batch_edges(
-                    mol.edge_index,
-                    mol.batch,
-                    "integration_adjusted: after filter_nodes",
-                )
-                if not is_cb:
-                    exit()
 
             # 4. Add the new insertions
             # Allow insertions from ALL nodes, including deleted ones.
@@ -548,10 +519,5 @@ class RateIntegrator:
                 else:
                     # Fall back to random edge sampling
                     mol = join_molecules_with_atoms(mol, new_atoms, edge_dist)
-
-                # Validate: check for cross-batch edges after joining
-                validate_no_cross_batch_edges(
-                    mol.edge_index, mol.batch, "integration_adjusted: after joining"
-                )
 
         return mol

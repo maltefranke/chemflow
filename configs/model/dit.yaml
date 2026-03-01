@@ -52,7 +52,7 @@ module:
   ins_noise_scale: ${data.ins_noise_scale}
   edit_loss_ema_decay: 0.99
   edit_loss_ema_eps: 1.0e-8
-  ema_decay: 0.9999
+  ema_decay: 0.999
   use_ema_for_eval: true
   time_dist: ${if:${eq:${model.sample_time_strategy}, log}, ${model.beta_sched}, ${model.linear_sched}}
   integrator: ${model.integrator}
@@ -182,7 +182,7 @@ do_natoms_cfg: true
 
 natoms_cfg:
   dropout_prob: 0.15
-  guidance_scale: 1.5
+  guidance_scale: 1.0
   embed_dim: 128
   embedding:
     _target_: chemflow.model.embedding.NAtomsCFGEmbedding

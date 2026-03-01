@@ -9,7 +9,6 @@ from chemflow.flow_matching.assignment import partial_optimal_transport
 from chemflow.utils import (
     token_to_index,
     EdgeAligner,
-    validate_no_cross_batch_edges,
 )
 from external_code.egnn import unsorted_segment_mean
 
@@ -522,13 +521,5 @@ class Interpolator:
         _ = mol_t.remove_com(x_mean)
         _ = mol_1.remove_com(x_mean)
         _ = ins_targets.remove_com(x_mean)
-
-        # Validate: check for cross-batch edges after interpolation
-        validate_no_cross_batch_edges(
-            mol_t.edge_index, mol_t.batch, "interpolate_different_size mol_t"
-        )
-        validate_no_cross_batch_edges(
-            mol_1.edge_index, mol_1.batch, "interpolate_different_size mol_1"
-        )
 
         return mol_t, mol_1, ins_targets
