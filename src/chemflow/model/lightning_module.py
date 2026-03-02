@@ -22,6 +22,7 @@ from chemflow.metrics import (
 )
 from lightning.pytorch.utilities import grad_norm
 from chemflow.model.learnable_loss import UnifiedWeightedLoss
+from chemflow.model.cfg import CFGAdapter
 
 
 class LightningModuleRates(pl.LightningModule):
@@ -215,20 +216,16 @@ class LightningModuleRates(pl.LightningModule):
         self.register_buffer("ema_do_del_pos", torch.tensor(1.0))
         self.register_buffer("ema_do_del_neg", torch.tensor(1.0))
 
-        # Classifier-free guidance: dropout probability during training,
-        # guidance scale during inference. Active only when > 0 and
-        # properties are provided by the data class.
-        self.cfg_dropout_prob = float(cfg_dropout_prob)
-        self.cfg_guidance_scale = float(cfg_guidance_scale)
-
-        # N_atoms classifier-free guidance: separate from property CFG.
-        # Conditions on the target molecule size and can be dropped
-        # independently during training.
-        self.natoms_cfg_dropout_prob = float(natoms_cfg_dropout_prob)
-        self.natoms_cfg_guidance_scale = float(natoms_cfg_guidance_scale)
-
         self.save_hyperparameters()
         self.model = hydra.utils.instantiate(model)
+
+        self.cfg_adapter = CFGAdapter(
+            model=self.model,
+            cfg_dropout_prob=cfg_dropout_prob,
+            cfg_guidance_scale=cfg_guidance_scale,
+            natoms_cfg_dropout_prob=natoms_cfg_dropout_prob,
+            natoms_cfg_guidance_scale=natoms_cfg_guidance_scale,
+        )
 
         # Exponential moving average of model parameters for stable inference
         self.model_ema = copy.deepcopy(self.model)
@@ -318,101 +315,6 @@ class LightningModuleRates(pl.LightningModule):
         if not has_ema and self.model_ema is not None:
             self.model_ema.load_state_dict(self.model.state_dict(), strict=True)
 
-    @property
-    def _has_property_conditioning(self) -> bool:
-        return self.model.embedding_backbone.property_embedding is not None
-
-    @property
-    def _has_natoms_cfg(self) -> bool:
-        return self.model.embedding_backbone.natoms_cfg_embedding is not None
-
-    def _extract_properties(self, mols_t) -> torch.Tensor | None:
-        """Return graph-level properties from the batch, or None."""
-        if not self._has_property_conditioning:
-            return None
-        if hasattr(mols_t, "y") and mols_t.y is not None:
-            return mols_t.y.float()
-        return None
-
-    def _extract_target_n_atoms(self, mols) -> torch.Tensor | None:
-        """Return per-graph target atom counts, or None if n_atoms CFG is off."""
-        if not self._has_natoms_cfg:
-            return None
-        # TODO use torch geometric attributes if possible instead of bincount
-        return torch.bincount(mols.batch)
-
-    def _sample_cfg_drop_mask(self, batch_size: int) -> torch.Tensor | None:
-        """During training, randomly mask out properties for CFG."""
-        if self.cfg_dropout_prob <= 0.0 or not self.training:
-            return None
-        return torch.rand(batch_size, device=self.device) < self.cfg_dropout_prob
-
-    def _sample_natoms_cfg_drop_mask(self, batch_size: int) -> torch.Tensor | None:
-        """During training, randomly mask out target n_atoms for CFG."""
-        if self.natoms_cfg_dropout_prob <= 0.0 or not self.training:
-            return None
-        return torch.rand(batch_size, device=self.device) < self.natoms_cfg_dropout_prob
-
-    # Head categories for type-aware classifier-free guidance.
-    # Rule 1 & 2: linear extrapolation (positions, logits before softmax/sigmoid)
-    _cfg_linear_keys = {
-        "atom_type_head",
-        "charge_head",
-        "edge_type_head",
-        "do_ins_head",
-        "do_del_head",
-        "do_sub_a_head",
-        "do_sub_e_head",
-    }
-    # Rule 3: log-space CFG for strictly-positive rate outputs (post-softplus)
-    _cfg_rate_keys = {"ins_rate_head"}
-
-    # Rule 4: use conditional predictions for certain keys
-    _cfg_use_cond_keys = {"pos_head"}
-
-    def _apply_cfg(
-        self,
-        preds_cond: dict,
-        preds_uncond: dict,
-        guidance_scale: float,
-    ) -> dict:
-        """Type-aware classifier-free guidance."""
-        guided = {}
-        w = guidance_scale
-
-        for key, v_cond in preds_cond.items():
-            v_uncond = preds_uncond[key]
-
-            if key in self._cfg_linear_keys:
-                guided[key] = v_uncond + w * (v_cond - v_uncond)
-
-            elif key in self._cfg_use_cond_keys:
-                guided[key] = v_cond
-
-            elif key in self._cfg_rate_keys:
-                log_cond = torch.log(v_cond.clamp_min(1e-12))
-                log_uncond = torch.log(v_uncond.clamp_min(1e-12))
-                guided[key] = torch.exp(log_uncond + w * (log_cond - log_uncond))
-
-            elif key == "gmm_head" and isinstance(v_cond, dict):
-                guided_gmm = {}
-                for k, gv_cond in v_cond.items():
-                    gv_uncond = v_uncond[k]
-                    if k in {"pi", "a_probs", "c_probs"}:
-                        cond_logits = torch.log(gv_cond.clamp_min(1e-12))
-                        uncond_logits = torch.log(gv_uncond.clamp_min(1e-12))
-                        guided_logits = uncond_logits + w * (
-                            cond_logits - uncond_logits
-                        )
-                        guided_gmm[k] = F.softmax(guided_logits, dim=-1)
-                    else:
-                        guided_gmm[k] = gv_cond
-                guided[key] = guided_gmm
-
-            else:
-                guided[key] = v_cond
-
-        return guided
 
     def forward(self, x):
         pass
@@ -647,22 +549,18 @@ class LightningModuleRates(pl.LightningModule):
         # randomized self-conditioning with p = 0.5 during training
         is_random_self_conditioning = (torch.rand(1) > 0.5).item()
 
-        # Extract properties for classifier-free guidance (None if not available)
-        properties = self._extract_properties(mols_t)
-        cfg_drop_mask = self._sample_cfg_drop_mask(mols_t.num_graphs)
-
-        # Extract target n_atoms for n_atoms CFG (from target molecule mols_1)
-        target_n_atoms = self._extract_target_n_atoms(mols_1)
-        natoms_drop_mask = self._sample_natoms_cfg_drop_mask(mols_t.num_graphs)
+        cfg_inputs = self.cfg_adapter.get_training_inputs(
+            mols_t, mols_1, self.device, self.training
+        )
 
         preds = self.model(
             mols_t,
             t.view(-1, 1),
             is_random_self_conditioning=is_random_self_conditioning,
-            properties=properties,
-            property_drop_mask=cfg_drop_mask,
-            target_n_atoms=target_n_atoms,
-            natoms_drop_mask=natoms_drop_mask,
+            properties=cfg_inputs["properties"],
+            property_drop_mask=cfg_inputs["cfg_drop_mask"],
+            target_n_atoms=cfg_inputs["target_n_atoms"],
+            natoms_drop_mask=cfg_inputs["natoms_drop_mask"],
         )
 
         a_pred = preds["atom_type_head"]
@@ -1167,9 +1065,22 @@ class LightningModuleRates(pl.LightningModule):
         pass
 
     def predict_step(self, batch, batch_idx):
-        return self.sample(batch, batch_idx, return_traj=True)
+        return_traj = bool(getattr(self, "predict_return_traj", True))
+        target_override = getattr(self, "predict_target_n_atoms_override", None)
+        return self.sample(
+            batch,
+            batch_idx,
+            return_traj=return_traj,
+            target_n_atoms_override=target_override,
+        )
 
-    def sample(self, batch, batch_idx, return_traj: bool = False):
+    def sample(
+        self,
+        batch,
+        batch_idx,
+        return_traj: bool = False,
+        target_n_atoms_override: torch.Tensor | int | None = None,
+    ):
         """
         Inference step for flow matching.
 
@@ -1177,6 +1088,8 @@ class LightningModuleRates(pl.LightningModule):
             batch: Batch of data (for now, we'll use batch size to determine number of graphs)
             batch_idx: Batch index
             return_traj: If True, return trajectory for each molecule. If False, return final state only.
+            target_n_atoms_override: If provided, overrides the target n_atoms extracted from data.
+                Shape (batch_size,) with integer atom counts.
 
         Returns:
             If return_traj is False: MoleculeBatch - final sampled molecules
@@ -1207,21 +1120,19 @@ class LightningModuleRates(pl.LightningModule):
         # previous outputs for self-conditioning. none at the beginning
         preds = None
 
-        # Extract properties for conditional generation
-        properties = self._extract_properties(mol_t)
-        use_cfg = (
-            self.cfg_guidance_scale > 0.0
-            and properties is not None
-            and self._has_property_conditioning
-        )
-
-        # Extract target n_atoms for n_atoms CFG
-        target_n_atoms = self._extract_target_n_atoms(mol_1)
-        use_natoms_cfg = (
-            self.natoms_cfg_guidance_scale > 0.0
-            and target_n_atoms is not None
-            and self._has_natoms_cfg
-        )
+        properties = self.cfg_adapter.extract_properties(mol_t)
+        if target_n_atoms_override is not None:
+            if isinstance(target_n_atoms_override, int):
+                target_n_atoms = torch.full(
+                    (batch_size,),
+                    target_n_atoms_override,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+            else:
+                target_n_atoms = target_n_atoms_override.to(self.device)
+        else:
+            target_n_atoms = self.cfg_adapter.extract_target_n_atoms(mol_1)
 
         # Integration loop: integrate from t=0 to t=1
         for step_size in step_sizes:
@@ -1229,38 +1140,9 @@ class LightningModuleRates(pl.LightningModule):
 
             prev_preds = preds
 
-            # 1) Always start from unconditional predictions.
-            preds = model(
-                mol_t,
-                t.view(-1, 1),
-                prev_outs=prev_preds,
-                properties=None,
-                target_n_atoms=None,
+            preds = self.cfg_adapter.guided_predict(
+                model, mol_t, t, prev_preds, properties, target_n_atoms,
             )
-
-            # 2) If n_atoms CFG is enabled, predict conditional and guide from uncond.
-            if use_natoms_cfg:
-                preds_cond_natoms = model(
-                    mol_t,
-                    t.view(-1, 1),
-                    prev_outs=prev_preds,
-                    properties=None,
-                    target_n_atoms=target_n_atoms,
-                )
-                preds = self._apply_cfg(
-                    preds_cond_natoms, preds, self.natoms_cfg_guidance_scale
-                )
-
-            # 3) If property CFG is enabled, predict conditional and guide.
-            if use_cfg:
-                preds_cond = model(
-                    mol_t,
-                    t.view(-1, 1),
-                    prev_outs=prev_preds,
-                    properties=properties,
-                    target_n_atoms=target_n_atoms,
-                )
-                preds = self._apply_cfg(preds_cond, preds, self.cfg_guidance_scale)
 
             # Extract predictions
             x1_pred = preds["pos_head"]  # (N_total, D)

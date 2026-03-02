@@ -1,13 +1,7 @@
 from external_code.semla import EquiInvDynamics
 import torch
 
-from torch_geometric.utils import to_dense_batch, to_dense_adj, dense_to_sparse
-
-import torch
-
-# --- 1. Setup: Assume you have these from previous steps ---
-# atom_mask: [B, N_max] (True for real nodes, False for padding)
-# edge_feats: [B, N_max, N_max, F] (Dense edge attributes)
+from torch_geometric.utils import to_dense_batch, scatter
 
 
 def dense_to_sparse_edges(edge_feats, atom_mask):
@@ -86,23 +80,64 @@ class SemlaBB(torch.nn.Module):
         )
 
     def forward(self, h, x, edges: tuple[torch.Tensor, torch.Tensor], edge_attr, batch):
+        # batch_size as a data-dependent SymInt (same pattern as transformer.py)
+        batch_size = batch.unique().shape[0]
+        num_nodes = scatter(
+            batch.new_ones(x.size(0)), batch, dim=0, dim_size=batch_size, reduce="sum"
+        )
+        # max_num_nodes as a 0-dim tensor (same pattern as dit.py)
+        max_num_nodes = num_nodes.max()
+
         edges = torch.stack(edges, dim=0)
 
-        # transform to dense feats as required by semla
-        coords, atom_mask = to_dense_batch(x, batch)
-        # coords = coords.unsqueeze(1)
-        # atom_mask = atom_mask.unsqueeze(1)
-        inv_feats, _ = to_dense_batch(h, batch)
-        adj_matrix = to_dense_adj(edges, batch)
-        edge_feats = to_dense_adj(edges, batch, edge_attr)
+        coords, atom_mask = to_dense_batch(
+            x, batch, batch_size=batch_size, max_num_nodes=max_num_nodes
+        )
+        inv_feats, _ = to_dense_batch(
+            h, batch, batch_size=batch_size, max_num_nodes=max_num_nodes
+        )
+
+        # Build dense adj/edge tensors without to_dense_adj.
+        # B and N are SymInts derived from tensor shapes, which torch.zeros accepts —
+        # unlike to_dense_adj which calls torch.Size([flattened_size_tensor]) and crashes.
+        B, N = atom_mask.shape[0], atom_mask.shape[1]
+
+        # Compute each node's local index within its graph
+        counts = scatter(
+            batch.new_ones(batch.shape[0]),
+            batch,
+            dim=0,
+            dim_size=batch_size,
+            reduce="sum",
+        )
+        cum_counts = torch.cat([counts.new_zeros(1), counts.cumsum(0)[:-1]])
+        local_idx = (
+            torch.arange(batch.shape[0], device=batch.device) - cum_counts[batch]
+        )
+
+        row, col = edges[0], edges[1]
+        b_idx = batch[row]
+        local_row = local_idx[row]
+        local_col = local_idx[col]
+
+        adj_matrix = torch.zeros(B, N, N, device=x.device)
+        adj_matrix[b_idx, local_row, local_col] = 1.0
+
+        edge_feats = torch.zeros(
+            B, N, N, edge_attr.shape[-1], dtype=edge_attr.dtype, device=edge_attr.device
+        )
+        edge_feats[b_idx, local_row, local_col] = edge_attr
 
         out_coords, inv_feats, edge_feats = self.dynamics(
             coords, inv_feats, adj_matrix, atom_mask, edge_feats
         )
 
-        # transform back to our format
+        # Convert back to sparse format.
+        # Index at the original input edge positions — no nonzero() call, no graph break.
+        # The dynamics refines features at existing edge positions; we don't need to detect
+        # new edges from the dense output (which would require nonzero() and break torch.compile).
         coords_out = out_coords[atom_mask]
         h_out = inv_feats[atom_mask]
-        _, e_out = dense_to_sparse_edges(edge_feats, atom_mask)
+        e_out = edge_feats[b_idx, local_row, local_col]
 
         return h_out, coords_out, e_out

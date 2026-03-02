@@ -19,7 +19,7 @@ integrator:
   gmm_params: ${model.gmm_params}
   cat_strategy: ${data.cat_strategy}
   n_atoms_strategy: ${data.n_atoms_strategy}
-  time_strategy: linear
+  time_strategy: log
   num_integration_steps: 200
   del_schedule: ${data.interpolator.del_schedule}
   ins_schedule: ${data.interpolator.ins_schedule}
@@ -95,6 +95,9 @@ module:
       betas: [0.9, 0.95]
       eps: 1e-10
       weight_decay: 0.00
+
+    emb_optimizer:
+      lr: 3e-3
 
     scheduler:
       _target_: chemflow.schedulers.MultiGroupCosineWarmupLR
@@ -181,7 +184,7 @@ property_embed_dim: ${if:${model.do_cfg}, ${model.cfg.property_embed_dim}, 0}
 do_natoms_cfg: true
 
 natoms_cfg:
-  dropout_prob: 0.15
+  dropout_prob: 0.35
   guidance_scale: 1.0
   embed_dim: 128
   embedding:
@@ -252,17 +255,6 @@ heads:
       do_sub_a_head:
         input_dim: ${model.backbone.out_node_nf}
         output_dim: 1
-        hidden_dim: 128
-    
-    graph_heads:
-      global_ins_budget_head:
-        input_dim: ${model.backbone.out_node_nf}
-        output_dim: 30
-        hidden_dim: 128
-
-      global_del_budget_head:
-        input_dim: ${model.backbone.out_node_nf}
-        output_dim: 30
         hidden_dim: 128
       
     edge_heads:

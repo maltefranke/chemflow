@@ -508,8 +508,9 @@ class EquiMessagePassingLayer(torch.nn.Module):
             d_message_out + d_edge_out if d_edge_out is not None else d_message_out
         )
 
-        if d_edge_in is not None:
-            self.edge_feat_norm = torch.nn.LayerNorm(d_edge_in)
+        # NOTE Malte: this is never used! Will lead to problems with DDP / compile!
+        """if d_edge_in is not None:
+            self.edge_feat_norm = torch.nn.LayerNorm(d_edge_in)"""
 
         self.node_ff = NodeFeedForward(
             d_model,

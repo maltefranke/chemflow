@@ -206,7 +206,7 @@ class PropertyEmbedding(nn.Module):
             nn.Linear(embedding_dim, out_dim),
         )
 
-        self.null_embedding = nn.Parameter(torch.randn(out_dim) * 0.02)
+        self.null_embedding = nn.Parameter(torch.randn(out_dim))
         self._init_weights()
 
     def _init_weights(self):
@@ -237,7 +237,11 @@ class PropertyEmbedding(nn.Module):
 
         emb = self.mlp(properties)
 
-        if drop_mask is not None and drop_mask.any():
+        if drop_mask is not None:
+            # Always use torch.where without .any() guard so null_embedding is always
+            # in the computation graph. When drop_mask is all-False, null_embedding
+            # receives a zero gradient (not None), satisfying DDP's requirement that
+            # every requires_grad parameter participates in every backward pass.
             null = self.null_embedding.unsqueeze(0).expand_as(emb)
             emb = torch.where(drop_mask.unsqueeze(-1), null, emb)
 
@@ -269,7 +273,7 @@ class NAtomsCFGEmbedding(nn.Module):
         self.count_embedding = CountEmbedding(
             embedding_dim=embedding_dim, out_dim=out_dim, max_period=max_period
         )
-        self.null_embedding = nn.Parameter(torch.randn(out_dim) * 0.02)
+        self.null_embedding = nn.Parameter(torch.randn(out_dim))
 
     def forward(
         self,
@@ -291,7 +295,11 @@ class NAtomsCFGEmbedding(nn.Module):
 
         emb = self.count_embedding(target_n_atoms)
 
-        if drop_mask is not None and drop_mask.any():
+        if drop_mask is not None:
+            # Always use torch.where without .any() guard so null_embedding is always
+            # in the computation graph. When drop_mask is all-False, null_embedding
+            # receives a zero gradient (not None), satisfying DDP's requirement that
+            # every requires_grad parameter participates in every backward pass.
             null = self.null_embedding.unsqueeze(0).expand_as(emb)
             emb = torch.where(drop_mask.unsqueeze(-1), null, emb)
 

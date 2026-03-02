@@ -8,20 +8,24 @@ import hydra
 
 class LightningModuleRatesTransformer(LightningModuleRates):
     def configure_optimizers(self):
-        # Identify transformer backbone parameters by id
+        # Identify backbone parameters by id for Muon routing
         backbone_param_ids = {id(p) for p in self.model.backbone.parameters()}
 
-        # 2D backbone weights -> Muon
-        # Everything else (backbone biases/norms, embeddings, heads) -> Adam
+        # Backbone 2D weights                      -> Muon
+        # All other 2D+ params (embs, heads, etc.) -> Adam high LR (emb_optimizer)
+        # All 1D params everywhere (biases, norms)  -> Adam low LR (aux_optimizer)
         muon_params = []
+        high_lr_params = []
         adam_params = []
         for p in self.model.parameters():
             if id(p) in backbone_param_ids and p.ndim >= 2:
                 muon_params.append(p)
+            elif id(p) not in backbone_param_ids and p.ndim >= 2:
+                high_lr_params.append(p)
             else:
                 adam_params.append(p)
 
-        # Add learnable loss weight params to Adam group
+        # Learnable loss weights are scalars — low-LR aux group
         if (
             self.loss_weight_wrapper.use_learnable
             and self.loss_weight_wrapper.learnable_wrapper is not None
@@ -33,11 +37,20 @@ class LightningModuleRatesTransformer(LightningModuleRates):
         # Read hyperparameters from config
         opt_cfg = self.optimizer_config.optimizer
         aux_cfg = self.optimizer_config.aux_optimizer
+        emb_cfg = self.optimizer_config.emb_optimizer
 
         param_groups = [
             dict(
                 params=adam_params,
                 lr=aux_cfg.lr,
+                betas=tuple(aux_cfg.betas),
+                eps=aux_cfg.get("eps", 1e-10),
+                weight_decay=aux_cfg.weight_decay,
+                use_muon=False,
+            ),
+            dict(
+                params=high_lr_params,
+                lr=emb_cfg.lr,
                 betas=tuple(aux_cfg.betas),
                 eps=aux_cfg.get("eps", 1e-10),
                 weight_decay=aux_cfg.weight_decay,
