@@ -60,7 +60,6 @@ class LightningModuleRates(pl.LightningModule):
         optimizer_config: DictConfig = None,
         gmm_params: DictConfig = None,
         n_atoms_strategy: str = "fixed",
-        ins_rate_strategy: str = "poisson",  # "poisson" or "classification"
         type_loss_token_weights: str = "uniform",  # "uniform" or "training"
         cat_weighting: DictConfig = None,
         time_dist: DictConfig = None,
@@ -100,7 +99,6 @@ class LightningModuleRates(pl.LightningModule):
 
         self.gmm_params = gmm_params
         self.n_atoms_strategy = n_atoms_strategy
-        self.ins_rate_strategy = ins_rate_strategy
         self.type_loss_token_weights = type_loss_token_weights
 
         if time_dist is None:
@@ -397,16 +395,10 @@ class LightningModuleRates(pl.LightningModule):
 
     def rate_loss(self, rate_pred, num_actions, batch, num_graphs):
         """
-        Calculate the rate loss for the given rate predictions and number of actions.
-        Is only used for insertions which can have multiple insertions per node.
-        For the other actions, we use the do_action_loss.
-
-        Supports two strategies:
-        - "poisson": Poisson NLL loss for regression (rate_pred is scalar)
-        - "classification": Cross-entropy loss (rate_pred is logits over classes)
+        Calculate the Poisson NLL rate loss for insertion predictions.
 
         Args:
-            rate_pred: The predicted rate values (scalar for poisson, logits for classification).
+            rate_pred: The predicted rate values, shape (N,) or (N, 1).
             num_actions: The integer number of actions for each node.
             batch: The batch indices for each node.
             num_graphs: The number of graphs in the batch.
@@ -415,29 +407,13 @@ class LightningModuleRates(pl.LightningModule):
         do_action = num_actions > 0.0
         do_action = do_action.view(-1)
 
-        if self.ins_rate_strategy == "classification":
-            # Classification: use cross-entropy loss
-            # rate_pred shape: (N, num_classes)
-            # num_actions needs to be converted to class indices (clamped to valid range)
-            num_classes = rate_pred.shape[-1]
-            targets = num_actions.long().view(-1).clamp(0, num_classes - 1)
-
-            # Only apply loss for nodes that have actions
-            rate_loss = F.cross_entropy(
-                rate_pred[do_action],
-                targets[do_action],
-                reduction="none",
-            )
-        else:
-            # Poisson: use Poisson NLL loss (original behavior)
-            # Only apply rate loss for nodes that have actions.
-            rate_loss = F.poisson_nll_loss(
-                rate_pred[do_action].view(-1),
-                num_actions[do_action].view(-1),
-                log_input=False,
-                reduction="none",
-                full=True,
-            )
+        rate_loss = F.poisson_nll_loss(
+            rate_pred[do_action].view(-1),
+            num_actions[do_action].view(-1),
+            log_input=False,
+            reduction="none",
+            full=True,
+        )
 
         # NOTE: first normalize by number of nodes / graphs
         # Otherwise, nodes with more atoms will have more weight by design
@@ -683,8 +659,6 @@ class LightningModuleRates(pl.LightningModule):
 
             # indices of nodes in mol_t that spawn/predict each insertion
             spawn_node_idx = ins_targets.spawn_node_idx
-
-            # num_inserts_per_node = torch.zeros(mols_t.num_nodes, device=self.device)
 
             if spawn_node_idx.numel() > 0:
                 # Count how many insertions each node spawns
@@ -1185,24 +1159,10 @@ class LightningModuleRates(pl.LightningModule):
             do_ins_probs = torch.sigmoid(do_ins_logits)
 
             # Extract insertion rate prediction (number of insertions per node)
-            # Note: do_ins is computed inside integrate_step_gnn from num_ins_pred
-            ins_rate_output = preds["ins_rate_head"]  # Shape depends on strategy
-
-            if self.ins_rate_strategy == "classification":
-                # Classification: sample from categorical distribution
-                # ins_rate_output shape: (N, num_classes) - logits
-                temperature = 0.1
-                ins_rate_output = ins_rate_output / temperature
-                ins_probs = F.softmax(ins_rate_output, dim=-1)
-                num_ins_pred = (
-                    torch.distributions.Categorical(probs=ins_probs).sample().float()
-                )
-            else:
-                # Poisson: use the predicted rate directly
-                num_ins_pred = ins_rate_output  # Shape (N, 1) or (N,)
-                # Ensure num_ins_pred has correct shape
-                if num_ins_pred.ndim > 1:
-                    num_ins_pred = num_ins_pred.squeeze(-1)
+            ins_rate_output = preds["ins_rate_head"]
+            num_ins_pred = ins_rate_output  # Shape (N, 1) or (N,)
+            if num_ins_pred.ndim > 1:
+                num_ins_pred = num_ins_pred.squeeze(-1)
 
             # if we fix the number of atoms, we will not use the jump process
             if self.n_atoms_strategy == "fixed":

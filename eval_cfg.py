@@ -16,6 +16,8 @@ import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
 from rdkit import RDLogger
 
+from chemflow.utils import init_uniform_prior
+
 
 OmegaConf.register_new_resolver("oc.eval", eval)
 OmegaConf.register_new_resolver("len", lambda x: len(x))
@@ -73,21 +75,7 @@ def eval_cfg(cfg: DictConfig):
     distributions = preprocessing.distributions
     loss_weight_distributions = deepcopy(distributions)
 
-    # Sampling prior uses uniform categorical distributions.
-    distributions.atom_type_distribution = torch.ones_like(
-        distributions.atom_type_distribution
-    )
-    distributions.atom_type_distribution /= distributions.atom_type_distribution.sum()
-    distributions.edge_type_distribution = torch.ones_like(
-        distributions.edge_type_distribution
-    )
-    distributions.edge_type_distribution /= distributions.edge_type_distribution.sum()
-    distributions.charge_type_distribution = torch.ones_like(
-        distributions.charge_type_distribution
-    )
-    distributions.charge_type_distribution /= (
-        distributions.charge_type_distribution.sum()
-    )
+    token_prior_distribution = init_uniform_prior(distributions)
 
     cfg.data.vocab = vocab
 
@@ -95,7 +83,7 @@ def eval_cfg(cfg: DictConfig):
         cfg.data.datamodule,
         _recursive_=False,
         vocab=vocab,
-        distributions=distributions,
+        distributions=token_prior_distribution,
     )
     datamodule.setup()
 
@@ -103,7 +91,7 @@ def eval_cfg(cfg: DictConfig):
     module = hydra.utils.instantiate(
         cfg.model.module,
         _recursive_=False,
-        distributions=distributions,
+        distributions=token_prior_distribution,
         loss_weight_distributions=loss_weight_distributions,
     )
 

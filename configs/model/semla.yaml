@@ -9,9 +9,6 @@ is_typed: true
 output_dim_typed: ${oc.eval:"${model.gmm_params.K} * (2 + ${model.gmm_params.D} + ${len:${data.vocab.atom_tokens}} + ${len:${data.vocab.charge_tokens}})"}
 output_dim_untyped: ${oc.eval:"${model.gmm_params.K} * (3 +  ${model.gmm_params.D})"}
 
-# Insertion rate strategy: "poisson" (regression with Poisson NLL) or "classification" (cross-entropy)
-ins_rate_strategy: "poisson"
-
 integrator:
   _target_: chemflow.flow_matching.integration.RateIntegrator
   vocab: ${data.vocab}
@@ -49,7 +46,6 @@ module:
   # tokens and atom_type_distribution will be passed from preprocessing in run.py
   gmm_params: ${model.gmm_params}
   n_atoms_strategy: ${data.n_atoms_strategy}
-  ins_rate_strategy: ${model.ins_rate_strategy}
   type_loss_token_weights: training
   cat_weighting:
     _target_: DictConfig
@@ -237,13 +233,9 @@ heads:
         output_dim: ${len:${data.vocab.charge_tokens}}
         hidden_dim: 128
 
-      # Insertion rate head: output_dim depends on strategy
-      # - For "poisson": output_dim = 1 (regression)
-      # - For "classification": output_dim = max_n_atoms (number of classes)
-      # max_n_atoms will be determined at runtime from the n_atoms_distribution
       ins_rate_head:
         input_dim: ${model.backbone.in_node_nf}
-        output_dim: ${if:${eq:${model.ins_rate_strategy},classification},30,1}
+        output_dim: 1
         hidden_dim: 128
 
       do_ins_head:

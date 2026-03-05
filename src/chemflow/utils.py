@@ -135,17 +135,6 @@ def rigid_alignment(x_0, x_1, pre_centered=False):
     else:
         t = x_1_mean - R.mm(x_0_mean.T).T  # has shape (1, D)
 
-    """# apply rotation to x_0_c
-    x_0_aligned = x_0_c.mm(R.T)
-
-    # move x_0_aligned to its original frame
-    x_0_aligned = x_0_aligned + x_0_mean
-
-    # apply the translation
-    x_0_aligned = x_0_aligned + t
-
-    return x_0_aligned"""
-
     return R, t
 
 
@@ -305,6 +294,26 @@ def symmetrize_upper_triangle(edge_index, edge_attr):
 
     # 4. Sort to ensure canonical PyG order (row-major)
     return sort_edge_index(full_edge_index, full_edge_attr)
+
+
+def init_uniform_prior(distributions):
+    """Return a new Distributions with uniform atom, edge, and charge type distributions.
+
+    All other fields (n_atoms_distribution, coordinate_std) are copied from the
+    original. The original object is not modified.
+    """
+    from copy import deepcopy
+    from chemflow.dataset.vocab import Distributions
+
+    prior = deepcopy(distributions)
+    for attr in (
+        "atom_type_distribution",
+        "edge_type_distribution",
+        "charge_type_distribution",
+    ):
+        dist = torch.ones_like(getattr(prior, attr))
+        setattr(prior, attr, dist / dist.sum())
+    return prior
 
 
 def validate_no_cross_batch_edges(

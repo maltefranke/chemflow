@@ -1,7 +1,6 @@
 import hydra
 import omegaconf
 import torch
-from copy import deepcopy
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import LearningRateMonitor
@@ -10,7 +9,7 @@ from omegaconf import OmegaConf
 from rdkit import RDLogger
 from pytorch_lightning.strategies import DDPStrategy
 
-from chemflow.utils import build_callbacks
+from chemflow.utils import build_callbacks, init_uniform_prior
 from chemflow.model.lightning_module import LightningModuleRates
 
 # resolvers for more complex config expressions
@@ -37,31 +36,11 @@ def run(cfg: DictConfig):
     # Extract tokens and distributions from preprocessing
     vocab = preprocessing.vocab
     distributions = preprocessing.distributions
+
     # Keep training-frequency distributions for loss weighting.
     loss_weight_distributions = deepcopy(distributions)
 
-    # Sampling prior uses uniform categorical distributions.
-    distributions.atom_type_distribution = torch.ones_like(
-        distributions.atom_type_distribution
-    )
-    distributions.atom_type_distribution = (
-        distributions.atom_type_distribution
-        / distributions.atom_type_distribution.sum()
-    )
-    distributions.edge_type_distribution = torch.ones_like(
-        distributions.edge_type_distribution
-    )
-    distributions.edge_type_distribution = (
-        distributions.edge_type_distribution
-        / distributions.edge_type_distribution.sum()
-    )
-    distributions.charge_type_distribution = torch.ones_like(
-        distributions.charge_type_distribution
-    )
-    distributions.charge_type_distribution = (
-        distributions.charge_type_distribution
-        / distributions.charge_type_distribution.sum()
-    )
+    token_prior_distribution = init_uniform_prior(distributions)
 
     cfg.data.vocab = vocab
     # cfg.data.distributions = distributions
@@ -81,7 +60,7 @@ def run(cfg: DictConfig):
         cfg.data.datamodule,
         _recursive_=False,
         vocab=vocab,
-        distributions=distributions,
+        distributions=token_prior_distribution,
     )
     # Call setup to create datasets with tokens and distributions
     datamodule.setup()
@@ -91,7 +70,7 @@ def run(cfg: DictConfig):
     module: pl.LightningModule = hydra.utils.instantiate(
         cfg.model.module,
         _recursive_=False,
-        distributions=distributions,
+        distributions=token_prior_distribution,
         loss_weight_distributions=loss_weight_distributions,
     )
 

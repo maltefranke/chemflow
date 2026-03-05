@@ -1,47 +1,6 @@
 import torch
 import torch.nn.functional as F
-from chemflow.flow_matching.gmm import get_gmm, get_typed_gmm_components
-
-
-def gmm_loss(gmm_output, target_locations, target_batch_ids, mask_value=-1e3):
-    """
-    Computes NLL for non-typed Equivariant GMM on variable sized graphs.
-
-    Args:
-        gmm_output (dict): Output from compute_equivariant_gmm (mu, sigma, pi).
-        target_locations (Tensor): [N_total, D] Node positions.
-        target_batch_ids (Tensor): [N_total] Batch index per node.
-    """
-
-    # --- 1. Filter Invalid Targets ---
-    valid_mask = (target_locations != mask_value).any(dim=-1)
-
-    if valid_mask.sum() == 0:
-        return torch.tensor(0.0, device=target_locations.device, requires_grad=True)
-
-    locs = target_locations[valid_mask]  # [N_valid, D]
-    batch_idx = target_batch_ids[valid_mask]  # [N_valid]
-
-    # --- 2. Gather Params (B -> N) ---
-    # Expand graph-level params to node-level params
-    gmm_expanded = {
-        "mu": gmm_output["mu"][batch_idx],  # [N, K, D]
-        "sigma": gmm_output["sigma"][batch_idx],  # [N, K]
-        "pi": gmm_output["pi"][batch_idx],  # [N, K]
-    }
-
-    # --- 3. Create Distribution ---
-    # The helper sees "Batch Size" as N_valid.
-    # Returns distribution with batch_shape=[N_valid, 1], event_shape=[D]
-    gmm_dist = get_gmm(gmm_expanded, D=locs.shape[-1])
-
-    # --- 4. Compute Log Prob ---
-    # Target: [N, D] -> [N, 1, D] to match dist batch_shape [N, 1]
-    log_likelihood = gmm_dist.log_prob(locs.unsqueeze(1))
-
-    # Loss is negative mean log likelihood
-    return -torch.mean(log_likelihood)
-
+from chemflow.flow_matching.gmm import get_typed_gmm_components
 
 def typed_gmm_loss(
     gmm_output,
