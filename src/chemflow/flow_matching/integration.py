@@ -186,7 +186,7 @@ class RateIntegrator:
             mol_t_final: MoleculeBatch - updated molecule after one integration step
         """
 
-        x_t, a_t, c_t, e_t, edge_index, batch_id = mol_t.unpack()
+        x_t, a_t, _, e_t, edge_index, batch_id = mol_t.unpack()
         x_1, a_1, c_1, e_1, edge_index_1, _ = mol_1_pred.unpack()
 
         # Rate for movement
@@ -215,7 +215,8 @@ class RateIntegrator:
         velocity = (x_1 - x_t) * move_rate_node.view(-1, 1)
         x_t = x_t + velocity * dt
 
-        # 1. Handle insertions using global budget (velocity-based) or local Poisson
+        """INSERTION"""
+        # 1. Handle insertions using local Poisson
         num_graphs = t.shape[0]
 
         # Per-node Poisson sampling
@@ -249,18 +250,9 @@ class RateIntegrator:
                     removed_indices = removed_indices[:n_to_remove]
                     do_ins[removed_indices] = False
 
-        """DELETION or SUBSTITUTION"""
-        # TODO implement multinomial sampling for deletion like above for insertions
-        # TODO this should take into account the logic below (conflicts with substitution)
-
+        """NODE DELETION or SUBSTITUTION"""
         # 1. Scale probabilities by time (converting prob -> rate * dt)
         # rate_node is 1 / (1 - t)
-        """do_sub_a = torch.rand_like(do_sub_a_probs) < do_sub_a_probs
-        do_del = torch.rand_like(do_del_probs) < do_del_probs
-
-        p_sub_scaled = do_sub_a.long().view(-1) * sub_rate_node * dt
-        p_del_scaled = do_del.long().view(-1) * del_rate_node * dt"""
-
         p_sub_scaled = do_sub_a_probs.view(-1) * sub_rate_node * dt
         p_del_scaled = do_del_probs.view(-1) * del_rate_node * dt
 
@@ -285,30 +277,11 @@ class RateIntegrator:
         # An edit occurs AND it is NOT a deletion type (therefore substitution)
         do_sub_a = do_edit & (~is_deletion_type)
 
-        """# 1. Modulate base rates with the neural network's continuous probabilities
-        lambda_sub = do_sub_a_probs.view(-1) * sub_rate_node
-        lambda_del = do_del_probs.view(-1) * del_rate_node
-
-        # 2. Calculate safe bounds for the independent probabilities
-        prob_sub = 1.0 - torch.exp(-lambda_sub * dt)
-        prob_del = 1.0 - torch.exp(-lambda_del * dt)
-
-        # 3. Sample the independent events (Coin flips)
-        do_sub_raw = torch.rand_like(prob_sub) < prob_sub
-        do_del_raw = torch.rand_like(prob_del) < prob_del
-
-        # 4. Apply "Sub over Deletion" conflict resolution
-        # Substitution gets absolute priority.
-        do_sub_a = do_sub_raw
-
-        # Deletion only happens if it triggered AND substitution did not.
-        do_del = do_del_raw & (~do_sub_raw)"""
-
         # 6. Apply
         # a_1 is your predicted token values from Step 2
         a_t[do_sub_a] = a_1[do_sub_a]
 
-        # 2.5. Update edge types
+        """EDGE SUBSTITUTION"""
         # Get current edge types (already indices)
 
         # we will deal with only the triu edge types and symmetrize later
@@ -318,23 +291,6 @@ class RateIntegrator:
         )
         e_triu, do_sub_e_probs_triu, e_1_triu = edge_infos["edge_attr"]
         edge_index_triu, _ = edge_infos["edge_index"]
-
-        """# Use probabilities directly (sigmoid already applied in sample())
-        p_sub_e = do_sub_e_probs_triu.view(-1)
-        do_sub_e = torch.rand_like(p_sub_e) < p_sub_e
-
-        # Get batch_id for edges from the source nodes of the edges
-        # edge_index_triu[0] gives the source node indices for each edge
-        batch_id_edge = batch_id[edge_index_triu[0]]
-
-        # Calculate rate for edges using the separate edge substitution schedule
-        rate_edge = sub_e_rate[batch_id_edge].unsqueeze(-1)
-        p_mod_e = rate_edge * dt
-        p_mod_e = p_mod_e.view(-1)
-
-        do_mod_e = torch.rand_like(p_mod_e) < p_mod_e
-
-        do_sub_e = do_sub_e & do_mod_e"""
 
         # Use probabilities directly (sigmoid already applied in sample())
         p_sub_e = do_sub_e_probs_triu.view(-1)

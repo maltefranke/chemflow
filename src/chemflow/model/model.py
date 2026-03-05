@@ -10,7 +10,7 @@ from chemflow.dataset.molecule_data import MoleculeBatch
 class EmbeddingBackbone(nn.Module):
     """
     Embedding Module.
-    Embeds atom features, charges, edge types, time, and node counts before passing to the backbone.
+    Embeds atom features, edge types, time, and node counts before passing to the backbone.
     Optionally embeds molecular properties for property-conditional generation.
     """
 
@@ -18,7 +18,6 @@ class EmbeddingBackbone(nn.Module):
         self,
         atom_type_embedding_args: DictConfig,
         edge_type_embedding_args: DictConfig,
-        # charge_embedding_args: DictConfig,
         time_embedding_args: DictConfig,
         node_count_embedding_args: DictConfig,
         property_embedding_args: Optional[DictConfig] = None,
@@ -27,7 +26,6 @@ class EmbeddingBackbone(nn.Module):
     ):
         super().__init__()
         self.atom_type_embedding = hydra.utils.instantiate(atom_type_embedding_args)
-        # self.charge_embedding = hydra.utils.instantiate(charge_embedding_args)
         self.edge_type_embedding = hydra.utils.instantiate(edge_type_embedding_args)
         self.time_embedding = hydra.utils.instantiate(time_embedding_args)
         self.node_count_embedding = hydra.utils.instantiate(node_count_embedding_args)
@@ -51,7 +49,6 @@ class EmbeddingBackbone(nn.Module):
     def forward(
         self,
         a: torch.Tensor,
-        c: torch.Tensor,
         e: torch.Tensor,
         edge_index: torch.Tensor,
         t: torch.Tensor,
@@ -64,7 +61,6 @@ class EmbeddingBackbone(nn.Module):
         N_nodes = torch.bincount(batch)
 
         a_embed = self.atom_type_embedding(a)
-        # c_embed = self.charge_embedding(c)
 
         # Calculate conditioning embeddings
         # Ensure we index correctly based on the batch size
@@ -113,7 +109,6 @@ class BackboneWithHeads(nn.Module):
         # Embedding args
         atom_type_embedding_args: DictConfig,
         edge_type_embedding_args: DictConfig,
-        # charge_embedding_args: DictConfig,
         time_embedding_args: DictConfig,
         node_count_embedding_args: DictConfig,
         # Backbone model args
@@ -134,7 +129,6 @@ class BackboneWithHeads(nn.Module):
         self.embedding_backbone = EmbeddingBackbone(
             atom_type_embedding_args=atom_type_embedding_args,
             edge_type_embedding_args=edge_type_embedding_args,
-            # charge_embedding_args=charge_embedding_args,
             time_embedding_args=time_embedding_args,
             node_count_embedding_args=node_count_embedding_args,
             property_embedding_args=property_embedding_args,
@@ -198,7 +192,6 @@ class BackboneWithHeads(nn.Module):
         # 1. Embedding Pass
         h_0, edge_index_tuple, e_embed = self.embedding_backbone(
             a,
-            c,
             e,
             edge_index,
             t,
