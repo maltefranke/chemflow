@@ -207,10 +207,10 @@ def compute_token_weights(
         distribution: Distribution of token types from training data.
             MUST have the same length as token_list and be aligned by index.
         special_token_names: List of special token names to handle specially
-            (e.g., ["<MASK>", "<DEATH>"] for nodes or ["<MASK>", "<NO_BOND>"] for edges)
+            (e.g., ["<NO_BOND>"] for edges)
         weight_alpha: Alpha parameter for weight scaling (default: 1.0)
         type_loss_token_weights: "uniform" or "training" - if "uniform", returns
-            uniform weights (all 1.0) except for <MASK> which stays 0.0
+            uniform weights (all 1.0)
 
     Returns:
         Weights tensor with same shape as distribution
@@ -224,23 +224,16 @@ def compute_token_weights(
 
     # Get indices for special tokens (with validation)
     special_token_indices = set()
-    mask_token_idx = None
     for token_name in special_token_names:
         if token_name not in token_list:
             print(f"Warning: Special token '{token_name}' not in token_list, skipping")
             continue
         idx = token_to_index(token_list, token_name)
         special_token_indices.add(idx)
-        if token_name == "<MASK>":
-            mask_token_idx = idx
 
     # --- Handle uniform weights case early ---
     if type_loss_token_weights == "uniform":
-        final_weights = torch.ones_like(distribution)
-        # <MASK> should always have 0 weight (ignore in loss)
-        if mask_token_idx is not None:
-            final_weights[mask_token_idx] = 0.0
-        return final_weights
+        return torch.ones_like(distribution)
 
     # --- 1. Initial Weight Calculation (Inverse Frequency) ---
     epsilon = 1e-8
@@ -252,11 +245,7 @@ def compute_token_weights(
     regular_token_indices = list(all_indices - special_token_indices)
 
     if not regular_token_indices:
-        # Fallback if no regular tokens (unlikely, but good to handle)
-        final_weights = torch.ones_like(weights)
-        if mask_token_idx is not None:
-            final_weights[mask_token_idx] = 0.0
-        return final_weights
+        return torch.ones_like(weights)
 
     # Get weights for only the regular tokens
     regular_weights = weights[regular_token_indices]
@@ -273,23 +262,16 @@ def compute_token_weights(
     # Assign normalized regular weights to their correct positions
     final_weights[regular_token_indices] = regular_weights
 
-    # Handle special tokens
+    # Handle special tokens: use their actual inverse frequency weight,
+    # normalized the same way as regular tokens
     for token_name in special_token_names:
         if token_name not in token_list:
             continue
         token_idx = token_to_index(token_list, token_name)
-
-        if token_name == "<MASK>":
-            # <MASK> should never contribute to loss
-            final_weights[token_idx] = 0.0
-        else:
-            # For other special tokens (e.g., <NO_BOND>), use their actual
-            # inverse frequency weight, normalized the same way as regular tokens
-            # This ensures common special tokens (like <NO_BOND>) get low weight
-            special_weight = weights[token_idx]
-            if mean_regular_weight > 0:
-                special_weight = special_weight / mean_regular_weight
-            final_weights[token_idx] = special_weight
+        special_weight = weights[token_idx]
+        if mean_regular_weight > 0:
+            special_weight = special_weight / mean_regular_weight
+        final_weights[token_idx] = special_weight
 
     # set the minimum weight to 1.0
     final_weights = final_weights / final_weights.min()
@@ -323,15 +305,6 @@ def symmetrize_upper_triangle(edge_index, edge_attr):
 
     # 4. Sort to ensure canonical PyG order (row-major)
     return sort_edge_index(full_edge_index, full_edge_attr)
-
-
-def remove_token_from_distribution(token_list, distribution, token="<MASK>"):
-    token_index = token_to_index(token_list, token)
-    token_list.remove(token)
-    distribution = torch.cat(
-        [distribution[:token_index], distribution[token_index + 1 :]]
-    )
-    return token_list, distribution
 
 
 def validate_no_cross_batch_edges(

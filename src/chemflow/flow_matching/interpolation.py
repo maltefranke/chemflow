@@ -33,7 +33,6 @@ class Interpolator:
         self,
         vocab: Vocab,
         distributions: Distributions,
-        cat_strategy="uniform-sample",
         n_atoms_strategy="flexible",
         optimal_transport="equivariant",
         ins_noise_scale=1.0,
@@ -47,7 +46,6 @@ class Interpolator:
     ):
         self.vocab = vocab
         self.distributions = distributions
-        self.cat_strategy = cat_strategy
         self.n_atoms_strategy = n_atoms_strategy
 
         self.optimal_transport = optimal_transport
@@ -77,10 +75,6 @@ class Interpolator:
         self.c_move = c_move
         self.c_sub = c_sub
         self.c_ins = c_ins
-
-        if self.cat_strategy == "mask":
-            self.atom_mask_token = token_to_index(self.atom_tokens, "<MASK>")
-            self.edge_mask_token = token_to_index(self.edge_tokens, "<MASK>")
 
         # TODO I'm lazy and this will always be 3
         self.D = 3

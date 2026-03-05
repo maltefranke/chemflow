@@ -5,7 +5,7 @@ gmm_params:
 
 rotate: false
 
-is_typed: ${if:${eq:${data.cat_strategy},uniform-sample},true,false}
+is_typed: true
 output_dim_typed: ${oc.eval:"${model.gmm_params.K} * (2 + ${model.gmm_params.D} + ${len:${data.vocab.atom_tokens}} + ${len:${data.vocab.charge_tokens}})"}
 output_dim_untyped: ${oc.eval:"${model.gmm_params.K} * (3 +  ${model.gmm_params.D})"}
 
@@ -17,7 +17,6 @@ integrator:
   vocab: ${data.vocab}
   distributions: None
   gmm_params: ${model.gmm_params}
-  cat_strategy: ${data.cat_strategy}
   n_atoms_strategy: ${data.n_atoms_strategy}
   # strategy used for sampling time during **integration**
   # NOTE can be different from the time strategy used for the model (see below)
@@ -54,13 +53,12 @@ module:
   type_loss_token_weights: training
   cat_weighting:
     _target_: DictConfig
-    cat_strategy: ${data.cat_strategy}
     weight_alpha: 0.4
   ins_noise_scale: ${data.ins_noise_scale}
   edit_loss_ema_decay: 0.99
   edit_loss_ema_eps: 1.0e-8
   ema_decay: 0.999
-  use_ema_for_eval: true
+  use_ema_for_eval: false
   time_dist: ${if:${eq:${model.sample_time_strategy}, log}, ${model.beta_sched}, ${model.linear_sched}}
 
   # Classifier-free guidance on molecular properties (controlled by model.do_cfg)
@@ -77,19 +75,19 @@ module:
   # Loss component weights
   use_learnable_loss_weights: false
   loss_weights:
-    l_do_sub_a: 3.0
+    l_do_sub_a: 1.0
     l_sub_a_class: 1.0
-    l_do_sub_e: 4.0
-    l_sub_e_class: 2.0
-    l_do_del: 2.0
-    l_do_ins: 2.0
+    l_do_sub_e: 1.0
+    l_sub_e_class: 1.0
+    l_do_del: 1.0
+    l_do_ins: 1.0
     l_ins_rate: 1.0
     l_ins_gmm: 1.0
-    l_ins_e: 3.0
-    l_x: 20.0
+    l_ins_e: 1.0
+    l_x: 1.0
     l_c: 1.0
-    l_global_ins_budget: 0.01
-    l_global_del_budget: 0.01
+    l_global_ins_budget: 0.0
+    l_global_del_budget: 0.0
 
   # Optimizer configuration
   # MuonWithAuxAdam: Muon for 2D backbone weights, AdamW for the rest.
@@ -97,16 +95,16 @@ module:
     optimizer:
       lr: 0.02
       momentum: 0.95
-      weight_decay: 0.01
+      weight_decay: 0.0
 
     aux_optimizer:
       lr: 3e-4
       betas: [0.9, 0.95]
       eps: 1e-10
-      weight_decay: 0.00
+      weight_decay: 0.0
 
     emb_optimizer:
-      lr: 3e-3
+      lr: 3e-4
 
     scheduler:
       _target_: chemflow.schedulers.MultiGroupCosineWarmupLR

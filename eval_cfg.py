@@ -16,7 +16,6 @@ import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
 from rdkit import RDLogger
 
-from chemflow.utils import remove_token_from_distribution
 
 OmegaConf.register_new_resolver("oc.eval", eval)
 OmegaConf.register_new_resolver("len", lambda x: len(x))
@@ -74,39 +73,21 @@ def eval_cfg(cfg: DictConfig):
     distributions = preprocessing.distributions
     loss_weight_distributions = deepcopy(distributions)
 
-    if cfg.data.cat_strategy != "mask":
-        atom_tokens, atom_dist = remove_token_from_distribution(
-            vocab.atom_tokens, distributions.atom_type_distribution, "<MASK>"
-        )
-        edge_tokens, edge_dist = remove_token_from_distribution(
-            vocab.edge_tokens, distributions.edge_type_distribution, "<MASK>"
-        )
-        vocab.atom_tokens = atom_tokens
-        distributions.atom_type_distribution = atom_dist
-        loss_weight_distributions.atom_type_distribution = atom_dist
-        vocab.edge_tokens = edge_tokens
-        distributions.edge_type_distribution = edge_dist
-        loss_weight_distributions.edge_type_distribution = edge_dist
-
-    if cfg.data.cat_strategy == "uniform-sample":
-        distributions.atom_type_distribution = torch.ones_like(
-            distributions.atom_type_distribution
-        )
-        distributions.atom_type_distribution /= (
-            distributions.atom_type_distribution.sum()
-        )
-        distributions.edge_type_distribution = torch.ones_like(
-            distributions.edge_type_distribution
-        )
-        distributions.edge_type_distribution /= (
-            distributions.edge_type_distribution.sum()
-        )
-        distributions.charge_type_distribution = torch.ones_like(
-            distributions.charge_type_distribution
-        )
-        distributions.charge_type_distribution /= (
-            distributions.charge_type_distribution.sum()
-        )
+    # Sampling prior uses uniform categorical distributions.
+    distributions.atom_type_distribution = torch.ones_like(
+        distributions.atom_type_distribution
+    )
+    distributions.atom_type_distribution /= distributions.atom_type_distribution.sum()
+    distributions.edge_type_distribution = torch.ones_like(
+        distributions.edge_type_distribution
+    )
+    distributions.edge_type_distribution /= distributions.edge_type_distribution.sum()
+    distributions.charge_type_distribution = torch.ones_like(
+        distributions.charge_type_distribution
+    )
+    distributions.charge_type_distribution /= (
+        distributions.charge_type_distribution.sum()
+    )
 
     cfg.data.vocab = vocab
 

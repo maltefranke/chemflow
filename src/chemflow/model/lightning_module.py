@@ -103,13 +103,6 @@ class LightningModuleRates(pl.LightningModule):
         self.ins_rate_strategy = ins_rate_strategy
         self.type_loss_token_weights = type_loss_token_weights
 
-        if self.cat_weighting.cat_strategy == "mask":
-            self.atom_mask_index = token_to_index(self.vocab.atom_tokens, "<MASK>")
-            self.edge_mask_index = token_to_index(self.vocab.edge_tokens, "<MASK>")
-        else:
-            self.atom_mask_index = None
-            self.edge_mask_index = None
-
         if time_dist is None:
             time_dist = DictConfig(
                 {
@@ -169,8 +162,6 @@ class LightningModuleRates(pl.LightningModule):
 
         # Always compute token distribution weights for weighted cross-entropy loss
         atom_special_tokens = []
-        if self.cat_weighting.cat_strategy == "mask":
-            atom_special_tokens.append("<MASK>")
 
         atom_type_weights = compute_token_weights(
             token_list=self.vocab.atom_tokens,
@@ -183,8 +174,6 @@ class LightningModuleRates(pl.LightningModule):
 
         # Compute edge token distribution weights for weighted cross-entropy loss
         edge_special_tokens = ["<NO_BOND>"]
-        if self.cat_weighting.cat_strategy == "mask":
-            edge_special_tokens.append("<MASK>")
 
         edge_weights = compute_token_weights(
             token_list=self.vocab.edge_tokens,
@@ -924,6 +913,7 @@ class LightningModuleRates(pl.LightningModule):
         n_inserts = (mols_t.lambda_ins > 0.0).sum().float()
         n_deletes = (mols_t.lambda_del > 0.0).sum().float()
         w_ins, w_del = self._get_ema_edit_weights(n_inserts, n_deletes)
+        w_ins, w_del = 1.0, 1.0
 
         # 5. Combine all losses using the unified wrapper
         # Balance insertion/deletion components with EMA-smoothed activity weights.

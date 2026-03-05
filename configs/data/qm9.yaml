@@ -4,11 +4,9 @@ root_path: ${oc.env:PROJECT_ROOT}/data
 preprocess_workers: 0
 
 n_atoms_strategy: "flexible" # "fixed", "approx"
-cat_strategy: "uniform-sample" #"mask" # "uniform-sample"
 optimal_transport: "equivariant"
 ins_noise_scale: 0.5
-# t_end_del: 0.975
-#t_end_ins: 0.975
+
 
 # Preprocessing configuration - computes tokens from data and distributions from training dataset only
 preprocessing:
@@ -25,7 +23,6 @@ vocab: None
 
 interpolator:
   _target_: chemflow.flow_matching.interpolation.Interpolator
-  cat_strategy: ${data.cat_strategy}
   n_atoms_strategy: ${data.n_atoms_strategy}
   # will be set in the instantiate method
   vocab: ${data.vocab}
@@ -71,20 +68,19 @@ datamodule:
         rotate: ${model.rotate}
   
   interpolator: ${data.interpolator}
-  
+
   num_workers:
-    train: 10
-    val: 10
+    train: 20
+    val: 20
     test: 10
     predict: 10
 
   batch_size:
-    train: 256
-    val: 128
+    train: 1024
+    val: 256
     test: 32
 
   n_atoms_strategy: ${data.n_atoms_strategy}
-  cat_strategy: ${data.cat_strategy}
   optimal_transport: ${data.optimal_transport}
   time_dist: ${model.module.time_dist}
   

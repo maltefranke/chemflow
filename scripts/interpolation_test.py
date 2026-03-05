@@ -9,7 +9,6 @@ from omegaconf import OmegaConf
 from chemflow.flow_matching.interpolation import Interpolator
 from chemflow.dataset.molecule_data import MoleculeBatch
 import torch.nn.functional as F
-from chemflow.utils import remove_token_from_distribution
 
 from chemflow.flow_matching.schedules import FastPowerSchedule
 
@@ -34,19 +33,6 @@ def run(cfg: DictConfig):
     # Extract vocab and distributions from preprocessing
     vocab = preprocessing.vocab
     distributions = preprocessing.distributions
-
-    if cfg.data.cat_strategy != "mask":
-        # remove <MASK> token from the atom_type_distribution and edge_type_distribution
-        atom_tokens, atom_type_distribution = remove_token_from_distribution(
-            vocab.atom_tokens, distributions.atom_type_distribution, "<MASK>"
-        )
-        edge_tokens, edge_type_distribution = remove_token_from_distribution(
-            vocab.edge_tokens, distributions.edge_type_distribution, "<MASK>"
-        )
-        vocab.atom_tokens = atom_tokens
-        distributions.atom_type_distribution = atom_type_distribution
-        vocab.edge_tokens = edge_tokens
-        distributions.edge_type_distribution = edge_type_distribution
 
     cfg.data.vocab = vocab
     print(distributions)

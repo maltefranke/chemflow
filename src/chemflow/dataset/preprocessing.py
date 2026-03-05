@@ -26,10 +26,7 @@ class Preprocessing:
     """
 
     # Special tokens that must always be present
-    MASK_TOKEN = "<MASK>"
     NO_BOND_TOKEN = "<NO_BOND>"
-    SPECIAL_TOKENS = [MASK_TOKEN]
-    EDGE_SPECIAL_TOKENS = [MASK_TOKEN, NO_BOND_TOKEN]
 
     def __init__(
         self,
@@ -155,16 +152,14 @@ class Preprocessing:
         edge_type_indices_sorted = sorted(all_edge_type_indices)
         charge_tokens_sorted = sorted(all_charge_tokens)
 
-        # Combine special tokens (always first) with discovered atom types
-        tokens = self.SPECIAL_TOKENS + atom_types_sorted
+        # Atom tokens: discovered atom types only (no special tokens)
+        tokens = atom_types_sorted
 
         # Create bond type tokens (as strings)
         bond_type_tokens = [str(int(idx)) for idx in edge_type_indices_sorted]
 
-        # Edge tokens order: [NO_BOND_TOKEN] + [bond types] + [MASK_TOKEN]
-        # This way: 0 maps to NO_BOND (index 0), 1-4 map to bond types,
-        # MASK is last
-        edge_tokens = [self.NO_BOND_TOKEN, *bond_type_tokens, self.MASK_TOKEN]
+        # Edge tokens order: [NO_BOND_TOKEN] + [bond types]
+        edge_tokens = [self.NO_BOND_TOKEN, *bond_type_tokens]
 
         charge_tokens = [str(int(idx)) for idx in charge_tokens_sorted]
 

@@ -10,7 +10,7 @@ from omegaconf import OmegaConf
 from rdkit import RDLogger
 from pytorch_lightning.strategies import DDPStrategy
 
-from chemflow.utils import build_callbacks, remove_token_from_distribution
+from chemflow.utils import build_callbacks
 from chemflow.model.lightning_module import LightningModuleRates
 
 # resolvers for more complex config expressions
@@ -40,44 +40,28 @@ def run(cfg: DictConfig):
     # Keep training-frequency distributions for loss weighting.
     loss_weight_distributions = deepcopy(distributions)
 
-    if cfg.data.cat_strategy != "mask":
-        # remove <MASK> token from the atom_type_distribution and edge_type_distribution
-        atom_tokens, atom_type_distribution = remove_token_from_distribution(
-            vocab.atom_tokens, distributions.atom_type_distribution, "<MASK>"
-        )
-        edge_tokens, edge_type_distribution = remove_token_from_distribution(
-            vocab.edge_tokens, distributions.edge_type_distribution, "<MASK>"
-        )
-        vocab.atom_tokens = atom_tokens
-        distributions.atom_type_distribution = atom_type_distribution
-        loss_weight_distributions.atom_type_distribution = atom_type_distribution
-        vocab.edge_tokens = edge_tokens
-        distributions.edge_type_distribution = edge_type_distribution
-        loss_weight_distributions.edge_type_distribution = edge_type_distribution
-
-    if cfg.data.cat_strategy == "uniform-sample":
-        # Sampling prior uses uniform categorical distributions.
-        distributions.atom_type_distribution = torch.ones_like(
-            distributions.atom_type_distribution
-        )
-        distributions.atom_type_distribution = (
-            distributions.atom_type_distribution
-            / distributions.atom_type_distribution.sum()
-        )
-        distributions.edge_type_distribution = torch.ones_like(
-            distributions.edge_type_distribution
-        )
-        distributions.edge_type_distribution = (
-            distributions.edge_type_distribution
-            / distributions.edge_type_distribution.sum()
-        )
-        distributions.charge_type_distribution = torch.ones_like(
-            distributions.charge_type_distribution
-        )
-        distributions.charge_type_distribution = (
-            distributions.charge_type_distribution
-            / distributions.charge_type_distribution.sum()
-        )
+    # Sampling prior uses uniform categorical distributions.
+    distributions.atom_type_distribution = torch.ones_like(
+        distributions.atom_type_distribution
+    )
+    distributions.atom_type_distribution = (
+        distributions.atom_type_distribution
+        / distributions.atom_type_distribution.sum()
+    )
+    distributions.edge_type_distribution = torch.ones_like(
+        distributions.edge_type_distribution
+    )
+    distributions.edge_type_distribution = (
+        distributions.edge_type_distribution
+        / distributions.edge_type_distribution.sum()
+    )
+    distributions.charge_type_distribution = torch.ones_like(
+        distributions.charge_type_distribution
+    )
+    distributions.charge_type_distribution = (
+        distributions.charge_type_distribution
+        / distributions.charge_type_distribution.sum()
+    )
 
     cfg.data.vocab = vocab
     # cfg.data.distributions = distributions
@@ -111,7 +95,7 @@ def run(cfg: DictConfig):
         loss_weight_distributions=loss_weight_distributions,
     )
 
-    module.compile()
+    # module.compile()
 
     # Setup logging and callbacks
     wandb_logger = WandbLogger(**cfg.logging)
@@ -128,7 +112,7 @@ def run(cfg: DictConfig):
     )
 
     ckpt_path = None
-    # ckpt_path = "/cluster/project/krause/frankem/chemflow/outputs/2026-02-28/10-54-28/logs/chemflow/8u2u45g9/checkpoints/epoch=469-step=10340.ckpt"
+    #ckpt_path = "/users/frankem/chemflow/outputs/2026-03-03/23-32-59/logs/chemflow/s26mr2e6/checkpoints/epoch=29-step=661.ckpt"
 
     # Train the model
     trainer.fit(

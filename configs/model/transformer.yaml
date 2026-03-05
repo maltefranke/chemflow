@@ -5,7 +5,7 @@ gmm_params:
 
 rotate: true
 
-is_typed: ${if:${eq:${data.cat_strategy},uniform-sample},true,false}
+is_typed: true
 output_dim_typed: ${oc.eval:"${model.gmm_params.K} * (2 + ${model.gmm_params.D} + ${len:${data.vocab.atom_tokens}} + ${len:${data.vocab.charge_tokens}})"}
 output_dim_untyped: ${oc.eval:"${model.gmm_params.K} * (3 +  ${model.gmm_params.D})"}
 
@@ -17,7 +17,6 @@ integrator:
   vocab: ${data.vocab}
   distributions: None
   gmm_params: ${model.gmm_params}
-  cat_strategy: ${data.cat_strategy}
   n_atoms_strategy: ${data.n_atoms_strategy}
   # strategy used for sampling time during **integration**
   # NOTE can be different from the time strategy used for the model (see below)
@@ -54,7 +53,6 @@ module:
   type_loss_token_weights: training
   cat_weighting:
     _target_: DictConfig
-    cat_strategy: ${data.cat_strategy}
     weight_alpha: 0.4
   ins_noise_scale: ${data.ins_noise_scale}
   edit_loss_ema_decay: 0.99

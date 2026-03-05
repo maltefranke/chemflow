@@ -7,8 +7,6 @@ from functools import partial
 
 from chemflow.dataset.molecule_data import MoleculeBatch
 from chemflow.flow_matching.sampling import sample_prior_graph
-from chemflow.utils import token_to_index
-
 
 class LightningDataModule(pl.LightningDataModule):
     def __init__(
@@ -19,7 +17,6 @@ class LightningDataModule(pl.LightningDataModule):
         interpolator: DictConfig,
         num_workers: DictConfig,
         batch_size: DictConfig,
-        cat_strategy: str = "uniform-sample",
         n_atoms_strategy: str = "flexible",
         optimal_transport: str = "equivariant",
         time_dist: DictConfig = None,
@@ -30,7 +27,6 @@ class LightningDataModule(pl.LightningDataModule):
         self.interpolator = interpolator
         self.num_workers = num_workers
         self.batch_size = batch_size
-        self.cat_strategy = cat_strategy
         self.n_atoms_strategy = n_atoms_strategy
         self.optimal_transport = optimal_transport
 
@@ -49,26 +45,6 @@ class LightningDataModule(pl.LightningDataModule):
         self.train_dataset = None
         self.val_datasets = None
         self.test_datasets = None
-
-        if self.cat_strategy == "mask":
-            self.atom_mask_token_index = token_to_index(
-                self.vocab.atom_tokens, "<MASK>"
-            )
-            self.edge_mask_token_index = token_to_index(
-                self.vocab.edge_tokens, "<MASK>"
-            )
-
-            self.distributions.atom_type_distribution = torch.zeros_like(
-                self.distributions.atom_type_distribution
-            )
-            # always sample a mask token
-            self.distributions.atom_type_distribution[self.atom_mask_token_index] = 1.0
-
-            self.distributions.edge_type_distribution = torch.zeros_like(
-                self.distributions.edge_type_distribution
-            )
-            # always sample a mask token
-            self.distributions.edge_type_distribution[self.edge_mask_token_index] = 1.0
 
         self.distributions.coordinate_std = (
             self.distributions.coordinate_std

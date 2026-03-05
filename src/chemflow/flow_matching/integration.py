@@ -2,7 +2,6 @@ import torch
 
 from chemflow.flow_matching.gmm import (
     sample_from_typed_gmm,
-    sample_from_gmm,
 )
 from chemflow.utils import (
     token_to_index,
@@ -37,7 +36,6 @@ class RateIntegrator:
         vocab: Vocabulary containing atom, edge, and charge tokens
         distributions: Distribution statistics for the dataset
         gmm_params: Parameters for Gaussian Mixture Model used in insertions
-        cat_strategy: Categorical strategy ("uniform-sample" or "mask")
         n_atoms_strategy: Strategy for number of atoms ("flexible" or "fixed")
         num_integration_steps: Number of integration steps from t=0 to t=1
         time_strategy: Time scheduling strategy ("linear" or "log")
@@ -49,7 +47,6 @@ class RateIntegrator:
         vocab: Vocab,
         distributions: Distributions,
         gmm_params,
-        cat_strategy="uniform-sample",
         n_atoms_strategy="flexible",
         num_integration_steps=100,
         time_strategy="log",
@@ -62,7 +59,6 @@ class RateIntegrator:
         self.vocab = vocab
         self.distributions = distributions
         self.gmm_params = gmm_params
-        self.cat_strategy = cat_strategy
         self.n_atoms_strategy = n_atoms_strategy
         self.time_strategy = time_strategy
         self.num_integration_steps = num_integration_steps
@@ -137,24 +133,9 @@ class RateIntegrator:
 
         # Sample from GMM for this graph
         # Keep batch dimension
-        if self.cat_strategy == "uniform-sample":
-            sampled_x, sampled_a, sampled_c = sample_from_typed_gmm(
-                ins_gmm_dict, num_ins, self.gmm_params.K, self.gmm_params.D, N_a, N_c
-            )
-        else:
-            sampled_x = sample_from_gmm(
-                ins_gmm_dict, num_ins, self.gmm_params.K, self.gmm_params.D
-            )
-            sampled_a = self.atom_mask_index * torch.ones(
-                (num_ins,),
-                dtype=torch.long,
-                device=self.device,
-            )
-            sampled_c = self.charge_mask_index * torch.ones(
-                (num_ins,),
-                dtype=torch.long,
-                device=self.device,
-            )
+        sampled_x, sampled_a, sampled_c = sample_from_typed_gmm(
+            ins_gmm_dict, num_ins, self.gmm_params.K, self.gmm_params.D, N_a, N_c
+        )
 
         new_atoms = PointCloud(
             x=sampled_x.view(-1, self.gmm_params.D),
@@ -437,16 +418,7 @@ class RateIntegrator:
                 new_atoms.batch = batch_id[do_ins_valid]
 
                 # Determine fallback edge distribution
-                if (
-                    self.cat_strategy == "uniform-sample"
-                    and self.distributions.edge_type_distribution is not None
-                ):
-                    edge_dist = self.distributions.edge_type_distribution.to(
-                        self.device
-                    )
-                else:
-                    edge_dist = torch.zeros(len(self.vocab.edge_tokens))
-                    edge_dist[self.edge_mask_index] = 1.0
+                edge_dist = self.distributions.edge_type_distribution.to(self.device)
 
                 # Build mapping: original spawn index -> new atom index
                 # New atoms are ordered by the True values in do_ins_valid
