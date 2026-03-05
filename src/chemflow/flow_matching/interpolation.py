@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -7,7 +6,6 @@ from torch_geometric.utils import to_dense_adj
 from chemflow.flow_matching.assignment import partial_optimal_transport
 
 from chemflow.utils import (
-    token_to_index,
     EdgeAligner,
 )
 from external_code.egnn import unsorted_segment_mean
@@ -137,29 +135,29 @@ class Interpolator:
         """
         return x0 * (1 - t) + x1 * t
 
-    def interpolate_discrete(self, c0_idx, c1_idx, t):
+    def interpolate_discrete(self, y0_idx, y1_idx, t):
         """
         Discrete interpolation for discrete variables / one-hot classes c.
 
         Args:
-            c0_idx: (N,) class indices tensor at time 0
-            c1_idx: (N,) class indices tensor at time 1
+            y0_idx: (N,) class indices tensor at time 0
+            y1_idx: (N,) class indices tensor at time 1
             t: float, interpolation time in [0, 1]
         Returns:
             y_t: (N, ) interpolated class indices tensor at time t
         """
 
-        N = c0_idx.shape[0]
+        N = y0_idx.shape[0]
 
         # Sample Bernoulli mask for which positions to keep from y0
         mask = torch.rand(N, device=t.device) > t  # True = keep from y0
         mask = mask.view(N)
 
         # Start from y1 and overwrite with y0 where mask=True
-        ct_idx = c1_idx.clone()
-        ct_idx[mask] = c0_idx[mask]
+        yt_idx = y1_idx.clone()
+        yt_idx[mask] = y0_idx[mask]
 
-        return ct_idx
+        return yt_idx
 
     def interpolate_different_size(
         self,

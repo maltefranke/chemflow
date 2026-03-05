@@ -118,12 +118,13 @@ class LightningDataModule(pl.LightningDataModule):
         targets_batched = MoleculeBatch.from_data_list(targets)
 
         if stage == "train":
+            # TODO maybe it makes sense to already put this in the __get_item__ method
+            # TODO this could lead to speedups, since get_item is parallelized
             batch_size = targets_batched.batch_size
             device = targets_batched.x.device
 
             # interpolate
             t = self.time_dist.sample((batch_size,)).to(device)
-            # clip t_max
             t = torch.clamp(t, min=0.0, max=1 - 1e-6)
             mols_t, mols_1, ins_targets = self.interpolator.interpolate_different_size(
                 samples_batched,
