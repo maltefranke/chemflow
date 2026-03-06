@@ -77,7 +77,7 @@ datamodule:
 
   batch_size:
     train: 1024
-    val: 256
+    val: 128
     test: 32
 
   n_atoms_strategy: ${data.n_atoms_strategy}

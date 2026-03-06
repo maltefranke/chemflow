@@ -514,6 +514,32 @@ def init_metrics(train_mols=None, target_n_atoms_distribution: torch.Tensor | No
     return metrics, stability_metrics
 
 
+def calc_posebusters_metrics(
+    rdkit_mols: list[Chem.rdchem.Mol | None],
+) -> dict[str, float]:
+    """Run PoseBusters molecular plausibility checks and return averaged pass rates.
+
+    Uses the "mol" config (standalone molecule checks, no protein context).
+    Each check produces a boolean per molecule; we return the mean pass rate.
+    """
+    from posebusters import PoseBusters
+
+    valid_mols = [mol for mol in rdkit_mols if mol is not None]
+    if len(valid_mols) == 0:
+        return {}
+
+    buster = PoseBusters(config="mol")
+    df = buster.bust(valid_mols)
+
+    results = {}
+    for col in df.columns:
+        series = df[col]
+        if series.dtype == "bool" or series.dtype == "boolean":
+            results[col] = float(series.mean())
+
+    return results
+
+
 def calc_metrics_(
     rdkit_mols,
     metrics,

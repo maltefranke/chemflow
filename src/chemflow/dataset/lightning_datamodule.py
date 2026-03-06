@@ -104,6 +104,15 @@ class LightningDataModule(pl.LightningDataModule):
             # floor to minimum of 3
             n_atoms = [max(3, n_atoms_i) for n_atoms_i in n_atoms]
 
+        elif self.n_atoms_strategy == "median":
+            
+            # Get the index of the median of the n_atoms_distribution
+            n_atoms_dist = self.distributions.n_atoms_distribution
+            n_atoms_cumsum = torch.cumsum(n_atoms_dist, dim=0)
+            median_idx = int((n_atoms_cumsum >= 0.5).nonzero(as_tuple=True)[0][0].item())
+            n_atoms_median = median_idx
+            n_atoms = [n_atoms_median for target in targets]
+
         else:
             n_atoms = [None for target in targets]
 

@@ -5,7 +5,6 @@ gmm_params:
 
 rotate: false
 
-is_typed: true
 output_dim_typed: ${oc.eval:"${model.gmm_params.K} * (2 + ${model.gmm_params.D} + ${len:${data.vocab.atom_tokens}} + ${len:${data.vocab.charge_tokens}})"}
 output_dim_untyped: ${oc.eval:"${model.gmm_params.K} * (3 +  ${model.gmm_params.D})"}
 
@@ -82,8 +81,8 @@ module:
     l_ins_e: 1.0
     l_x: 1.0
     l_c: 1.0
-    l_global_ins_budget: 0.0
-    l_global_del_budget: 0.0
+    l_global_ins_budget: 0.1
+    l_global_del_budget: 0.1
 
   # Optimizer configuration
   # MuonWithAuxAdam: Muon for 2D backbone weights, AdamW for the rest.
@@ -186,11 +185,11 @@ property_embedding: ${if:${model.do_cfg}, ${model.cfg.property_embedding}, null}
 property_embed_dim: ${if:${model.do_cfg}, ${model.cfg.property_embed_dim}, 0}
 
 # ── Classifier-free guidance for target n_atoms (enabled by default) ──
-do_natoms_cfg: true
+do_natoms_cfg: false
 
 natoms_cfg:
   dropout_prob: 0.35
-  guidance_scale: 1.5
+  guidance_scale: 0.0
   embed_dim: 128
   embedding:
     _target_: chemflow.model.embedding.NAtomsCFGEmbedding
@@ -212,7 +211,7 @@ backbone:
   self_cond: False
   coord_norm: "length"
   eps: 1e-6
-  n_attn_heads: 4
+  n_attn_heads: 8
 
 
 heads:

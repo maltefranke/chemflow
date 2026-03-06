@@ -5,7 +5,6 @@ import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
 import hydra
 from chemflow.losses import typed_gmm_loss
-from chemflow.losses import gmm_loss as untyped_gmm_loss
 
 from chemflow.utils import (
     token_to_index,
@@ -18,10 +17,11 @@ from chemflow.dataset.molecule_data import MoleculeBatch
 from chemflow.dataset.vocab import Vocab, Distributions
 from chemflow.metrics import (
     calc_metrics_,
+    calc_posebusters_metrics,
     init_metrics,
 )
 from lightning.pytorch.utilities import grad_norm
-from chemflow.model.learnable_loss import UnifiedWeightedLoss
+from chemflow.model.learnable_loss import LossAccumulator, UnifiedWeightedLoss
 from chemflow.model.cfg import CFGAdapter
 
 
@@ -51,6 +51,15 @@ class LightningModuleRates(pl.LightningModule):
     - Number of deletions predicted globally for each graph.
     - Number of insertions predicted globally for each graph.
     """
+
+    LOSS_GROUPS: dict[str, list[str]] = {
+        "sub": ["do_sub_a", "sub_a_class", "do_sub_e", "sub_e_class"],
+        "del": ["do_del"],
+        "ins": ["do_ins", "ins_rate", "ins_gmm", "ins_e"],
+        "x": ["x"],
+        "c": ["c"],
+        "budget": ["global_ins_budget", "global_del_budget"],
+    }
 
     def __init__(
         self,
@@ -115,25 +124,26 @@ class LightningModuleRates(pl.LightningModule):
         if loss_weights is None:
             loss_weights = DictConfig(
                 {
-                    "l_do_sub_a": 1.0,
-                    "l_sub_a_class": 1.0,
-                    "l_do_sub_e": 1.0,
-                    "l_sub_e_class": 1.0,
-                    "l_do_del": 1.0,
-                    "l_do_ins": 1.0,
-                    "l_ins_rate": 1.0,
-                    "l_ins_gmm": 1.0,
-                    "l_ins_e": 1.0,
-                    "l_x": 1.0,
-                    "l_c": 1.0,
-                    "l_global_ins_budget": 1.0,
-                    "l_global_del_budget": 1.0,
+                    "do_sub_a": 1.0,
+                    "sub_a_class": 1.0,
+                    "do_sub_e": 1.0,
+                    "sub_e_class": 1.0,
+                    "do_del": 1.0,
+                    "do_ins": 1.0,
+                    "ins_rate": 1.0,
+                    "ins_gmm": 1.0,
+                    "ins_e": 1.0,
+                    "x": 1.0,
+                    "c": 1.0,
+                    "global_ins_budget": 1.0,
+                    "global_del_budget": 1.0,
                 }
             )
 
-        # register the loss weights as buffers
-        for key, value in loss_weights.items():
-            self.register_buffer(key, torch.tensor(value))
+        # Strip legacy "l_" prefix from config keys (YAML configs still use it)
+        loss_weight_values = {
+            k.removeprefix("l_"): float(v) for k, v in loss_weights.items()
+        }
 
         # Set default optimizer config if not provided
         if optimizer_config is None:
@@ -195,9 +205,7 @@ class LightningModuleRates(pl.LightningModule):
             target_n_atoms_distribution=self.distributions.n_atoms_distribution
         )
 
-        # EMA counts used to smooth insertion/deletion loss balancing.
-        self.register_buffer("ema_n_ins", torch.tensor(1.0))
-        self.register_buffer("ema_n_del", torch.tensor(1.0))
+        # EMA counts for balancing BCE pos_weight in do_action_loss.
         self.register_buffer("ema_do_ins_pos", torch.tensor(1.0))
         self.register_buffer("ema_do_ins_neg", torch.tensor(1.0))
         self.register_buffer("ema_do_del_pos", torch.tensor(1.0))
@@ -222,54 +230,13 @@ class LightningModuleRates(pl.LightningModule):
 
         self.edge_aligner = EdgeAligner()
 
-        # Initialize unified loss weight wrapper with dictionary structure
-        manual_weights = {
-            "do_sub_a": float(self.l_do_sub_a),
-            "sub_a_class": float(self.l_sub_a_class),
-            "do_sub_e": float(self.l_do_sub_e),
-            "sub_e_class": float(self.l_sub_e_class),
-            "do_del": float(self.l_do_del),
-            "do_ins": float(self.l_do_ins),
-            "ins_rate": float(self.l_ins_rate),
-            "ins_gmm": float(self.l_ins_gmm),
-            "ins_e": float(self.l_ins_e),
-            "x": float(self.l_x),
-            "c": float(self.l_c),
-            # Global budget prediction losses
-            "global_ins_budget": float(getattr(self, "l_global_ins_budget", 1.0)),
-            "global_del_budget": float(getattr(self, "l_global_del_budget", 1.0)),
-        }
         self.loss_weight_wrapper = UnifiedWeightedLoss(
-            manual_weights=manual_weights,
-            component_keys=manual_weights.keys(),
+            manual_weights=loss_weight_values,
+            component_keys=list(loss_weight_values.keys()),
             use_learnable=use_learnable_loss_weights,
         )
 
         self.is_compiled = False
-
-    def _get_ema_edit_weights(
-        self, n_inserts: torch.Tensor, n_deletes: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return EMA-smoothed balancing weights for insertion and deletion losses."""
-        n_inserts = n_inserts.detach().to(
-            device=self.device, dtype=self.ema_n_ins.dtype
-        )
-        n_deletes = n_deletes.detach().to(
-            device=self.device, dtype=self.ema_n_del.dtype
-        )
-
-        if self.training:
-            decay = self.edit_loss_ema_decay
-            one_minus_decay = 1.0 - decay
-            self.ema_n_ins.mul_(decay).add_(n_inserts * one_minus_decay)
-            self.ema_n_del.mul_(decay).add_(n_deletes * one_minus_decay)
-
-        denom = (self.ema_n_ins + self.ema_n_del).clamp(min=self.edit_loss_ema_eps)
-        # NOTE inverse scaling, so w_ins should be high if n_del is high and vice versa
-        w_ins = self.ema_n_del / denom
-        w_del = self.ema_n_ins / denom
-
-        return w_ins, w_del
 
     def compile(self):
         """Compile the model using torch.compile."""
@@ -294,8 +261,19 @@ class LightningModuleRates(pl.LightningModule):
             ):
                 p_ema.mul_(self.ema_decay).add_(p.data, alpha=1.0 - self.ema_decay)
 
+    _LEGACY_BUFFER_KEYS = frozenset({
+        "l_do_sub_a", "l_sub_a_class", "l_do_sub_e", "l_sub_e_class",
+        "l_do_del", "l_do_ins", "l_ins_rate", "l_ins_gmm", "l_ins_e",
+        "l_x", "l_c", "l_global_ins_budget", "l_global_del_budget",
+        "ema_n_ins", "ema_n_del",
+    })
+
     def load_state_dict(self, state_dict, strict=True):
-        """Load state dict with backward compatibility for checkpoints without EMA."""
+        """Load state dict with backward compatibility for old checkpoints."""
+        state_dict = {
+            k: v for k, v in state_dict.items()
+            if k not in self._LEGACY_BUFFER_KEYS
+        }
         has_ema = any(k.startswith("model_ema.") for k in state_dict)
         load_strict = strict and has_ema
         super().load_state_dict(state_dict, strict=load_strict)
@@ -587,38 +565,6 @@ class LightningModuleRates(pl.LightningModule):
             e_batch_triu,
             mols_t.num_graphs,
         )
-        # Compute weighted components for logging using wrapper weights
-        weights = self.loss_weight_wrapper.get_weight_tensors(self.device)
-
-        sub_a_loss_weighted = (
-            weights["do_sub_a"] * do_sub_a_loss
-            + weights["sub_a_class"] * sub_a_class_loss
-        )
-        sub_e_loss_weighted = (
-            weights["do_sub_e"] * do_sub_e_loss
-            + weights["sub_e_class"] * sub_e_class_loss
-        )
-        sub_loss_weighted = sub_a_loss_weighted + sub_e_loss_weighted
-
-        # Log substitution losses with subgroups
-        self.log_dict(
-            {
-                "loss/sub/a/action": do_sub_a_loss,
-                "loss/sub/a/class": sub_a_class_loss,
-                "loss/sub/a/weighted": sub_a_loss_weighted,
-                "loss/sub/e/action": do_sub_e_loss,
-                "loss/sub/e/class": sub_e_class_loss,
-                "loss/sub/e/weighted": sub_e_loss_weighted,
-                "loss/sub/weighted": sub_loss_weighted,
-                "loss/sub/c": c_loss,
-                "loss/sub/c_weighted": weights["c"] * c_loss,
-            },
-            prog_bar=False,
-            logger=True,
-        )
-
-        del_loss_weighted = torch.tensor(0.0, device=self.device)
-        ins_loss_weighted = torch.tensor(0.0, device=self.device)
         do_del_loss = torch.tensor(0.0, device=self.device)
         do_ins_loss = torch.tensor(0.0, device=self.device)
         ins_loss_rate = torch.tensor(0.0, device=self.device)
@@ -644,13 +590,6 @@ class LightningModuleRates(pl.LightningModule):
                 mols_t.num_graphs,
                 ema_key="ins",
             )
-            self.log_dict(
-                {
-                    "loss/ins/action": do_ins_loss,
-                },
-                prog_bar=False,
-                logger=True,
-            )
 
             # Count number of insertions per node
             # Initialize with zeros for all nodes
@@ -667,15 +606,6 @@ class LightningModuleRates(pl.LightningModule):
                 # mask indicating which nodes are focal for insertion
                 ins_loss_rate = self.rate_loss(
                     ins_rate_pred, num_inserts_per_node, mols_t.batch, mols_t.num_graphs
-                )
-
-                self.log_dict(
-                    {
-                        "loss/ins/rate": ins_loss_rate,
-                        "loss/ins/rate_weighted": weights["ins_rate"] * ins_loss_rate,
-                    },
-                    prog_bar=False,
-                    logger=True,
                 )
 
                 # mask indicating in which graph we have inserts
@@ -718,15 +648,6 @@ class LightningModuleRates(pl.LightningModule):
 
                 ins_loss_gmm = ins_loss_gmm[batch_has_inserts].mean()
 
-                self.log_dict(
-                    {
-                        "loss/ins/gmm": ins_loss_gmm,
-                        "loss/ins/gmm_weighted": weights["ins_gmm"] * ins_loss_gmm,
-                    },
-                    prog_bar=False,
-                    logger=True,
-                )
-
                 # Compute insertion edge loss if available
                 # Validate indices are within bounds
                 spawn_idx = ins_targets.ins_edge_spawn_idx
@@ -768,15 +689,6 @@ class LightningModuleRates(pl.LightningModule):
 
                     ins_loss_e = ins_loss_e[batch_has_inserts].mean()
 
-                    self.log_dict(
-                        {
-                            "loss/ins/e": ins_loss_e,
-                            "loss/ins/e_weighted": weights["ins_e"] * ins_loss_e,
-                        },
-                        prog_bar=False,
-                        logger=True,
-                    )
-
             else:
                 # NOTE ins_rate_head,edge_head, gmm_head unused, throws an error (unused_params)
                 # NOTE therefore we add a dummy loss wrt. edge_head and gmm_head
@@ -793,15 +705,6 @@ class LightningModuleRates(pl.LightningModule):
                 ins_loss_e = 0.0 * edge_head_loss
                 ins_loss_gmm = 0.0 * gmm_head_loss
                 ins_loss_rate = 0.0 * ins_rate_head_loss
-
-            # Log insertion and deletion losses with subgroups
-            self.log_dict(
-                {
-                    "loss/del/action": do_del_loss,
-                },
-                prog_bar=False,
-                logger=True,
-            )
 
         # 4. Calculate the flow matching loss
         # Only compute the loss for nodes that are not to be deleted
@@ -860,125 +763,50 @@ class LightningModuleRates(pl.LightningModule):
                 del_budget_target,
             )
 
-            self.log_dict(
-                {
-                    "stats/ins_budget_pred_mean": ins_graph_expected.mean(),
-                    "stats/del_budget_pred_mean": del_graph_expected.mean(),
-                    "stats/ins_budget_target_mean": ins_budget_target.float().mean(),
-                    "stats/del_budget_target_mean": del_budget_target.float().mean(),
-                },
-                prog_bar=False,
-                logger=True,
-            )
         else:
             # Keep graph connectivity when the global budget terms are disabled.
             global_ins_budget_loss = 0.0 * (do_ins_head.sum() + ins_rate_pred.sum())
             global_del_budget_loss = 0.0 * do_del_head.sum()
 
-        self.log_dict(
-            {
-                "loss/global_budget/ins": global_ins_budget_loss,
-                "loss/global_budget/del": global_del_budget_loss,
-            },
-            prog_bar=False,
-            logger=True,
+        # 5. Combine, weight, and log all losses
+        losses = LossAccumulator(
+            self.loss_weight_wrapper, self.LOSS_GROUPS, self.device
         )
-
-        n_inserts = (mols_t.lambda_ins > 0.0).sum().float()
-        n_deletes = (mols_t.lambda_del > 0.0).sum().float()
-        w_ins, w_del = self._get_ema_edit_weights(n_inserts, n_deletes)
-        w_ins, w_del = 1.0, 1.0
-
-        # 5. Combine all losses using the unified wrapper
-        # Balance insertion/deletion components with EMA-smoothed activity weights.
-        loss_components = {
+        losses.set_losses({
             "do_sub_a": do_sub_a_loss,
             "sub_a_class": sub_a_class_loss,
             "do_sub_e": do_sub_e_loss,
             "sub_e_class": sub_e_class_loss,
-            "do_del": w_del * do_del_loss,
-            "do_ins": w_ins * do_ins_loss,
-            "ins_rate": w_ins * ins_loss_rate,
-            "ins_gmm": w_ins * ins_loss_gmm,
-            "ins_e": w_ins * ins_loss_e,
+            "do_del": do_del_loss,
+            "do_ins": do_ins_loss,
+            "ins_rate": ins_loss_rate,
+            "ins_gmm": ins_loss_gmm,
+            "ins_e": ins_loss_e,
             "x": x_loss,
             "c": c_loss,
-            # Global budget losses
             "global_ins_budget": global_ins_budget_loss,
             "global_del_budget": global_del_budget_loss,
-        }
-        loss = self.loss_weight_wrapper(loss_components)
+        })
 
-        # Log learnable weights for monitoring (if using learnable weights)
-        if self.loss_weight_wrapper.use_learnable:
-            self.log_dict(
-                {
-                    "learnable_weight/sub/a/rate": weights["do_sub_a"],
-                    "learnable_weight/sub/a/class": weights["sub_a_class"],
-                    "learnable_weight/sub/e/rate": weights["do_sub_e"],
-                    "learnable_weight/sub/e/class": weights["sub_e_class"],
-                    "learnable_weight/del/rate": weights["do_del"],
-                    "learnable_weight/ins/action": weights["do_ins"],
-                    "learnable_weight/ins/rate": weights["ins_rate"],
-                    "learnable_weight/ins/gmm": weights["ins_gmm"],
-                    "learnable_weight/ins/e": weights["ins_e"],
-                    "learnable_weight/x": weights["x"],
-                    "learnable_weight/c": weights["c"],
-                    "learnable_weight/global_ins_budget": weights["global_ins_budget"],
-                    "learnable_weight/global_del_budget": weights["global_del_budget"],
-                },
-                prog_bar=False,
-                logger=True,
-            )
+        losses.add_stats({
+            "n_ins": (mols_t.lambda_ins > 0.0).sum().float(),
+            "n_del": (mols_t.lambda_del > 0.0).sum().float(),
+            "ema_do_ins_pos": self.ema_do_ins_pos,
+            "ema_do_ins_neg": self.ema_do_ins_neg,
+            "ema_do_del_pos": self.ema_do_del_pos,
+            "ema_do_del_neg": self.ema_do_del_neg,
+        })
 
-        # For backward compatibility, compute edit_flow_loss and x_loss_weighted for logging
-        del_loss_weighted = w_del * weights["do_del"] * do_del_loss
-        ins_loss_weighted = w_ins * (
-            weights["do_ins"] * do_ins_loss
-            + weights["ins_rate"] * ins_loss_rate
-            + weights["ins_gmm"] * ins_loss_gmm
-            + weights["ins_e"] * ins_loss_e
-        )
-        global_budget_loss_weighted = (
-            weights["global_ins_budget"] * global_ins_budget_loss
-            + weights["global_del_budget"] * global_del_budget_loss
-        )
-        edit_flow_loss = (
-            sub_loss_weighted
-            + del_loss_weighted
-            + ins_loss_weighted
-            + global_budget_loss_weighted
-        )
-        x_loss_weighted = weights["x"] * x_loss
-        c_loss_weighted = weights["c"] * c_loss
+        if self.n_atoms_strategy != "fixed":
+            losses.add_stats({
+                "ins_budget_pred_mean": ins_graph_expected.mean(),
+                "del_budget_pred_mean": del_graph_expected.mean(),
+                "ins_budget_target_mean": ins_budget_target.float().mean(),
+                "del_budget_target_mean": del_budget_target.float().mean(),
+            })
 
-        loss = self.safe_loss(loss)
-
-        # Log final losses and statistics
-
-        self.log_dict(
-            {
-                "loss/sub": sub_loss_weighted,
-                "loss/del": del_loss_weighted,
-                "loss/ins": ins_loss_weighted,
-                "loss/edit_flow": edit_flow_loss,
-                "loss/move/x": x_loss,
-                "loss/move/x_weighted": x_loss_weighted,
-                "loss/global_budget/weighted": global_budget_loss_weighted,
-                "stats/n_ins": n_inserts,
-                "stats/n_del": n_deletes,
-                "stats/loss_weight_ins_ema": w_ins,
-                "stats/loss_weight_del_ema": w_del,
-                "stats/ema_n_ins": self.ema_n_ins,
-                "stats/ema_n_del": self.ema_n_del,
-                "stats/ema_do_ins_pos": self.ema_do_ins_pos,
-                "stats/ema_do_ins_neg": self.ema_do_ins_neg,
-                "stats/ema_do_del_pos": self.ema_do_del_pos,
-                "stats/ema_do_del_neg": self.ema_do_del_neg,
-            },
-            prog_bar=False,
-            logger=True,
-        )
+        loss = self.safe_loss(losses.total_loss())
+        self.log_dict(losses.log_dict(), prog_bar=False, logger=True)
 
         return loss
 
@@ -1021,6 +849,22 @@ class LightningModuleRates(pl.LightningModule):
             logger=True,
             batch_size=len(mols),
         )
+
+        # pb_metrics = calc_posebusters_metrics(rdkit_mols)
+        pb_metrics = False
+        if pb_metrics:
+            pb_metrics_dict = {
+                f"posebusters/{key}": value for key, value in pb_metrics.items()
+            }
+            self.log_dict(
+                pb_metrics_dict,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                batch_size=len(mols),
+            )
+            eval_metrics.update(pb_metrics)
 
         return eval_metrics
 

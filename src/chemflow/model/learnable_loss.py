@@ -1,6 +1,111 @@
+from __future__ import annotations
+
+import math
+
 import torch
 import torch.nn as nn
-import math
+
+
+class LossAccumulator:
+    """Per-step helper that collects raw losses, applies weights, and builds
+    a uniform log dict with raw components, weighted group totals, and stats.
+
+    Usage::
+
+        acc = LossAccumulator(weight_module, groups, device)
+        acc.set_losses({"x": x_loss, "c": c_loss, ...})
+        acc.add_stat("n_ins", n_inserts)
+
+        total = acc.total_loss()       # weighted scalar
+        entries = acc.log_dict()       # ready for pl.log_dict
+
+    Args:
+        weight_module: ``UnifiedWeightedLoss`` instance that owns the weights.
+        groups: Mapping from group name to list of component keys.
+            Each group produces a single ``loss/{group}_weighted`` entry.
+        device: Device for fallback zero tensors.
+    """
+
+    def __init__(
+        self,
+        weight_module: UnifiedWeightedLoss,
+        groups: dict[str, list[str]],
+        device: torch.device,
+    ):
+        self._weight_module = weight_module
+        self._groups = groups
+        self._device = device
+        self._weights = weight_module.get_weight_tensors(device)
+        self._losses: dict[str, torch.Tensor] = {}
+        self._stats: dict[str, torch.Tensor | float] = {}
+
+    # ── Population ───────────────────────────────────────────────────
+
+    def set_losses(self, losses: dict[str, torch.Tensor]):
+        """Set all loss components at once (replaces any previous)."""
+        self._losses = losses
+
+    def add(self, key: str, value: torch.Tensor):
+        """Add or overwrite a single loss component."""
+        self._losses[key] = value
+
+    def add_stat(self, key: str, value):
+        """Add a single statistic for logging."""
+        self._stats[key] = value
+
+    def add_stats(self, stats: dict):
+        """Merge multiple statistics for logging."""
+        self._stats.update(stats)
+
+    # ── Outputs ──────────────────────────────────────────────────────
+
+    def total_loss(self) -> torch.Tensor:
+        """Compute total weighted loss via the weight module."""
+        return self._weight_module(self._losses)
+
+    def log_dict(self) -> dict[str, torch.Tensor | float]:
+        """Build a uniform log dict.
+
+        Sections emitted:
+        * ``loss/{component}``            — raw (unweighted) per-component value
+        * ``loss_weighted/{component}``   — weighted per-component value
+        * ``loss_weighted/{group}``       — sum of weighted components per group
+        * ``loss/total``                   — sum of all raw components
+        * ``loss_weighted/total``         — sum of all weighted components
+        * ``stats/{key}``                 — additional statistics
+        * ``weight/{component}``          — current weight values (learnable only)
+        """
+        entries: dict[str, torch.Tensor | float] = {}
+
+        total_unweighted = 0.0
+        total_weighted = 0.0
+        for key, val in self._losses.items():
+            w_val = self._weights[key] * val
+            entries[f"loss/{key}"] = val
+            entries[f"loss_weighted/{key}"] = w_val
+            total_unweighted = total_unweighted + val
+            total_weighted = total_weighted + w_val
+
+        for group, keys in self._groups.items():
+            terms = [
+                self._weights[k] * self._losses[k]
+                for k in keys
+                if k in self._losses
+            ]
+            if terms:
+                entries[f"loss_weighted/{group}"] = sum(terms)
+
+        entries["loss/total"] = total_unweighted
+        entries["loss_weighted/total"] = total_weighted
+
+        for key, val in self._stats.items():
+            entries[f"stats/{key}"] = val
+
+        if self._weight_module.use_learnable:
+            for k, w in self._weights.items():
+                entries[f"weight/{k}"] = w
+
+        return entries
 
 
 class LearnableWeightedLoss(nn.Module):
