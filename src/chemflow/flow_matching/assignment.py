@@ -130,6 +130,63 @@ def distance_and_class_based_assignment(
     return row_ind, col_ind
 
 
+def partial_optimal_transport_single(
+    sample_mol: MoleculeData,
+    target_mol: MoleculeData,
+    c_move: float = 1.0,
+    c_sub: float = 10.0,
+    c_ins: float = 5.0,
+    optimal_transport: str = "equivariant",
+    pre_align: bool = False,
+) -> tuple[AugmentedMoleculeData, AugmentedMoleculeData]:
+    """Single-pair partial optimal transport alignment.
+
+    Args:
+        sample_mol: Prior sample molecule.
+        target_mol: Target molecule.
+        c_move: Distance cost weight.
+        c_sub: Substitution cost weight.
+        c_ins: Insertion cost weight.
+        optimal_transport: Alignment strategy ("equivariant" or other).
+        pre_align: Whether to pre-align positions with iterated Kabsch.
+
+    Returns:
+        Aligned (sample, target) as AugmentedMoleculeData with auxiliary
+        flags and filtered auxiliary-auxiliary pairs.
+    """
+    sample = AugmentedMoleculeData.from_molecule(sample_mol)
+    target = AugmentedMoleculeData.from_molecule(target_mol)
+
+    N, M = sample.x.shape[0], target.x.shape[0]
+    x0, x1 = sample.x.detach().cpu().numpy(), target.x.detach().cpu().numpy()
+    a0, a1 = sample.a.detach().cpu().numpy(), target.a.detach().cpu().numpy()
+
+    if pre_align:
+        x0, x1 = pre_align_positions(x0, x1, num_iterations=3)
+
+    row_ind, col_ind = distance_and_class_based_assignment(
+        x0, x1, a0, a1, c_move, c_sub, c_ins,
+    )
+
+    sample.pad(num_auxiliary=M).permute_nodes(row_ind)
+    target.pad(num_auxiliary=N).permute_nodes(col_ind)
+
+    sample_is_aux = sample.is_auxiliary.squeeze()
+    target_is_aux = target.is_auxiliary.squeeze()
+    valid_mask = ~(sample_is_aux & target_is_aux)
+
+    if optimal_transport == "equivariant":
+        match_mask = (~sample_is_aux) & (~target_is_aux)
+        if match_mask.sum() > 0:
+            R, t = rigid_alignment(sample.x[match_mask], target.x[match_mask])
+            sample.x = sample.x @ R.T + t
+
+    sample = filter_nodes(sample, valid_mask)
+    target = filter_nodes(target, valid_mask)
+
+    return sample, target
+
+
 def partial_optimal_transport(
     samples_batched: MoleculeBatch,
     targets_batched: MoleculeBatch,
@@ -139,57 +196,21 @@ def partial_optimal_transport(
     optimal_transport: str = "equivariant",
     pre_align: bool = False,
 ) -> list[tuple[AugmentedMoleculeData, AugmentedMoleculeData]]:
-    results = []
+    """Batch wrapper around partial_optimal_transport_single."""
     num_graphs = (
         targets_batched.batch_size
         if hasattr(targets_batched, "batch_size")
         else len(targets_batched)
     )
-
-    for b in range(num_graphs):
-        # 1. Inititalize the augmented molecule data objects
-        sample = AugmentedMoleculeData.from_molecule(samples_batched[b])
-        target = AugmentedMoleculeData.from_molecule(targets_batched[b])
-
-        N, M = sample.x.shape[0], target.x.shape[0]
-        x0, x1 = sample.x.detach().cpu().numpy(), target.x.detach().cpu().numpy()
-        a0, a1 = sample.a.detach().cpu().numpy(), target.a.detach().cpu().numpy()
-
-        # 1.5. Pre-align the positions
-        if pre_align:
-            x0, x1 = pre_align_positions(x0, x1, num_iterations=3)
-
-        # 2. Solve the POT assignment problem
-        row_ind, col_ind = distance_and_class_based_assignment(
-            x0,
-            x1,
-            a0,
-            a1,
-            c_move,
-            c_sub,
-            c_ins,
+    return [
+        partial_optimal_transport_single(
+            samples_batched[b],
+            targets_batched[b],
+            c_move=c_move,
+            c_sub=c_sub,
+            c_ins=c_ins,
+            optimal_transport=optimal_transport,
+            pre_align=pre_align,
         )
-
-        # 3. Augment with auxiliary nodes & permute based on the assignment
-        sample.pad(num_auxiliary=M).permute_nodes(row_ind)
-        target.pad(num_auxiliary=N).permute_nodes(col_ind)
-
-        # 4. Filter out auxiliary-auxiliary pairs
-        sample_is_aux = sample.is_auxiliary.squeeze()
-        target_is_aux = target.is_auxiliary.squeeze()
-
-        valid_mask = ~(sample_is_aux & target_is_aux)
-
-        # 5. Align the matched items
-        if optimal_transport == "equivariant":
-            match_mask = (~sample_is_aux) & (~target_is_aux)
-            if match_mask.sum() > 0:
-                R, t = rigid_alignment(sample.x[match_mask], target.x[match_mask])
-                sample.x = sample.x @ R.T + t
-
-        sample = filter_nodes(sample, valid_mask)
-        target = filter_nodes(target, valid_mask)
-
-        results.append((sample, target))
-
-    return results
+        for b in range(num_graphs)
+    ]

@@ -1,12 +1,15 @@
+import torch
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 from omegaconf import DictConfig
 import hydra
-import torch
-from functools import partial
 
-from chemflow.dataset.molecule_data import MoleculeBatch
-from chemflow.flow_matching.sampling import sample_prior_graph
+from chemflow.dataset.flow_matching_wrapper import (
+    FlowMatchingDatasetWrapper,
+    train_collate_fn,
+    eval_collate_fn,
+    worker_init_fn,
+)
 
 class LightningDataModule(pl.LightningDataModule):
     def __init__(
@@ -60,7 +63,6 @@ class LightningDataModule(pl.LightningDataModule):
 
     def setup(self, stage=None):
         """Construct datasets and assign data scalers."""
-        # Check that tokens and distributions are set
         if self.vocab is None:
             raise ValueError(
                 "vocab and distributions must be set before calling setup(). "
@@ -69,102 +71,88 @@ class LightningDataModule(pl.LightningDataModule):
 
         # Inject tokens and distributions into dataset configs
         train_cfg = self.datasets.train.copy()
-        self.train_dataset = hydra.utils.instantiate(
+        base_train = hydra.utils.instantiate(
             train_cfg, vocab=self.vocab, distributions=self.distributions
+        )
+        self.train_dataset = FlowMatchingDatasetWrapper(
+            base_dataset=base_train,
+            distributions=self.distributions,
+            interpolator=self.interpolator,
+            n_atoms_strategy=self.n_atoms_strategy,
+            time_dist=self.time_dist,
+            stage="train",
         )
 
         self.val_datasets = []
         for dataset_cfg in self.datasets.val:
             val_cfg = dataset_cfg.copy()
+            base_val = hydra.utils.instantiate(
+                val_cfg, vocab=self.vocab, distributions=self.distributions
+            )
             self.val_datasets.append(
-                hydra.utils.instantiate(
-                    val_cfg, vocab=self.vocab, distributions=self.distributions
+                FlowMatchingDatasetWrapper(
+                    base_dataset=base_val,
+                    distributions=self.distributions,
+                    interpolator=self.interpolator,
+                    n_atoms_strategy=self.n_atoms_strategy,
+                    time_dist=self.time_dist,
+                    stage="val",
                 )
             )
 
         self.test_datasets = []
         for dataset_cfg in self.datasets.test:
             test_cfg = dataset_cfg.copy()
+            base_test = hydra.utils.instantiate(
+                test_cfg, vocab=self.vocab, distributions=self.distributions
+            )
             self.test_datasets.append(
-                hydra.utils.instantiate(
-                    test_cfg, vocab=self.vocab, distributions=self.distributions
+                FlowMatchingDatasetWrapper(
+                    base_dataset=base_test,
+                    distributions=self.distributions,
+                    interpolator=self.interpolator,
+                    n_atoms_strategy=self.n_atoms_strategy,
+                    time_dist=self.time_dist,
+                    stage="test",
                 )
             )
 
-    def collate_fn(self, batch, stage="train"):
-        targets = batch
-        if self.n_atoms_strategy == "fixed":
-            n_atoms = [target.num_nodes for target in targets]
-        elif self.n_atoms_strategy == "approx":
-            # sample normal distribution with mean 0 and std 2 and add to target.num_nodes
-            n_atoms = [
-                target.num_nodes + int((torch.randn(1) * 2).round().item())
-                for target in targets
-            ]
-            # floor to minimum of 3
-            n_atoms = [max(3, n_atoms_i) for n_atoms_i in n_atoms]
+    def transfer_batch_to_device(self, batch, device, dataloader_idx):
+        """Move batch to *device* with ``non_blocking=True``.
 
-        elif self.n_atoms_strategy == "median":
-            
-            # Get the index of the median of the n_atoms_distribution
-            n_atoms_dist = self.distributions.n_atoms_distribution
-            n_atoms_cumsum = torch.cumsum(n_atoms_dist, dim=0)
-            median_idx = int((n_atoms_cumsum >= 0.5).nonzero(as_tuple=True)[0][0].item())
-            n_atoms_median = median_idx
-            n_atoms = [n_atoms_median for target in targets]
-
-        else:
-            n_atoms = [None for target in targets]
-
-        samples = [
-            sample_prior_graph(
-                self.distributions,
-                n_atoms=n_atoms_i,
+        Lightning's default path uses ``apply_to_collection`` keyed on
+        ``Tensor``, which does not recurse into PyG ``Data``/``Batch``
+        objects.  We handle the concrete batch formats produced by
+        ``train_collate_fn`` and ``eval_collate_fn`` explicitly so that
+        every tensor attribute inside the PyG objects benefits from the
+        asynchronous DMA transfer enabled by ``pin_memory=True``.
+        """
+        if isinstance(batch, (tuple, list)):
+            return type(batch)(
+                item.to(device, non_blocking=True)
+                if isinstance(item, torch.Tensor) or hasattr(item, "stores")
+                else item
+                for item in batch
             )
-            for n_atoms_i in n_atoms
-        ]
-        samples_batched = MoleculeBatch.from_data_list(samples)
-        targets_batched = MoleculeBatch.from_data_list(targets)
-
-        if stage == "train":
-            # TODO maybe it makes sense to already put this in the __get_item__ method
-            # TODO this could lead to speedups, since get_item is parallelized
-            batch_size = targets_batched.batch_size
-            device = targets_batched.x.device
-
-            # interpolate
-            t = self.time_dist.sample((batch_size,)).to(device)
-            t = torch.clamp(t, min=0.0, max=1 - 1e-6)
-            mols_t, mols_1, ins_targets = self.interpolator.interpolate_different_size(
-                samples_batched,
-                targets_batched,
-                t,
-            )
-
-            # Propagate molecular properties from targets for property conditioning
-            if hasattr(targets_batched, "y") and targets_batched.y is not None:
-                mols_t.y = targets_batched.y
-
-            return mols_t, mols_1, ins_targets, t
-
-        else:
-            return samples_batched, targets_batched
+        if isinstance(batch, torch.Tensor) or hasattr(batch, "stores"):
+            return batch.to(device, non_blocking=True)
+        return batch
 
     def train_dataloader(self):
-        # Return a DataLoader for training
         return DataLoader(
             self.train_dataset,
             shuffle=True,
             batch_size=self.batch_size.train,
             num_workers=self.num_workers.train,
             persistent_workers=True,
-            pin_memory=False,
+            pin_memory=True,
             drop_last=True,
-            collate_fn=partial(self.collate_fn, stage="train"),
+            collate_fn=train_collate_fn,
+            worker_init_fn=worker_init_fn,
+            prefetch_factor=4,
         )
 
     def val_dataloader(self):
-        # Return a DataLoader for validation
         return [
             DataLoader(
                 dataset,
@@ -172,15 +160,15 @@ class LightningDataModule(pl.LightningDataModule):
                 batch_size=self.batch_size.val,
                 num_workers=self.num_workers.val,
                 persistent_workers=True,
-                pin_memory=False,
+                pin_memory=True,
                 drop_last=True,
-                collate_fn=partial(self.collate_fn, stage="val"),
+                collate_fn=eval_collate_fn,
+                worker_init_fn=worker_init_fn,
             )
             for dataset in self.val_datasets
         ]
 
     def test_dataloader(self):
-        # Return a DataLoader for testing
         return [
             DataLoader(
                 dataset,
@@ -188,8 +176,9 @@ class LightningDataModule(pl.LightningDataModule):
                 batch_size=self.batch_size.test,
                 num_workers=self.num_workers.test,
                 persistent_workers=True,
-                pin_memory=False,
-                collate_fn=partial(self.collate_fn, stage="test"),
+                pin_memory=True,
+                collate_fn=eval_collate_fn,
+                worker_init_fn=worker_init_fn,
             )
             for dataset in self.test_datasets
         ]

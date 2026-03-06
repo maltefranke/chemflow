@@ -118,7 +118,7 @@ def run(cfg: DictConfig):
 
         # Interpolate all 100 samples at their respective times
         # This mirrors the integration process where each sample is integrated at different time steps
-        mol_t, mol_1, ins_targets = interpolator.interpolate_different_size(
+        mol_t, mol_1, ins_targets = interpolator.interpolate_batch(
             samples_batched_dup,
             targets_batched_dup,
             t,
