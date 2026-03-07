@@ -7,6 +7,19 @@ import hydra
 from chemflow.dataset.molecule_data import MoleculeBatch
 
 
+class FeatureProjector(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        self.linear = nn.Linear(in_dim, out_dim)
+        self.activation = nn.SiLU()
+        self.norm = nn.LayerNorm(out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.linear(x)
+        x = self.activation(x)
+        return self.norm(x)
+
+
 class EmbeddingBackbone(nn.Module):
     """
     Embedding Module.
@@ -23,6 +36,11 @@ class EmbeddingBackbone(nn.Module):
         property_embedding_args: Optional[DictConfig] = None,
         bond_degree_embedding_args: Optional[DictConfig] = None,
         natoms_cfg_embedding_args: Optional[DictConfig] = None,
+        *,
+        h0_input_dim: int,
+        h0_projection_dim: int,
+        e_input_dim: int,
+        e_projection_dim: int,
     ):
         super().__init__()
         self.atom_type_embedding = hydra.utils.instantiate(atom_type_embedding_args)
@@ -45,6 +63,9 @@ class EmbeddingBackbone(nn.Module):
             self.natoms_cfg_embedding = hydra.utils.instantiate(
                 natoms_cfg_embedding_args
             )
+
+        self.h0_projection = FeatureProjector(h0_input_dim, h0_projection_dim)
+        self.e_projection = FeatureProjector(e_input_dim, e_projection_dim)
 
     def forward(
         self,
@@ -89,9 +110,11 @@ class EmbeddingBackbone(nn.Module):
             embeddings_to_concat.append(struct_embed)
 
         h_0 = torch.cat(embeddings_to_concat, dim=-1)
+        h_0 = self.h0_projection(h_0)
 
         # Process edge embeddings
         e_embed = self.edge_type_embedding(e)
+        e_embed = self.e_projection(e_embed)
 
         # Ensure edge_index is formatted correctly (tuple for some backbones, tensor for others)
         edge_index_tuple = (edge_index[0], edge_index[1])
@@ -106,35 +129,18 @@ class BackboneWithHeads(nn.Module):
 
     def __init__(
         self,
-        # Embedding args
-        atom_type_embedding_args: DictConfig,
-        edge_type_embedding_args: DictConfig,
-        time_embedding_args: DictConfig,
-        node_count_embedding_args: DictConfig,
+        embedding_backbone_args: DictConfig,
         # Backbone model args
         backbone_model_args: DictConfig,
         # Heads args
         heads_args: DictConfig,
         ins_gmm_head_args: DictConfig,
         ins_edge_head_args: DictConfig,
-        # Optional property embedding for classifier-free guidance
-        property_embedding_args: Optional[DictConfig] = None,
-        bond_degree_embedding_args: Optional[DictConfig] = None,
-        # Optional n_atoms CFG embedding
-        natoms_cfg_embedding_args: Optional[DictConfig] = None,
     ):
         super().__init__()
 
-        # 1. Instantiate the Embedding Layer manually using the provided args
-        self.embedding_backbone = EmbeddingBackbone(
-            atom_type_embedding_args=atom_type_embedding_args,
-            edge_type_embedding_args=edge_type_embedding_args,
-            time_embedding_args=time_embedding_args,
-            node_count_embedding_args=node_count_embedding_args,
-            property_embedding_args=property_embedding_args,
-            bond_degree_embedding_args=bond_degree_embedding_args,
-            natoms_cfg_embedding_args=natoms_cfg_embedding_args,
-        )
+        # 1. Instantiate EmbeddingBackbone from a bundled config block
+        self.embedding_backbone = hydra.utils.instantiate(embedding_backbone_args)
 
         # 2. Instantiate the main Backbone (e.g., EGNN)
         self.backbone = hydra.utils.instantiate(backbone_model_args)

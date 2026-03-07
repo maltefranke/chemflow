@@ -111,20 +111,13 @@ module:
     _target_: chemflow.model.model.BackboneWithHeads
     _recursive_: false
 
-    atom_type_embedding_args: ${model.atom_type_embedding}
-    edge_type_embedding_args: ${model.edge_type_embedding}
-    time_embedding_args: ${model.time_embedding}
-    node_count_embedding_args: ${model.node_count_embedding}
+    embedding_backbone_args: ${model.embedding_backbone}
 
     backbone_model_args: ${model.backbone}
 
     heads_args: ${model.heads}
     ins_gmm_head_args: ${model.gmm_head_args}
 
-    # Optional: property embedding for classifier-free guidance
-    # Set to null to disable property conditioning
-    property_embedding_args: ${model.property_embedding}
-    natoms_cfg_embedding_args: ${model.natoms_cfg_embedding}
     ins_edge_head_args:
       _target_: chemflow.model.heads.InsertionEdgeHead
       _recursive_: false
@@ -194,13 +187,27 @@ natoms_cfg:
 natoms_cfg_embedding: ${if:${model.do_natoms_cfg}, ${model.natoms_cfg.embedding}, null}
 natoms_cfg_embed_dim: ${if:${model.do_natoms_cfg}, ${model.natoms_cfg.embed_dim}, 0}
 
+embedding_backbone:
+  _target_: chemflow.model.model.EmbeddingBackbone
+  _recursive_: false
+  atom_type_embedding_args: ${model.atom_type_embedding}
+  edge_type_embedding_args: ${model.edge_type_embedding}
+  time_embedding_args: ${model.time_embedding}
+  node_count_embedding_args: ${model.node_count_embedding}
+  property_embedding_args: ${model.property_embedding}
+  natoms_cfg_embedding_args: ${model.natoms_cfg_embedding}
+  h0_input_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.property_embed_dim} + ${model.natoms_cfg_embed_dim}"}
+  h0_projection_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.property_embed_dim} + ${model.natoms_cfg_embed_dim}"}
+  e_input_dim: ${model.edge_type_embedding.out_dim}
+  e_projection_dim: ${model.edge_type_embedding.out_dim}
+
 backbone:
   _target_: chemflow.model.backbones.egnn.EGNNWithEdgeType
   _recursive_: false
-  in_node_nf: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.property_embed_dim} + ${model.natoms_cfg_embed_dim}"}
+  in_node_nf: ${model.embedding_backbone.h0_projection_dim}
   hidden_nf: 256
   out_node_nf: 256
-  in_edge_nf: ${model.edge_type_embedding.out_dim} # set to zero when not predicting edge types
+  in_edge_nf: ${model.embedding_backbone.e_projection_dim} # set to zero when not predicting edge types
   n_layers: 6
   residual: True
   attention: True

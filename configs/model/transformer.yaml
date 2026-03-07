@@ -118,18 +118,12 @@ module:
     _target_: chemflow.model.model.BackboneWithHeads
     _recursive_: false
 
-    atom_type_embedding_args: ${model.atom_type_embedding}
-    edge_type_embedding_args: ${model.edge_type_embedding}
-    time_embedding_args: ${model.time_embedding}
-    node_count_embedding_args: ${model.node_count_embedding}
+    embedding_backbone_args: ${model.embedding_backbone}
 
     backbone_model_args: ${model.backbone}
 
     heads_args: ${model.heads}
     ins_gmm_head_args: ${model.gmm_head_args}
-    property_embedding_args: ${model.property_embedding}
-    bond_degree_embedding_args: ${model.bond_degree_embedding}
-    natoms_cfg_embedding_args: ${model.natoms_cfg_embedding}
     ins_edge_head_args:
       _target_: chemflow.model.heads.InsertionEdgeHead
       _recursive_: false
@@ -204,12 +198,27 @@ bond_degree_embedding:
   out_dim: 128
 bond_degree_embed_dim: 128
 
+embedding_backbone:
+  _target_: chemflow.model.model.EmbeddingBackbone
+  _recursive_: false
+  atom_type_embedding_args: ${model.atom_type_embedding}
+  edge_type_embedding_args: ${model.edge_type_embedding}
+  time_embedding_args: ${model.time_embedding}
+  node_count_embedding_args: ${model.node_count_embedding}
+  property_embedding_args: ${model.property_embedding}
+  bond_degree_embedding_args: ${model.bond_degree_embedding}
+  natoms_cfg_embedding_args: ${model.natoms_cfg_embedding}
+  h0_input_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.property_embed_dim} + ${model.natoms_cfg_embed_dim} + ${model.bond_degree_embed_dim}"}
+  h0_projection_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.property_embed_dim} + ${model.natoms_cfg_embed_dim} + ${model.bond_degree_embed_dim}"}
+  e_input_dim: ${model.edge_type_embedding.out_dim}
+  e_projection_dim: ${model.edge_type_embedding.out_dim}
+
 backbone:
   _target_: chemflow.model.backbones.transformer.Transformer
   _recursive_: false
-  in_node_nf: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.property_embed_dim} + ${model.natoms_cfg_embed_dim} + ${model.bond_degree_embed_dim}"}
+  in_node_nf: ${model.embedding_backbone.h0_projection_dim}
   out_node_nf: 256
-  in_edge_nf: ${model.edge_type_embedding.out_dim}
+  in_edge_nf: ${model.embedding_backbone.e_projection_dim}
   rbf_embedding_args:
     _target_: chemflow.model.embedding.RBFEmbedding
     num_rbf: 128

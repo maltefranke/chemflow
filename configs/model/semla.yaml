@@ -116,24 +116,17 @@ module:
     _target_: chemflow.model.model.BackboneWithHeads
     _recursive_: false
 
-    atom_type_embedding_args: ${model.atom_type_embedding}
-    edge_type_embedding_args: ${model.edge_type_embedding}
-    time_embedding_args: ${model.time_embedding}
-    node_count_embedding_args: ${model.node_count_embedding}
+    embedding_backbone_args: ${model.embedding_backbone}
 
     backbone_model_args: ${model.backbone}
 
     heads_args: ${model.heads}
     ins_gmm_head_args: ${model.gmm_head_args}
 
-    # Optional: property embedding for classifier-free guidance
-    # Set to null to disable property conditioning
-    property_embedding_args: ${model.property_embedding}
-    natoms_cfg_embedding_args: ${model.natoms_cfg_embedding}
     ins_edge_head_args:
       _target_: chemflow.model.heads.InsertionEdgeHead
       _recursive_: false
-      hidden_dim: ${model.backbone.in_node_nf}
+      hidden_dim: ${model.backbone.d_model}
       n_edge_types: ${len:${data.vocab.edge_tokens}}
       n_atom_types: ${len:${data.vocab.atom_tokens}}
       n_charge_types: ${len:${data.vocab.charge_tokens}}
@@ -188,7 +181,7 @@ property_embed_dim: ${if:${model.do_cfg}, ${model.cfg.property_embed_dim}, 0}
 do_natoms_cfg: false
 
 natoms_cfg:
-  dropout_prob: 0.35
+  dropout_prob: 0.15
   guidance_scale: 0.0
   embed_dim: 128
   embedding:
@@ -199,19 +192,34 @@ natoms_cfg:
 natoms_cfg_embedding: ${if:${model.do_natoms_cfg}, ${model.natoms_cfg.embedding}, null}
 natoms_cfg_embed_dim: ${if:${model.do_natoms_cfg}, ${model.natoms_cfg.embed_dim}, 0}
 
+embedding_backbone:
+  _target_: chemflow.model.model.EmbeddingBackbone
+  _recursive_: false
+  atom_type_embedding_args: ${model.atom_type_embedding}
+  edge_type_embedding_args: ${model.edge_type_embedding}
+  time_embedding_args: ${model.time_embedding}
+  node_count_embedding_args: ${model.node_count_embedding}
+  property_embedding_args: ${model.property_embedding}
+  natoms_cfg_embedding_args: ${model.natoms_cfg_embedding}
+  h0_input_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.property_embed_dim} + ${model.natoms_cfg_embed_dim}"}
+  h0_projection_dim: ${model.backbone.d_model}
+  e_input_dim: ${model.edge_type_embedding.out_dim}
+  e_projection_dim: ${model.backbone.d_edge}
+
 backbone:
   _target_: chemflow.model.backbones.semla_bb.SemlaBB
   _recursive_: false
-  # Concatenated embeddings: atom + time + count + property_cfg + natoms_cfg
-  in_node_nf: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.property_embed_dim} + ${model.natoms_cfg_embed_dim}"}
-  hidden_nf: 256
-  in_edge_nf: ${model.edge_type_embedding.out_dim}
-  n_layers: 6
+  d_model: 384
+  d_message: 128
+  d_message_hidden: 128
+  d_edge: 128
+  n_layers: 8
+  n_attn_heads: 32
   bond_refine: True
   self_cond: False
   coord_norm: "length"
+  n_coord_sets: 64
   eps: 1e-6
-  n_attn_heads: 8
 
 
 heads:
@@ -223,50 +231,50 @@ heads:
 
     node_heads:
       atom_type_head:
-        input_dim: ${model.backbone.in_node_nf}
+        input_dim: ${model.backbone.d_model}
         output_dim: ${len:${data.vocab.atom_tokens}}
         hidden_dim: 128
 
       charge_head:
-        input_dim: ${model.backbone.in_node_nf}
+        input_dim: ${model.backbone.d_model}
         output_dim: ${len:${data.vocab.charge_tokens}}
         hidden_dim: 128
 
       ins_rate_head:
-        input_dim: ${model.backbone.in_node_nf}
+        input_dim: ${model.backbone.d_model}
         output_dim: 1
         hidden_dim: 128
 
       do_ins_head:
-        input_dim: ${model.backbone.in_node_nf}
+        input_dim: ${model.backbone.d_model}
         output_dim: 1
         hidden_dim: 128
 
       do_del_head:
-        input_dim: ${model.backbone.in_node_nf}
+        input_dim: ${model.backbone.d_model}
         output_dim: 1
         hidden_dim: 128
 
       do_sub_a_head:
-        input_dim: ${model.backbone.in_node_nf}
+        input_dim: ${model.backbone.d_model}
         output_dim: 1
         hidden_dim: 128
 
     edge_heads:
       edge_type_head:
-        input_dim: ${model.backbone.in_edge_nf}
+        input_dim: ${model.backbone.d_edge}
         output_dim: ${len:${data.vocab.edge_tokens}}
         hidden_dim: 128
 
       do_sub_e_head:
-        input_dim: ${model.backbone.in_edge_nf}
+        input_dim: ${model.backbone.d_edge}
         output_dim: 1
         hidden_dim: 128
 
 gmm_head_args:
   _target_: chemflow.model.heads.EquivariantGMMHead
   _recursive_: false
-  hidden_dim: ${model.backbone.in_node_nf}
+  hidden_dim: ${model.backbone.d_model}
   K: ${model.gmm_params.K}
   N_a: ${len:${data.vocab.atom_tokens}}
   N_c: ${len:${data.vocab.charge_tokens}}

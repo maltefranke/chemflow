@@ -50,29 +50,28 @@ def dense_to_sparse_edges(edge_feats, atom_mask):
 class SemlaBB(torch.nn.Module):
     def __init__(
         self,
-        in_node_nf,
+        d_model,
         n_layers,
         n_attn_heads,
-        hidden_nf,
-        in_edge_nf,
+        d_message,
+        d_message_hidden,
+        d_edge,
         bond_refine,
         self_cond,
         coord_norm,
+        n_coord_sets,
         eps,
     ):
-        # we only have one coord set
-        n_coord_sets = 1
-        self_cond = False
-
         super().__init__()
+
         self.dynamics = EquiInvDynamics(
-            d_model=in_node_nf,
+            d_model=d_model,
             n_coord_sets=n_coord_sets,
-            d_message=hidden_nf,
+            d_message=d_message,
             n_layers=n_layers,
             n_attn_heads=n_attn_heads,
-            d_message_hidden=hidden_nf,
-            d_edge=in_edge_nf,
+            d_message_hidden=d_message_hidden,
+            d_edge=d_edge,
             bond_refine=bond_refine,
             self_cond=self_cond,
             coord_norm=coord_norm,
