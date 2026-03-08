@@ -261,25 +261,29 @@ class LightningModuleRates(pl.LightningModule):
             ):
                 p_ema.mul_(self.ema_decay).add_(p.data, alpha=1.0 - self.ema_decay)
 
+    # fmt: off
     _LEGACY_BUFFER_KEYS = frozenset({
+        # substitution losses
         "l_do_sub_a", "l_sub_a_class", "l_do_sub_e", "l_sub_e_class",
+        # deletion and insertion losses
         "l_do_del", "l_do_ins", "l_ins_rate", "l_ins_gmm", "l_ins_e",
+        # move, charge and budget losses
         "l_x", "l_c", "l_global_ins_budget", "l_global_del_budget",
+        # EMA counts for balancing BCE pos_weight in do_action_loss.
         "ema_n_ins", "ema_n_del",
     })
+    # fmt: on
 
     def load_state_dict(self, state_dict, strict=True):
         """Load state dict with backward compatibility for old checkpoints."""
         state_dict = {
-            k: v for k, v in state_dict.items()
-            if k not in self._LEGACY_BUFFER_KEYS
+            k: v for k, v in state_dict.items() if k not in self._LEGACY_BUFFER_KEYS
         }
         has_ema = any(k.startswith("model_ema.") for k in state_dict)
         load_strict = strict and has_ema
         super().load_state_dict(state_dict, strict=load_strict)
         if not has_ema and self.model_ema is not None:
             self.model_ema.load_state_dict(self.model.state_dict(), strict=True)
-
 
     def forward(self, x):
         pass
@@ -565,6 +569,7 @@ class LightningModuleRates(pl.LightningModule):
             e_batch_triu,
             mols_t.num_graphs,
         )
+
         do_del_loss = torch.tensor(0.0, device=self.device)
         do_ins_loss = torch.tensor(0.0, device=self.device)
         ins_loss_rate = torch.tensor(0.0, device=self.device)
@@ -772,38 +777,44 @@ class LightningModuleRates(pl.LightningModule):
         losses = LossAccumulator(
             self.loss_weight_wrapper, self.LOSS_GROUPS, self.device
         )
-        losses.set_losses({
-            "do_sub_a": do_sub_a_loss,
-            "sub_a_class": sub_a_class_loss,
-            "do_sub_e": do_sub_e_loss,
-            "sub_e_class": sub_e_class_loss,
-            "do_del": do_del_loss,
-            "do_ins": do_ins_loss,
-            "ins_rate": ins_loss_rate,
-            "ins_gmm": ins_loss_gmm,
-            "ins_e": ins_loss_e,
-            "x": x_loss,
-            "c": c_loss,
-            "global_ins_budget": global_ins_budget_loss,
-            "global_del_budget": global_del_budget_loss,
-        })
+        losses.set_losses(
+            {
+                "do_sub_a": do_sub_a_loss,
+                "sub_a_class": sub_a_class_loss,
+                "do_sub_e": do_sub_e_loss,
+                "sub_e_class": sub_e_class_loss,
+                "do_del": do_del_loss,
+                "do_ins": do_ins_loss,
+                "ins_rate": ins_loss_rate,
+                "ins_gmm": ins_loss_gmm,
+                "ins_e": ins_loss_e,
+                "x": x_loss,
+                "c": c_loss,
+                "global_ins_budget": global_ins_budget_loss,
+                "global_del_budget": global_del_budget_loss,
+            }
+        )
 
-        losses.add_stats({
-            "n_ins": (mols_t.lambda_ins > 0.0).sum().float(),
-            "n_del": (mols_t.lambda_del > 0.0).sum().float(),
-            "ema_do_ins_pos": self.ema_do_ins_pos,
-            "ema_do_ins_neg": self.ema_do_ins_neg,
-            "ema_do_del_pos": self.ema_do_del_pos,
-            "ema_do_del_neg": self.ema_do_del_neg,
-        })
+        losses.add_stats(
+            {
+                "n_ins": (mols_t.lambda_ins > 0.0).sum().float(),
+                "n_del": (mols_t.lambda_del > 0.0).sum().float(),
+                "ema_do_ins_pos": self.ema_do_ins_pos,
+                "ema_do_ins_neg": self.ema_do_ins_neg,
+                "ema_do_del_pos": self.ema_do_del_pos,
+                "ema_do_del_neg": self.ema_do_del_neg,
+            }
+        )
 
         if self.n_atoms_strategy != "fixed":
-            losses.add_stats({
-                "ins_budget_pred_mean": ins_graph_expected.mean(),
-                "del_budget_pred_mean": del_graph_expected.mean(),
-                "ins_budget_target_mean": ins_budget_target.float().mean(),
-                "del_budget_target_mean": del_budget_target.float().mean(),
-            })
+            losses.add_stats(
+                {
+                    "ins_budget_pred_mean": ins_graph_expected.mean(),
+                    "del_budget_pred_mean": del_graph_expected.mean(),
+                    "ins_budget_target_mean": ins_budget_target.float().mean(),
+                    "del_budget_target_mean": del_budget_target.float().mean(),
+                }
+            )
 
         loss = self.safe_loss(losses.total_loss())
         self.log_dict(losses.log_dict(), prog_bar=False, logger=True)
@@ -949,7 +960,12 @@ class LightningModuleRates(pl.LightningModule):
             prev_preds = preds
 
             preds = self.cfg_adapter.guided_predict(
-                model, mol_t, t, prev_preds, properties, target_n_atoms,
+                model,
+                mol_t,
+                t,
+                prev_preds,
+                properties,
+                target_n_atoms,
             )
 
             # Extract predictions

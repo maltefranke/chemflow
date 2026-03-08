@@ -37,6 +37,7 @@ class Interpolator:
         c_move=1.0,
         c_sub=0.0,
         c_ins=1e8,
+        c_del=0.0,
     ):
         self.vocab = vocab
         self.distributions = distributions
@@ -69,12 +70,7 @@ class Interpolator:
         self.c_move = c_move
         self.c_sub = c_sub
         self.c_ins = c_ins
-
-        # TODO I'm lazy and this will always be 3
-        self.D = 3
-        self.M = len(self.distributions.atom_type_distribution)
-        self.E = len(self.distributions.edge_type_distribution)
-        self.C = len(self.distributions.charge_type_distribution)
+        self.c_del = c_del
 
         self.edge_aligner = EdgeAligner()
 
@@ -198,21 +194,17 @@ class Interpolator:
                 hasattr(ins_targets, "spawn_node_idx")
                 and ins_targets.spawn_node_idx.numel() > 0
             ):
-                ins_targets.spawn_node_idx = ins_targets.spawn_node_idx + offset
+                ins_targets.spawn_node_idx.add_(offset)
             if (
                 hasattr(ins_targets, "ins_edge_spawn_idx")
                 and ins_targets.ins_edge_spawn_idx.numel() > 0
             ):
-                ins_targets.ins_edge_spawn_idx = (
-                    ins_targets.ins_edge_spawn_idx + offset
-                )
+                ins_targets.ins_edge_spawn_idx.add_(offset)
             if (
                 hasattr(ins_targets, "ins_edge_target_idx")
                 and ins_targets.ins_edge_target_idx.numel() > 0
             ):
-                ins_targets.ins_edge_target_idx = (
-                    ins_targets.ins_edge_target_idx + offset
-                )
+                ins_targets.ins_edge_target_idx.add_(offset)
 
             mol_t_list.append(mol_t)
             mol_1_list.append(mol_1)
@@ -258,13 +250,14 @@ class Interpolator:
             c_move=self.c_move,
             c_sub=self.c_sub,
             c_ins=self.c_ins,
+            c_del=self.c_del,
             optimal_transport=self.optimal_transport,
         )
 
         # ===== 2. Per-pair interpolation =====
         N = sample.x.shape[0]
 
-        is_sub = (~sample.is_auxiliary) & (~target.is_auxiliary) # Real -> Real
+        is_sub = (~sample.is_auxiliary) & (~target.is_auxiliary)  # Real -> Real
         is_del = (~sample.is_auxiliary) & (target.is_auxiliary)  # Real -> Dummy
         is_ins = (sample.is_auxiliary) & (~target.is_auxiliary)  # Dummy -> Real
 
@@ -286,7 +279,6 @@ class Interpolator:
         t_ins = self.ins_schedule.kappa_t(t_i)
         inst_rate_ins = self.ins_schedule.rate(t_i)
 
-        
         # Masks to determine present nodes in the interpolated state.
         mask_keep_sub = is_sub
         mask_keep_del = is_del & (t_del < tau_del).squeeze()
@@ -300,12 +292,13 @@ class Interpolator:
             target.a[mask_keep_del] = sample.a[mask_keep_del]
             target.c[mask_keep_del] = sample.c[mask_keep_del]
 
-        # B. Births: jump to target with noise
+        # B. Insertions: jump to target with noise
         if mask_keep_ins.any():
             n_ins = mask_keep_ins.sum()
             sample.x[mask_keep_ins] = (
                 target.x[mask_keep_ins]
-                + torch.randn(n_ins, self.D, device=device) * self.ins_noise_scale
+                + torch.randn(n_ins, sample.x.shape[-1], device=device)
+                * self.ins_noise_scale
             )
             a_ins = self._cat_atom.sample((n_ins,))
             c_ins = self._cat_charge.sample((n_ins,))

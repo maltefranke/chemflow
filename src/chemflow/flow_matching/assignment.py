@@ -59,6 +59,7 @@ def distance_and_class_based_assignment(
     c_move=1.0,
     c_sub=10.0,
     c_ins=5.0,
+    c_del=10.0,
 ):
     """
     Assign targets from x1 to x0 using the Hungarian algorithm,
@@ -111,7 +112,7 @@ def distance_and_class_based_assignment(
     # A real point x0[i] matches a dummy target.
     # We use a very high value for off-diagonals so each point has its own dummy.
     del_block = np.full((N, N), fill_value=1e8)
-    np.fill_diagonal(del_block, c_sub)
+    np.fill_diagonal(del_block, c_del)
     aug_cost[:N, M:] = del_block
 
     # [Bottom-Left] Insertion Cost (M x M)
@@ -136,6 +137,7 @@ def partial_optimal_transport_single(
     c_move: float = 1.0,
     c_sub: float = 10.0,
     c_ins: float = 5.0,
+    c_del: float = 10.0,
     optimal_transport: str = "equivariant",
     pre_align: bool = False,
 ) -> tuple[AugmentedMoleculeData, AugmentedMoleculeData]:
@@ -165,7 +167,14 @@ def partial_optimal_transport_single(
         x0, x1 = pre_align_positions(x0, x1, num_iterations=3)
 
     row_ind, col_ind = distance_and_class_based_assignment(
-        x0, x1, a0, a1, c_move, c_sub, c_ins,
+        x0,
+        x1,
+        a0,
+        a1,
+        c_move,
+        c_sub,
+        c_ins,
+        c_del,
     )
 
     sample.pad(num_auxiliary=M).permute_nodes(row_ind)
@@ -193,6 +202,7 @@ def partial_optimal_transport(
     c_move: float = 1.0,
     c_sub: float = 10.0,
     c_ins: float = 5.0,
+    c_del: float = 10.0,
     optimal_transport: str = "equivariant",
     pre_align: bool = False,
 ) -> list[tuple[AugmentedMoleculeData, AugmentedMoleculeData]]:
@@ -209,6 +219,7 @@ def partial_optimal_transport(
             c_move=c_move,
             c_sub=c_sub,
             c_ins=c_ins,
+            c_del=c_del,
             optimal_transport=optimal_transport,
             pre_align=pre_align,
         )
