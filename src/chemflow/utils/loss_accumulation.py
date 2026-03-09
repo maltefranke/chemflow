@@ -1,35 +1,19 @@
-from __future__ import annotations
-
-import math
-
 import torch
-import torch.nn as nn
-
-from chemflow.model.learnable_loss import UnifiedWeightedLoss
 
 class LossAccumulator:
-    """Per-step helper that collects raw losses, applies weights, and builds
-    a uniform log dict with raw components, weighted group totals, and stats.
-
-    Usage::
-
-        acc = LossAccumulator(weight_module, groups, device)
-        acc.set_losses({"x": x_loss, "c": c_loss, ...})
-        acc.add_stat("n_ins", n_inserts)
-
-        total = acc.total_loss()       # weighted scalar
-        entries = acc.log_dict()       # ready for pl.log_dict
+    """Per-step helper that collects raw losses, applies time and component weights, 
+    and builds a uniform log dict separating pure losses from fully weighted losses.
 
     Args:
-        weight_module: ``UnifiedWeightedLoss`` instance that owns the weights.
+        weight_module: ``UnifiedWeightedLoss`` instance that owns the component weights.
         groups: Mapping from group name to list of component keys.
-            Each group produces a single ``loss/{group}_weighted`` entry.
         device: Device for fallback zero tensors.
+        time_weight_modules: Mapping from GROUP NAME to a time-weighting callable.
     """
 
     def __init__(
         self,
-        weight_module: UnifiedWeightedLoss,
+        weight_module,
         groups: dict[str, list[str]],
         device: torch.device,
         time_weight_modules: dict[str, callable] | None = None,
@@ -38,113 +22,142 @@ class LossAccumulator:
         self._groups = groups
         self._device = device
         self._weights = weight_module.get_weight_tensors(device)
-        self._losses: dict[str, torch.Tensor] = {}
-        self._stats: dict[str, torch.Tensor | float] = {}
-
-        # Store the time weighting modules (defaulting to empty dict)
         self._time_weight_modules = time_weight_modules or {}
+        
+        # Reverse mapping: component_key -> group_name for fast lookups
+        self._key_to_group = {
+            key: group for group, keys in groups.items() for key in keys
+        }
+
+        # Track pure and time-weighted losses separately
+        self._raw_losses: dict[str, torch.Tensor] = {}
+        self._tw_losses: dict[str, torch.Tensor] = {}
+        
+        self._stats: dict[str, torch.Tensor | float] = {}
+        self._current_time_weights: dict[str, float] = {}
 
     # ── Population ───────────────────────────────────────────────────
 
     def set_batch_losses(
         self, 
         batch_losses: dict[str, torch.Tensor], 
-        t: torch.Tensor | None = None
+        t: torch.Tensor | None = None,
+        masks: dict[str, torch.Tensor] | None = None
     ):
-        """Applies specific time-weighting to unreduced batch losses and averages them.
+        """Processes unreduced batch losses, applies time-weights, applies masks, and reduces.
         
         Args:
-            batch_losses: Dict of unreduced loss tensors (e.g., shape [Batch, ...])
-            t: Optional 1D tensor of shape [Batch] containing the time steps.
+            batch_losses: Dict of loss tensors, shape [num_graphs, ...]
+            t: Time steps, shape [num_graphs]
+            masks: Optional dict mapping loss keys to boolean tensors of shape [num_graphs].
+                   True means the graph should be included in the mean.
         """
-        self._losses.clear()
+        self._raw_losses.clear()
+        self._tw_losses.clear()
+        self._current_time_weights.clear()
+        masks = masks or {}
         
-        for key, loss_b in batch_losses.items():
-            if t is not None:
-                # 1. Fetch the specific time-weighting module for this loss key.
-                # If one wasn't registered, fallback to a safe constant 1.0
-                if key in self._time_weight_modules:
-                    time_weights = self._time_weight_modules[key](t)
-                else:
-                    time_weights = torch.ones_like(t)
-                
-                # 2. Broadcast time_weights to match loss_b dimensions
-                # e.g., if loss_b is [Batch, NumNodes, Dim], time_weights becomes [Batch, 1, 1]
-                target_shape = [-1] + [1] * (loss_b.ndim - 1)
-                tw_broadcast = time_weights.view(*target_shape)
-                
-                # 3. Apply the time weight
-                loss_b = loss_b * tw_broadcast
-                
-            # 4. Reduce to scalar after weighting
-            self._losses[key] = loss_b.mean()
+        # Precompute time-weight tensors
+        group_tw_tensors = {}
+        if t is not None:
+            for group, tw_module in self._time_weight_modules.items():
+                tw = tw_module(t)
+                group_tw_tensors[group] = tw
+                self._current_time_weights[group] = tw.mean().item()
 
+        for key, loss_b in batch_losses.items():
+            # 1. Apply time-weights to create a weighted copy
+            if t is not None:
+                group = self._key_to_group.get(key)
+                if group is not None and group in group_tw_tensors:
+                    tw = group_tw_tensors[group]
+                    target_shape = [-1] + [1] * (loss_b.ndim - 1)
+                    loss_tw_b = loss_b * tw.view(*target_shape)
+                else:
+                    loss_tw_b = loss_b
+            else:
+                loss_tw_b = loss_b
+
+            # 2. Apply masking if provided
+            mask = masks.get(key)
+            if mask is not None:
+                # Filter both the pure and time-weighted losses
+                valid_raw = loss_b[mask]
+                valid_tw = loss_tw_b[mask]
+                
+                # Prevent NaN if mask is entirely False
+                if valid_raw.numel() > 0:
+                    self._raw_losses[key] = valid_raw.mean()
+                    self._tw_losses[key] = valid_tw.mean()
+                else:
+                    # Dummy zero tensor that still requires grad (prevents DDP crashing)
+                    zero_loss = (loss_b * 0.0).sum()
+                    self._raw_losses[key] = zero_loss
+                    self._tw_losses[key] = zero_loss
+            else:
+                self._raw_losses[key] = loss_b.mean()
+                self._tw_losses[key] = loss_tw_b.mean()
 
     def set_losses(self, losses: dict[str, torch.Tensor]):
-        """
-        Set all loss components at once (replaces any previous).
-        Assumes losses are already reduced to scalars.
-        """
-        self._losses = losses
-
-    def add(self, key: str, value: torch.Tensor):
-        """Add or overwrite a single loss component."""
-        self._losses[key] = value
+        """Fallback for pre-reduced scalar losses."""
+        self._raw_losses = losses
+        self._tw_losses = losses.copy()
+        self._current_time_weights.clear()
 
     def add_stat(self, key: str, value):
-        """Add a single statistic for logging."""
         self._stats[key] = value
 
     def add_stats(self, stats: dict):
-        """Merge multiple statistics for logging."""
         self._stats.update(stats)
 
     # ── Outputs ──────────────────────────────────────────────────────
 
     def total_loss(self) -> torch.Tensor:
-        """Compute total weighted loss via the weight module."""
-        return self._weight_module(self._losses)
+        """Compute final loss for backprop: applies component weights to the time-weighted losses."""
+        return self._weight_module(self._tw_losses)
 
     def log_dict(self) -> dict[str, torch.Tensor | float]:
-        """Build a uniform log dict.
-
-        Sections emitted:
-        * ``loss/{component}``            — raw (unweighted) per-component value
-        * ``loss_weighted/{component}``   — weighted per-component value
-        * ``loss_weighted/{group}``       — sum of weighted components per group
-        * ``loss/total``                   — sum of all raw components
-        * ``loss_weighted/total``         — sum of all weighted components
-        * ``stats/{key}``                 — additional statistics
-        * ``weight/{component}``          — current weight values (learnable only)
-        """
+        """Builds a uniform log dict separating pure and fully weighted losses."""
         entries: dict[str, torch.Tensor | float] = {}
 
-        total_unweighted = 0.0
-        total_weighted = 0.0
-        for key, val in self._losses.items():
-            w_val = self._weights[key] * val
-            entries[f"loss/{key}"] = val
-            entries[f"loss_weighted/{key}"] = w_val
-            total_unweighted = total_unweighted + val
-            total_weighted = total_weighted + w_val
+        total_pure = 0.0
+        total_fully_weighted = 0.0
+        
+        # 1. Log individual components
+        for key in self._raw_losses.keys():
+            pure_val = self._raw_losses[key]
+            # Fully weighted = time-weighted value * learnable/manual component weight
+            fully_weighted_val = self._weights[key] * self._tw_losses[key]
+            
+            entries[f"loss/{key}"] = pure_val
+            entries[f"loss_weighted/{key}"] = fully_weighted_val
+            
+            total_pure += pure_val
+            total_fully_weighted += fully_weighted_val
 
+        # 2. Log group sums
         for group, keys in self._groups.items():
-            terms = [
-                self._weights[k] * self._losses[k]
-                for k in keys
-                if k in self._losses
-            ]
-            if terms:
-                entries[f"loss_weighted/{group}"] = sum(terms)
+            pure_terms = [self._raw_losses[k] for k in keys if k in self._raw_losses]
+            weighted_terms = [self._weights[k] * self._tw_losses[k] for k in keys if k in self._tw_losses]
+            
+            if pure_terms:
+                entries[f"loss/{group}"] = sum(pure_terms)
+            if weighted_terms:
+                entries[f"loss_weighted/{group}"] = sum(weighted_terms)
 
-        entries["loss/total"] = total_unweighted
-        entries["loss_weighted/total"] = total_weighted
+        # 3. Log totals
+        entries["loss/total"] = total_pure
+        entries["loss_weighted/total"] = total_fully_weighted
 
+        # 4. Log stats, weights, and time-weights
         for key, val in self._stats.items():
             entries[f"stats/{key}"] = val
 
-        if self._weight_module.use_learnable:
+        if getattr(self._weight_module, "use_learnable", False):
             for k, w in self._weights.items():
                 entries[f"weight/{k}"] = w
+
+        for group, tw_val in self._current_time_weights.items():
+            entries[f"time_weight/{group}"] = tw_val
 
         return entries

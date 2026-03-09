@@ -24,6 +24,7 @@ from lightning.pytorch.utilities import grad_norm
 from chemflow.utils.loss_accumulation import LossAccumulator
 from chemflow.model.learnable_loss import UnifiedWeightedLoss
 from chemflow.model.cfg import CFGAdapter
+from chemflow.utils.loss_weighing import InverseSquaredTimeLossWeighting, ConstantTimeLossWeighting, ShiftedParabolaTimeLossWeighting
 
 
 class LightningModuleRates(pl.LightningModule):
@@ -237,8 +238,18 @@ class LightningModuleRates(pl.LightningModule):
             use_learnable=use_learnable_loss_weights,
         )
 
+        # TODO make these configurable
+        time_weights = {
+            "x": InverseSquaredTimeLossWeighting(clamp_max=10.0),
+            "c": InverseSquaredTimeLossWeighting(clamp_max=10.0),
+            "ins": ShiftedParabolaTimeLossWeighting(),
+            "del": ShiftedParabolaTimeLossWeighting(),
+            "sub": InverseSquaredTimeLossWeighting(clamp_max=10.0),
+            "budget": ConstantTimeLossWeighting(1.0) # Maybe penalize budget less
+        }
+
         self.loss_accumulator = LossAccumulator(
-            self.loss_weight_wrapper, self.LOSS_GROUPS, self.device
+            self.loss_weight_wrapper, self.LOSS_GROUPS, self.device, time_weights
         )
         
         self.is_compiled = False
@@ -426,9 +437,8 @@ class LightningModuleRates(pl.LightningModule):
             )
             > 0
         )
-        rate_loss = rate_loss[batch_has_modified]
         
-        return self._reduce_loss(rate_loss, reduction)
+        return self._reduce_loss(rate_loss, reduction), batch_has_modified
 
     def class_loss(
         self, class_pred, class_target, class_weights, num_actions, batch, num_graphs, reduction: str = "mean",
@@ -467,10 +477,8 @@ class LightningModuleRates(pl.LightningModule):
             )
             > 0
         )
-
-        class_loss = class_loss[batch_has_modified]
         
-        return self._reduce_loss(class_loss, reduction)
+        return self._reduce_loss(class_loss, reduction), batch_has_modified
 
     def global_budget_loss(self, graph_rate_pred, target_budget, reduction: str = "mean"):
         """
@@ -540,13 +548,14 @@ class LightningModuleRates(pl.LightningModule):
 
         # NOTE charges not in mol_t, so we need to predict them for all atoms
         pred_all_atoms = torch.ones_like(mols_1.c, dtype=torch.bool)
-        c_loss = self.class_loss(
+        c_loss, c_batch_mask = self.class_loss(
             c_pred,
             mols_1.c,
             self.charge_token_weights,
             pred_all_atoms,
             mols_t.batch,
             mols_t.num_graphs,
+            reduction="none",
         )
 
         # 1. Handle substitutions
@@ -555,13 +564,14 @@ class LightningModuleRates(pl.LightningModule):
         do_sub_a_loss = self.do_action_loss(
             do_sub_a_head, mols_t.lambda_a_sub, mols_t.batch, mols_t.num_graphs
         )
-        sub_a_class_loss = self.class_loss(
+        sub_a_class_loss, sub_a_batch_mask = self.class_loss(
             a_pred,
             mols_1.a,
             self.atom_type_weights,
             mols_t.lambda_a_sub,
             mols_t.batch,
             mols_t.num_graphs,
+            reduction="none",
         )
         #### Handle edge type substitutions
         edge_infos = self.edge_aligner.align_edges(
@@ -574,22 +584,22 @@ class LightningModuleRates(pl.LightningModule):
 
         # NOTE As per EditFlow, only count class loss for edges that need modification
         do_sub_e_loss = self.do_action_loss(
-            do_sub_e_head_triu, do_sub_e_target_triu, e_batch_triu, mols_t.num_graphs
+            do_sub_e_head_triu, do_sub_e_target_triu, e_batch_triu, mols_t.num_graphs, 
+            reduction="none",
         )
-        sub_e_class_loss = self.class_loss(
+        sub_e_class_loss, sub_e_batch_mask = self.class_loss(
             e_pred_triu,
             e_target_triu,
             self.edge_token_weights,
             do_sub_e_target_triu,
             e_batch_triu,
             mols_t.num_graphs,
+            reduction="none",
         )
 
         do_del_loss = torch.tensor(0.0, device=self.device)
         do_ins_loss = torch.tensor(0.0, device=self.device)
-        ins_loss_rate = torch.tensor(0.0, device=self.device)
-        ins_loss_gmm = torch.tensor(0.0, device=self.device)
-        ins_loss_e = torch.tensor(0.0, device=self.device)
+        
         if self.n_atoms_strategy != "fixed":
             # TODO maybe we should weight the deletion loss and insertion loss by their number of deletions and insertions?
             # TODO e.g. w = n_del / (n_del + n_ins)
@@ -600,6 +610,7 @@ class LightningModuleRates(pl.LightningModule):
                 mols_t.batch,
                 mols_t.num_graphs,
                 ema_key="del",
+                reduction="none",
             )
 
             # 3. Handle insertions
@@ -609,12 +620,14 @@ class LightningModuleRates(pl.LightningModule):
                 mols_t.batch,
                 mols_t.num_graphs,
                 ema_key="ins",
+                reduction="none",
             )
 
             # Count number of insertions per node
             # Initialize with zeros for all nodes
             ins_loss_gmm = torch.tensor(0.0, device=self.device)
             ins_loss_e = torch.tensor(0.0, device=self.device)
+            ins_loss_rate = torch.tensor(0.0, device=self.device)
 
             # indices of nodes in mol_t that spawn/predict each insertion
             spawn_node_idx = ins_targets.spawn_node_idx
@@ -624,18 +637,9 @@ class LightningModuleRates(pl.LightningModule):
                 num_inserts_per_node = mols_t.n_ins
 
                 # mask indicating which nodes are focal for insertion
-                ins_loss_rate = self.rate_loss(
-                    ins_rate_pred, num_inserts_per_node, mols_t.batch, mols_t.num_graphs
-                )
-
-                # mask indicating in which graph we have inserts
-                batch_has_inserts = (
-                    unsorted_segment_sum(
-                        torch.ones((spawn_node_idx.shape[0], 1), device=self.device),
-                        mols_t.batch[spawn_node_idx],
-                        mols_t.num_graphs,
-                    )
-                    > 0
+                ins_loss_rate, ins_batch_mask = self.rate_loss(
+                    ins_rate_pred, num_inserts_per_node, mols_t.batch, mols_t.num_graphs,
+                    reduction="none",
                 )
 
                 # we must take the NLL for the closest nodes only
@@ -666,9 +670,7 @@ class LightningModuleRates(pl.LightningModule):
                     mols_t.num_graphs,
                 )
 
-                ins_loss_gmm = ins_loss_gmm[batch_has_inserts]
-                
-                ins_loss_gmm = self._reduce_loss(ins_loss_gmm, "mean")
+                ins_loss_gmm = self._reduce_loss(ins_loss_gmm, "none")
 
                 # Compute insertion edge loss if available
                 # Validate indices are within bounds
@@ -709,8 +711,7 @@ class LightningModuleRates(pl.LightningModule):
                         mols_t.num_graphs,
                     )
 
-                    ins_loss_e = ins_loss_e[batch_has_inserts]
-                    ins_loss_e = self._reduce_loss(ins_loss_e, "mean")
+                    ins_loss_e = self._reduce_loss(ins_loss_e, "none")
 
             else:
                 # NOTE ins_rate_head,edge_head, gmm_head unused, throws an error (unused_params)
@@ -741,14 +742,12 @@ class LightningModuleRates(pl.LightningModule):
         )
         # Keep only graphs that have at least one node contributing to x_loss
         # (i.e., at least one node that is not marked for deletion).
-        present_graphs_mask = torch.zeros(
+        x_batch_mask = torch.zeros(
             mols_t.num_graphs, dtype=torch.bool, device=self.device
         )
-        present_graphs_mask[mols_t.batch[~to_delete_mask]] = True
+        x_batch_mask[mols_t.batch[~to_delete_mask]] = True
 
-        if present_graphs_mask.any():
-            x_loss = x_loss[present_graphs_mask].mean()
-        else:
+        if not x_batch_mask.any():
             x_loss = 0.0 * sum(p.sum() for p in self.model.pos_head.parameters())
 
         # 4.5 Compute global budget losses from node-wise rates.
@@ -780,10 +779,12 @@ class LightningModuleRates(pl.LightningModule):
             global_ins_budget_loss = self.global_budget_loss(
                 ins_graph_expected,
                 ins_budget_target,
+                reduction="none",
             )
             global_del_budget_loss = self.global_budget_loss(
                 del_graph_expected,
                 del_budget_target,
+                reduction="none",
             )
 
         else:
@@ -791,8 +792,18 @@ class LightningModuleRates(pl.LightningModule):
             global_ins_budget_loss = 0.0 * (do_ins_head.sum() + ins_rate_pred.sum())
             global_del_budget_loss = 0.0 * do_del_head.sum()
 
+        loss_masks = {
+            "x": x_batch_mask,
+            "c": c_batch_mask,
+            "ins_rate": ins_batch_mask,
+            "ins_e": ins_batch_mask,
+            "ins_gmm": ins_batch_mask,
+            "sub_a_class": sub_a_batch_mask,
+            "sub_e_class": sub_e_batch_mask,
+        }
+
         # 5. Combine, weight, and log all losses
-        self.loss_accumulator.set_losses(
+        self.loss_accumulator.set_batch_losses(
             {
                 "do_sub_a": do_sub_a_loss,
                 "sub_a_class": sub_a_class_loss,
@@ -807,7 +818,9 @@ class LightningModuleRates(pl.LightningModule):
                 "c": c_loss,
                 "global_ins_budget": global_ins_budget_loss,
                 "global_del_budget": global_del_budget_loss,
-            }
+            },
+            t=t,
+            masks=loss_masks,
         )
 
         self.loss_accumulator.add_stats(
