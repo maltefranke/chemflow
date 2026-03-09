@@ -2,7 +2,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 import torch
 
-from chemflow.utils import rigid_alignment
+from chemflow.utils.utils import rigid_alignment
 
 from chemflow.dataset.molecule_data import (
     AugmentedMoleculeData,

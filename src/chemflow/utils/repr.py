@@ -1,6 +1,6 @@
 from rdkit import Chem
 from rdkit.Chem.rdDetermineBonds import DetermineBonds
-from chemflow.utils import index_to_token
+from chemflow.utils.utils  import index_to_token
 import torch
 import numpy as np
 
@@ -39,6 +39,7 @@ def tensors_to_rdkit_mol(
 
     try:
         mol = mol.GetMol()
+        # DetermineBonds(mol)
         for atom in mol.GetAtoms():
             atom.UpdatePropertyCache(strict=False)
     except Exception as e:

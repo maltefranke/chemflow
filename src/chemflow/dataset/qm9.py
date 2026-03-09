@@ -1,7 +1,7 @@
 from torch_geometric.datasets.qm9 import QM9, conversion
 import torch
 
-from chemflow.utils import (
+from chemflow.utils.utils import (
     edge_types_to_triu_entries,
     edge_types_to_symmetric,
     z_to_atom_types,
@@ -18,7 +18,7 @@ from torch_geometric.utils import one_hot, scatter
 
 from chemflow.dataset.molecule_data import MoleculeData
 from chemflow.dataset.vocab import Vocab, Distributions
-from chemflow.rdkit import mol_is_valid, sanitize_mol_correctly, BOND_IDX_MAP
+from chemflow.utils.rdkit import mol_is_valid, sanitize_mol_correctly, BOND_IDX_MAP
 from scipy.spatial.transform import Rotation
 
 

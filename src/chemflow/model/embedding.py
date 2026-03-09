@@ -120,18 +120,19 @@ class CountEmbedding(nn.Module):
     """
 
     def __init__(
-        self, embedding_dim: int, out_dim: int = None, max_period: float = 500.0
+        self, embedding_dim: int, out_dim: int = None, max_period: float = 100.0
     ):
         super().__init__()
         if out_dim is None:
             out_dim = embedding_dim
+
         self.encoder = SinusoidalEncoding(embedding_dim, max_period)
 
         # Optional: A small MLP to adapt the fixed features to the task
         self.projection = nn.Sequential(
             nn.Linear(embedding_dim, out_dim),
-            nn.LayerNorm(out_dim),
-            nn.GELU(),
+            # nn.LayerNorm(out_dim),
+            # nn.GELU(),
         )
 
     def forward(self, counts: torch.Tensor) -> torch.Tensor:
@@ -206,7 +207,7 @@ class PropertyEmbedding(nn.Module):
             nn.Linear(embedding_dim, out_dim),
         )
 
-        self.null_embedding = nn.Parameter(torch.randn(out_dim))
+        self.null_embedding = nn.Parameter(torch.randn(out_dim) * 0.02)
         self._init_weights()
 
     def _init_weights(self):
@@ -263,7 +264,7 @@ class NAtomsCFGEmbedding(nn.Module):
         self,
         embedding_dim: int,
         out_dim: int = None,
-        max_period: float = 500.0,
+        max_period: float = 100.0,
     ):
         super().__init__()
         if out_dim is None:
@@ -273,7 +274,7 @@ class NAtomsCFGEmbedding(nn.Module):
         self.count_embedding = CountEmbedding(
             embedding_dim=embedding_dim, out_dim=out_dim, max_period=max_period
         )
-        self.null_embedding = nn.Parameter(torch.randn(out_dim))
+        self.null_embedding = nn.Parameter(torch.randn(out_dim) * 0.02)
 
     def forward(
         self,

@@ -9,7 +9,7 @@ from rdkit import Chem
 from torchmetrics import Metric
 from torchmetrics import MetricCollection
 
-from chemflow import rdkit as chemflowRD
+from chemflow.utils import rdkit as chemflowRD
 
 
 def atom_count_distribution_metrics(

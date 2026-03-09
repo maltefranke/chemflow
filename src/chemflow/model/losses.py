@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from chemflow.flow_matching.gmm import get_typed_gmm_components
+from chemflow.model.gmm import get_typed_gmm_components
 
 def typed_gmm_loss(
     gmm_output,

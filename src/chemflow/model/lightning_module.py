@@ -4,9 +4,9 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
 import hydra
-from chemflow.losses import typed_gmm_loss
+from chemflow.model.losses import typed_gmm_loss
 
-from chemflow.utils import (
+from chemflow.utils.utils  import (
     token_to_index,
     compute_token_weights,
     EdgeAligner,
@@ -15,13 +15,14 @@ from external_code.egnn import unsorted_segment_mean, unsorted_segment_sum
 
 from chemflow.dataset.molecule_data import MoleculeBatch
 from chemflow.dataset.vocab import Vocab, Distributions
-from chemflow.metrics import (
+from chemflow.utils.metrics import (
     calc_metrics_,
     calc_posebusters_metrics,
     init_metrics,
 )
 from lightning.pytorch.utilities import grad_norm
-from chemflow.model.learnable_loss import LossAccumulator, UnifiedWeightedLoss
+from chemflow.utils.loss_accumulation import LossAccumulator
+from chemflow.model.learnable_loss import UnifiedWeightedLoss
 from chemflow.model.cfg import CFGAdapter
 
 
@@ -236,6 +237,10 @@ class LightningModuleRates(pl.LightningModule):
             use_learnable=use_learnable_loss_weights,
         )
 
+        self.loss_accumulator = LossAccumulator(
+            self.loss_weight_wrapper, self.LOSS_GROUPS, self.device
+        )
+        
         self.is_compiled = False
 
     def compile(self):
@@ -260,6 +265,16 @@ class LightningModuleRates(pl.LightningModule):
                 self.model.parameters(),
             ):
                 p_ema.mul_(self.ema_decay).add_(p.data, alpha=1.0 - self.ema_decay)
+
+    def _reduce_loss(self, loss, reduction: str = "mean"):
+        if reduction == "mean":
+            return loss.mean()
+        elif reduction == "sum":
+            return loss.sum()
+        elif reduction == "none":
+            return loss
+        else:
+            raise ValueError(f"Invalid reduction: {reduction}")
 
     # fmt: off
     _LEGACY_BUFFER_KEYS = frozenset({
@@ -313,6 +328,7 @@ class LightningModuleRates(pl.LightningModule):
         batch,
         num_graphs,
         ema_key: str | None = None,
+        reduction: str = "mean",
     ):
         """Calculate the do action loss for the given do action predictions.
         Is used for all actions (substitutions, deletions, insertions).
@@ -371,11 +387,10 @@ class LightningModuleRates(pl.LightningModule):
             do_action_loss.view(-1, 1), batch, num_graphs
         )
 
-        do_action_loss = do_action_loss.mean()
+        return self._reduce_loss(do_action_loss, reduction)
 
-        return do_action_loss
 
-    def rate_loss(self, rate_pred, num_actions, batch, num_graphs):
+    def rate_loss(self, rate_pred, num_actions, batch, num_graphs, reduction: str = "mean"):
         """
         Calculate the Poisson NLL rate loss for insertion predictions.
 
@@ -411,12 +426,12 @@ class LightningModuleRates(pl.LightningModule):
             )
             > 0
         )
-        rate_loss = rate_loss[batch_has_modified].mean()
-
-        return rate_loss
+        rate_loss = rate_loss[batch_has_modified]
+        
+        return self._reduce_loss(rate_loss, reduction)
 
     def class_loss(
-        self, class_pred, class_target, class_weights, num_actions, batch, num_graphs
+        self, class_pred, class_target, class_weights, num_actions, batch, num_graphs, reduction: str = "mean",
     ):
         """
         Calculate the class loss for the given class predictions and target classes.
@@ -453,11 +468,11 @@ class LightningModuleRates(pl.LightningModule):
             > 0
         )
 
-        class_loss = class_loss[batch_has_modified].mean()
+        class_loss = class_loss[batch_has_modified]
+        
+        return self._reduce_loss(class_loss, reduction)
 
-        return class_loss
-
-    def global_budget_loss(self, graph_rate_pred, target_budget):
+    def global_budget_loss(self, graph_rate_pred, target_budget, reduction: str = "mean"):
         """
         Calculate global budget loss from graph-level expected action counts.
 
@@ -478,7 +493,7 @@ class LightningModuleRates(pl.LightningModule):
             graph_rate_pred,
             target_budget,
             log_input=False,
-            reduction="mean",
+            reduction=reduction,
             full=True,
         )
         return loss
@@ -644,14 +659,16 @@ class LightningModuleRates(pl.LightningModule):
 
                 ins_loss_gmm = gmm_loss.view(-1)
 
-                # reduce the loss
+                # reduce the loss to per-graph level
                 ins_loss_gmm = unsorted_segment_mean(
                     ins_loss_gmm.view(-1, 1),
                     mols_t.batch[spawn_node_idx],
                     mols_t.num_graphs,
                 )
 
-                ins_loss_gmm = ins_loss_gmm[batch_has_inserts].mean()
+                ins_loss_gmm = ins_loss_gmm[batch_has_inserts]
+                
+                ins_loss_gmm = self._reduce_loss(ins_loss_gmm, "mean")
 
                 # Compute insertion edge loss if available
                 # Validate indices are within bounds
@@ -685,14 +702,15 @@ class LightningModuleRates(pl.LightningModule):
                     # NOTE All inserted edges will have a non-zero target rate
                     # NOTE Therefore no more filtering needed
 
-                    # reduce the loss
+                    # reduce the loss to per-graph level
                     ins_loss_e = unsorted_segment_mean(
                         ins_loss_e.view(-1, 1),
                         mols_t.batch[spawn_idx],
                         mols_t.num_graphs,
                     )
 
-                    ins_loss_e = ins_loss_e[batch_has_inserts].mean()
+                    ins_loss_e = ins_loss_e[batch_has_inserts]
+                    ins_loss_e = self._reduce_loss(ins_loss_e, "mean")
 
             else:
                 # NOTE ins_rate_head,edge_head, gmm_head unused, throws an error (unused_params)
@@ -774,10 +792,7 @@ class LightningModuleRates(pl.LightningModule):
             global_del_budget_loss = 0.0 * do_del_head.sum()
 
         # 5. Combine, weight, and log all losses
-        losses = LossAccumulator(
-            self.loss_weight_wrapper, self.LOSS_GROUPS, self.device
-        )
-        losses.set_losses(
+        self.loss_accumulator.set_losses(
             {
                 "do_sub_a": do_sub_a_loss,
                 "sub_a_class": sub_a_class_loss,
@@ -795,7 +810,7 @@ class LightningModuleRates(pl.LightningModule):
             }
         )
 
-        losses.add_stats(
+        self.loss_accumulator.add_stats(
             {
                 "n_ins": (mols_t.lambda_ins > 0.0).sum().float(),
                 "n_del": (mols_t.lambda_del > 0.0).sum().float(),
@@ -807,7 +822,7 @@ class LightningModuleRates(pl.LightningModule):
         )
 
         if self.n_atoms_strategy != "fixed":
-            losses.add_stats(
+            self.loss_accumulator.add_stats(
                 {
                     "ins_budget_pred_mean": ins_graph_expected.mean(),
                     "del_budget_pred_mean": del_graph_expected.mean(),
@@ -816,8 +831,8 @@ class LightningModuleRates(pl.LightningModule):
                 }
             )
 
-        loss = self.safe_loss(losses.total_loss())
-        self.log_dict(losses.log_dict(), prog_bar=False, logger=True)
+        loss = self.safe_loss(self.loss_accumulator.total_loss())
+        self.log_dict(self.loss_accumulator.log_dict(), prog_bar=False, logger=True)
 
         return loss
 
@@ -861,8 +876,12 @@ class LightningModuleRates(pl.LightningModule):
             batch_size=len(mols),
         )
 
-        # pb_metrics = calc_posebusters_metrics(rdkit_mols)
-        pb_metrics = False
+        try:
+            pb_metrics = calc_posebusters_metrics(rdkit_mols)
+        except Exception as e:
+            print(f"Error calculating PoseBusters metrics: {e}")
+            pb_metrics = False
+
         if pb_metrics:
             pb_metrics_dict = {
                 f"posebusters/{key}": value for key, value in pb_metrics.items()

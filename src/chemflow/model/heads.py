@@ -43,7 +43,7 @@ class OutputHead(nn.Module):
             layers.append(nn.LayerNorm(hidden_dim))
 
             # Activation
-            layers.append(nn.GELU())
+            layers.append(nn.SiLU())
 
             # Dropout (Regularization)
             if dropout > 0:

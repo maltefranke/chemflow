@@ -1,6 +1,7 @@
 import hydra
 import omegaconf
 import torch
+from copy import deepcopy
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import LearningRateMonitor
@@ -9,7 +10,7 @@ from omegaconf import OmegaConf
 from rdkit import RDLogger
 from pytorch_lightning.strategies import DDPStrategy
 
-from chemflow.utils import build_callbacks, init_uniform_prior
+from chemflow.utils.utils  import build_callbacks, init_uniform_prior
 from chemflow.model.lightning_module import LightningModuleRates
 
 # resolvers for more complex config expressions
@@ -43,7 +44,7 @@ def run(cfg: DictConfig):
     token_prior_distribution = init_uniform_prior(distributions)
 
     cfg.data.vocab = vocab
-    # cfg.data.distributions = distributions
+    print(cfg)
 
     hydra.utils.log.info(
         f"Preprocessing complete.\n"
@@ -91,7 +92,7 @@ def run(cfg: DictConfig):
     )
 
     ckpt_path = None
-    #ckpt_path = "/users/frankem/chemflow/outputs/2026-03-03/23-32-59/logs/chemflow/s26mr2e6/checkpoints/epoch=29-step=661.ckpt"
+    # ckpt_path = "/capstor/store/cscs/swissai/a131/frankem/chemflow/logs/wandb/sc-loss_weights_m-semla_gb-0.1_mu-0.01_aux-1e-4_emb-1e-4/chemflow/yln1sp7m/checkpoints/epoch=1079-step=17280.ckpt"
 
     # Train the model
     trainer.fit(

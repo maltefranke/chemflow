@@ -2,7 +2,7 @@ import torch
 from torch.distributions import Categorical
 
 from chemflow.dataset.molecule_data import MoleculeData
-from chemflow.utils import build_fully_connected_edge_index
+from chemflow.utils.utils import build_fully_connected_edge_index
 from chemflow.dataset.vocab import Distributions, Vocab
 
 

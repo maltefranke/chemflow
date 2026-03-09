@@ -4,13 +4,13 @@ from torch_geometric.utils import to_dense_adj
 from rdkit import Chem
 import numpy as np
 
-from chemflow.utils import index_to_token, EdgeAligner
+from chemflow.utils.utils  import index_to_token, EdgeAligner
 from external_code.egnn import unsorted_segment_mean
 
 from torch_geometric.utils import sort_edge_index
 from torch.distributions import Categorical
 
-from chemflow.repr import tensors_to_rdkit_mol
+from chemflow.utils.repr import tensors_to_rdkit_mol
 
 
 # RDKit bond type to index mapping

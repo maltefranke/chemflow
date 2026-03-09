@@ -5,12 +5,13 @@ import os
 import torch
 from torch_geometric.utils import to_dense_adj
 
+from chemflow.dataset.vocab import Vocab, Distributions
 from chemflow.dataset.qm9 import QM9Charges
-from chemflow.utils import (
+from chemflow.utils.utils  import (
     token_to_index,
     z_to_atom_types,
 )
-from chemflow.dataset.vocab import Vocab, Distributions
+
 
 
 class Preprocessing:

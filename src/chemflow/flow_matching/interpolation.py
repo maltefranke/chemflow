@@ -4,7 +4,7 @@ from torch_geometric.utils import to_dense_adj
 
 from chemflow.flow_matching.assignment import partial_optimal_transport_single
 
-from chemflow.utils import EdgeAligner
+from chemflow.utils.utils import EdgeAligner
 
 from chemflow.dataset.molecule_data import (
     AugmentedMoleculeData,

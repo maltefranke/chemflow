@@ -1,9 +1,9 @@
 import torch
 
-from chemflow.flow_matching.gmm import (
+from chemflow.model.gmm import (
     sample_from_typed_gmm,
 )
-from chemflow.utils import (
+from chemflow.utils.utils import (
     token_to_index,
     EdgeAligner,
 )
