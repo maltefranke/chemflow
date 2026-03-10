@@ -31,10 +31,10 @@ interpolator:
   ins_noise_scale: ${data.ins_noise_scale}
   del_schedule: ${schedule}
   ins_schedule: ${schedule}
-  sub_schedule: ${schedule}
-  # sub_e_schedule: ${schedule}
+  sub_schedule:
+    _target_: chemflow.flow_matching.schedules.SmoothstepSchedule
+    shift: 1.0
   sub_e_schedule: 
-    # _target_: chemflow.flow_matching.schedules.CubicSchedule
     _target_: chemflow.flow_matching.schedules.SmoothstepSchedule
     shift: 1.0
 
@@ -70,13 +70,13 @@ datamodule:
   interpolator: ${data.interpolator}
 
   num_workers:
-    train: 20
-    val: 20
-    test: 10
-    predict: 10
+    train: 32
+    val: 32
+    test: 32
+    predict: 32
 
   batch_size:
-    train: 1024
+    train: 2048
     val: 128
     test: 32
 

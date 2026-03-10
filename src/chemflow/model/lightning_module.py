@@ -239,13 +239,22 @@ class LightningModuleRates(pl.LightningModule):
         )
 
         # TODO make these configurable
-        time_weights = {
+        """time_weights = {
             "x": InverseSquaredTimeLossWeighting(clamp_max=10.0),
             "c": InverseSquaredTimeLossWeighting(clamp_max=10.0),
             "ins": ShiftedParabolaTimeLossWeighting(),
             "del": ShiftedParabolaTimeLossWeighting(),
-            "sub": InverseSquaredTimeLossWeighting(clamp_max=10.0),
-            "budget": ConstantTimeLossWeighting(1.0) # Maybe penalize budget less
+            "sub": ShiftedParabolaTimeLossWeighting(shift=-1.0),
+            "budget": ShiftedParabolaTimeLossWeighting()
+        }"""
+
+        time_weights = {
+            "x": InverseSquaredTimeLossWeighting(clamp_max=100.0),
+            "c": InverseSquaredTimeLossWeighting(clamp_max=100.0),
+            "ins": lambda t: self.integrator.ins_schedule.rate(t).clamp(max=100.0),
+            "del": lambda t: self.integrator.del_schedule.rate(t).clamp(max=100.0),
+            "sub": lambda t: self.integrator.sub_schedule.rate(t).clamp(max=100.0),
+            "budget": lambda t: self.integrator.ins_schedule.rate(t).clamp(max=100.0)
         }
 
         self.loss_accumulator = LossAccumulator(

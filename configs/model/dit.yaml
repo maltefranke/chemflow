@@ -93,7 +93,7 @@ module:
       lr: 3e-3
 
     scheduler:
-      _target_: chemflow.schedulers.MultiGroupCosineWarmupLR
+      _target_: chemflow.utils.lr_schedulers.MultiGroupCosineWarmupLR
       # We don't pass 'optimizer' here; we inject it in the Python script.
       warmup_steps: 1000        # Typically 2-5% of total_steps
       total_steps: 50000        # The total number of training iterations

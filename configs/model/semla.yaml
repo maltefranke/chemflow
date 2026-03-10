@@ -102,7 +102,7 @@ module:
       lr: 3e-4
 
     scheduler:
-      _target_: chemflow.schedulers.MultiGroupCosineWarmupLR
+      _target_: chemflow.utils.lr_schedulers.MultiGroupCosineWarmupLR
       warmup_steps: 1000
       total_steps: 350000
       min_lr_fraction: 0.05
@@ -152,7 +152,7 @@ edge_type_embedding:
 
 time_embedding:
   _target_: chemflow.model.embedding.TimeEmbedding
-  embedding_dim: 64
+  embedding_dim: 128
   out_dim: 128
 
 node_count_embedding:

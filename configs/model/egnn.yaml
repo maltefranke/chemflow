@@ -97,7 +97,7 @@ module:
       # _target_: chemflow.schedulers.LinearOneCycleLR
       # max_lr: 1e-3
       # warmup_steps: 1000
-      _target_: chemflow.schedulers.CosineWarmupLR
+      _target_: chemflow.utils.lr_schedulers.CosineWarmupLR
       max_lr: 5e-4
       min_lr: 2e-4
       warmup_steps: 1000

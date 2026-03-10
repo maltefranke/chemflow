@@ -21,7 +21,6 @@ class LossAccumulator:
         self._weight_module = weight_module
         self._groups = groups
         self._device = device
-        self._weights = weight_module.get_weight_tensors(device)
         self._time_weight_modules = time_weight_modules or {}
         
         # Reverse mapping: component_key -> group_name for fast lookups
@@ -120,14 +119,18 @@ class LossAccumulator:
         """Builds a uniform log dict separating pure and fully weighted losses."""
         entries: dict[str, torch.Tensor | float] = {}
 
+        current_weights = self._weight_module.get_weight_tensors(self._device)
+
         total_pure = 0.0
         total_fully_weighted = 0.0
         
         # 1. Log individual components
         for key in self._raw_losses.keys():
             pure_val = self._raw_losses[key]
-            # Fully weighted = time-weighted value * learnable/manual component weight
-            fully_weighted_val = self._weights[key] * self._tw_losses[key]
+            
+            # Use current_weights here
+            weight_k = current_weights.get(key, 1.0)
+            fully_weighted_val = weight_k * self._tw_losses[key]
             
             entries[f"loss/{key}"] = pure_val
             entries[f"loss_weighted/{key}"] = fully_weighted_val
@@ -138,7 +141,10 @@ class LossAccumulator:
         # 2. Log group sums
         for group, keys in self._groups.items():
             pure_terms = [self._raw_losses[k] for k in keys if k in self._raw_losses]
-            weighted_terms = [self._weights[k] * self._tw_losses[k] for k in keys if k in self._tw_losses]
+            weighted_terms = [
+                current_weights.get(k, 1.0) * self._tw_losses[k] 
+                for k in keys if k in self._tw_losses
+            ]
             
             if pure_terms:
                 entries[f"loss/{group}"] = sum(pure_terms)
@@ -154,7 +160,7 @@ class LossAccumulator:
             entries[f"stats/{key}"] = val
 
         if getattr(self._weight_module, "use_learnable", False):
-            for k, w in self._weights.items():
+            for k, w in current_weights.items():
                 entries[f"weight/{k}"] = w
 
         for group, tw_val in self._current_time_weights.items():
