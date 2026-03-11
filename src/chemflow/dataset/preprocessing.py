@@ -11,6 +11,7 @@ from chemflow.utils.utils  import (
     token_to_index,
     z_to_atom_types,
 )
+from torch_geometric.data import Dataset
 
 
 
@@ -32,6 +33,7 @@ class Preprocessing:
     def __init__(
         self,
         root: str,
+        train_dataset: Dataset,
         atom_tokens_path: str = None,
         edge_tokens_path: str = None,
         charge_tokens_path: str = None,
@@ -51,6 +53,7 @@ class Preprocessing:
                 If None, uses root/distributions.pt
         """
         self.root = root
+        self.train_dataset = train_dataset
 
         # Set default tokens path if not provided
         if atom_tokens_path is None:
@@ -76,6 +79,9 @@ class Preprocessing:
         # Load or compute tokens (both computed together if either is missing)
         self.vocab = self._load_or_compute_tokens()
         self.distributions = self._load_or_compute_distributions()
+
+        # remove train dataset to free memory
+        del self.train_dataset
 
     def _load_or_compute_tokens(self) -> Vocab:
         """
@@ -125,16 +131,15 @@ class Preprocessing:
         Returns:
             Tuple of (tokens, edge_tokens, charge_tokens)
         """
-        # Load QM9 dataset to extract unique atom and edge types
-        dataset = QM9Charges(root=self.root)
+        # Load dataset to extract unique atom and edge type
 
         # Extract all atom types and edge types from the dataset in one loop
         all_atom_types = set()
         all_edge_type_indices = set()
         all_charge_tokens = set()
 
-        for i in range(len(dataset)):
-            data = dataset[i]
+        for i in range(len(self.train_dataset)):
+            data = self.train_dataset[i]
 
             # Extract atom types
             atom_types = z_to_atom_types(data.z.tolist())

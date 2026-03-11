@@ -49,6 +49,11 @@ def tensors_to_rdkit_mol(
     if sanitize:
         try:
             Chem.SanitizeMol(mol)
+
+            for atom in mol.GetAtoms():
+                atom.SetNoImplicit(True) # Ensure no "ghost" Hs are expected
+                atom.UpdatePropertyCache()
+
         except Exception as e:
             print(e)
             return None

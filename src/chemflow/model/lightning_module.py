@@ -25,6 +25,7 @@ from chemflow.utils.loss_accumulation import LossAccumulator
 from chemflow.model.learnable_loss import UnifiedWeightedLoss
 from chemflow.model.cfg import CFGAdapter
 from chemflow.utils.loss_weighing import InverseSquaredTimeLossWeighting, ConstantTimeLossWeighting, ShiftedParabolaTimeLossWeighting
+from chemflow.utils.rdkit import mol_is_valid
 
 
 class LightningModuleRates(pl.LightningModule):
@@ -927,12 +928,23 @@ class LightningModuleRates(pl.LightningModule):
     def predict_step(self, batch, batch_idx):
         return_traj = bool(getattr(self, "predict_return_traj", True))
         target_override = getattr(self, "predict_target_n_atoms_override", None)
-        return self.sample(
+        gen_mols = self.sample(
             batch,
             batch_idx,
             return_traj=return_traj,
             target_n_atoms_override=target_override,
         )
+
+        # do quick validity check of the generated molecules
+        # take the last state of the trajectory and check validity
+        last_mols_rdkit = [i[-1].to_rdkit_mol(self.vocab.atom_tokens, self.vocab.edge_tokens, self.vocab.charge_tokens) for i in gen_mols]
+        mol_is_valid = [mol_is_valid(mol) for mol in last_mols_rdkit]
+
+        valid_mols = [i for i, valid in zip(last_mols_rdkit, mol_is_valid) if valid]
+        invalid_mols = [i for i, valid in zip(last_mols_rdkit, mol_is_valid) if not valid]
+
+        return valid_mols, invalid_mols
+
 
     def sample(
         self,

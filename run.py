@@ -92,7 +92,7 @@ def run(cfg: DictConfig):
     )
 
     ckpt_path = None
-    # ckpt_path = "/capstor/store/cscs/swissai/a131/frankem/chemflow/logs/wandb/sc-loss_weights_m-semla_gb-0.1_mu-0.01_aux-1e-4_emb-1e-4/chemflow/yln1sp7m/checkpoints/epoch=1079-step=17280.ckpt"
+    # ckpt_path = "/capstor/store/cscs/swissai/a131/frankem/chemflow/logs/wandb/sched_learnable_w/chemflow/asoc4re8/checkpoints/epoch=1999-step=32000.ckpt"
 
     # Train the model
     trainer.fit(
@@ -108,12 +108,14 @@ def run(cfg: DictConfig):
     )
     exit()"""
 
-    results = trainer.predict(
+    valid_mols, invalid_mols = trainer.predict(
         module,
         dataloaders=datamodule.test_dataloader(),
         ckpt_path=ckpt_path,
     )
-    torch.save(results, "results.pt")
+
+    torch.save(valid_mols, "valid_mols.pt")
+    torch.save(invalid_mols, "invalid_mols.pt")
 
 
 @hydra.main(
