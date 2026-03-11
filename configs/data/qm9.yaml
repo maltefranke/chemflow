@@ -12,6 +12,7 @@ ins_noise_scale: 0.5
 preprocessing:
   _target_: chemflow.dataset.preprocessing.Preprocessing
   root: ${data.root_path}/qm9
+  train_dataset: ${data.datamodule.datasets.train}
   atom_tokens_path: ${data.preprocessing.root}/processed/atom_tokens.txt
   edge_tokens_path: ${data.preprocessing.root}/processed/edge_tokens.txt
   charge_tokens_path: ${data.preprocessing.root}/processed/charge_tokens.txt
@@ -33,10 +34,10 @@ interpolator:
   ins_schedule: ${schedule}
   sub_schedule:
     _target_: chemflow.flow_matching.schedules.SmoothstepSchedule
-    shift: 1.0
+    shift: 1.5
   sub_e_schedule: 
     _target_: chemflow.flow_matching.schedules.SmoothstepSchedule
-    shift: 1.0
+    shift: 1.5
 
 datamodule:
   _target_: chemflow.dataset.lightning_datamodule.LightningDataModule

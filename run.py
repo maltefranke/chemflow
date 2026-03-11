@@ -10,8 +10,9 @@ from omegaconf import OmegaConf
 from rdkit import RDLogger
 from pytorch_lightning.strategies import DDPStrategy
 
-from chemflow.utils.utils  import build_callbacks, init_uniform_prior
+from chemflow.utils.utils import build_callbacks, init_uniform_prior
 from chemflow.model.lightning_module import LightningModuleRates
+from rdkit import Chem
 
 # resolvers for more complex config expressions
 OmegaConf.register_new_resolver("oc.eval", eval)
@@ -92,7 +93,11 @@ def run(cfg: DictConfig):
     )
 
     ckpt_path = None
-    # ckpt_path = "/capstor/store/cscs/swissai/a131/frankem/chemflow/logs/wandb/sched_learnable_w/chemflow/asoc4re8/checkpoints/epoch=1999-step=32000.ckpt"
+    # ckpt_path = (
+    #     "/cluster/project/krause/frankem/chemflow/outputs/epoch=1999-step=32000.ckpt"
+    # )
+
+    # module = module.__class__.load_from_checkpoint(ckpt_path)
 
     # Train the model
     trainer.fit(
@@ -108,14 +113,38 @@ def run(cfg: DictConfig):
     )
     exit()"""
 
-    valid_mols, invalid_mols = trainer.predict(
+    predictions = trainer.predict(
         module,
         dataloaders=datamodule.test_dataloader(),
         ckpt_path=ckpt_path,
     )
 
-    torch.save(valid_mols, "valid_mols.pt")
-    torch.save(invalid_mols, "invalid_mols.pt")
+    # Flatten the lists directly in your main script
+    all_valid_mols = []
+    all_invalid_mols = []
+    all_invalid_mols_rdkit = []
+
+    for batch_output in predictions:
+        all_valid_mols.extend(batch_output["valid_mols"])
+        all_invalid_mols.extend(batch_output["invalid_mols"])
+        all_invalid_mols_rdkit.extend(batch_output["invalid_mols_rdkit"])
+
+    torch.save(all_valid_mols, "valid_mols.pt")
+    torch.save(all_invalid_mols, "invalid_mols.pt")
+
+    writer = Chem.SDWriter("invalid_molecules.sdf")
+
+    for mol in all_invalid_mols_rdkit:
+        # Optional: Catch sanitization errors during writing just in case
+        if mol is None:
+            continue
+
+        try:
+            writer.write(mol)
+        except Exception as e:
+            print(f"Could not write molecule to SDF: {e}")
+
+    writer.close()
 
 
 @hydra.main(

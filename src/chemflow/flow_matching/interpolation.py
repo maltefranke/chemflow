@@ -98,7 +98,10 @@ class Interpolator:
 
         x_0, a_0, c_0, e_0, edge_index_0 = m_0.unpack()
         x_1, a_1, c_1, e_1, edge_index_1 = m_1.unpack()
-        is_auxiliary_0 = m_0.is_auxiliary
+        # A node is auxiliary in the interpolated paired representation if it is
+        # auxiliary on either side of the OT-aligned pair.
+        # This is not used downstream, just for consistency.
+        is_auxiliary_t = m_0.is_auxiliary | m_1.is_auxiliary
 
         assert e_0.shape == e_1.shape, "Edge types must have the same shape"
         assert torch.all(edge_index_0 == edge_index_1), "Edge indices must be the same"
@@ -121,7 +124,7 @@ class Interpolator:
             e=e_t,
             edge_index=edge_index_0,
             c=c_t,
-            is_auxiliary=is_auxiliary_0,  # Will not be needed for interpolation
+            is_auxiliary=is_auxiliary_t,
         )
 
     def interpolate_continuous(self, x0, x1, t):
@@ -327,11 +330,15 @@ class Interpolator:
         e1_triu = _extract_triu_feats(target)
 
         node_mask_del = mask_keep_del.squeeze()
-        edge_mask_del = node_mask_del[triu_rows] | node_mask_del[triu_cols]
-
         node_mask_ins = mask_keep_ins.squeeze()
-        edge_mask_ins = node_mask_ins[triu_rows] | node_mask_ins[triu_cols]
 
+        # Use mutually exclusive edge classes to avoid double-editing del-ins edges.
+        edge_has_del = node_mask_del[triu_rows] | node_mask_del[triu_cols]
+        edge_has_ins = node_mask_ins[triu_rows] | node_mask_ins[triu_cols]
+        edge_mask_del = edge_has_del & ~edge_has_ins
+        edge_mask_ins = edge_has_ins & ~edge_has_del
+
+        # del edges are frozen at source
         if edge_mask_del.any():
             e1_triu[edge_mask_del] = e0_triu[edge_mask_del]
 

@@ -6,7 +6,7 @@ from omegaconf import DictConfig, OmegaConf
 import hydra
 from chemflow.model.losses import typed_gmm_loss
 
-from chemflow.utils.utils  import (
+from chemflow.utils.utils import (
     token_to_index,
     compute_token_weights,
     EdgeAligner,
@@ -24,8 +24,12 @@ from lightning.pytorch.utilities import grad_norm
 from chemflow.utils.loss_accumulation import LossAccumulator
 from chemflow.model.learnable_loss import UnifiedWeightedLoss
 from chemflow.model.cfg import CFGAdapter
-from chemflow.utils.loss_weighing import InverseSquaredTimeLossWeighting, ConstantTimeLossWeighting, ShiftedParabolaTimeLossWeighting
-from chemflow.utils.rdkit import mol_is_valid
+from chemflow.utils.loss_weighing import (
+    InverseSquaredTimeLossWeighting,
+    ConstantTimeLossWeighting,
+    ShiftedParabolaTimeLossWeighting,
+)
+from chemflow.utils import rdkit as chemflowRD
 
 
 class LightningModuleRates(pl.LightningModule):
@@ -255,13 +259,13 @@ class LightningModuleRates(pl.LightningModule):
             "ins": lambda t: self.integrator.ins_schedule.rate(t).clamp(max=100.0),
             "del": lambda t: self.integrator.del_schedule.rate(t).clamp(max=100.0),
             "sub": lambda t: self.integrator.sub_schedule.rate(t).clamp(max=100.0),
-            "budget": lambda t: self.integrator.ins_schedule.rate(t).clamp(max=100.0)
+            "budget": lambda t: self.integrator.ins_schedule.rate(t).clamp(max=100.0),
         }
 
         self.loss_accumulator = LossAccumulator(
             self.loss_weight_wrapper, self.LOSS_GROUPS, self.device, time_weights
         )
-        
+
         self.is_compiled = False
 
     def compile(self):
@@ -410,8 +414,9 @@ class LightningModuleRates(pl.LightningModule):
 
         return self._reduce_loss(do_action_loss, reduction)
 
-
-    def rate_loss(self, rate_pred, num_actions, batch, num_graphs, reduction: str = "mean"):
+    def rate_loss(
+        self, rate_pred, num_actions, batch, num_graphs, reduction: str = "mean"
+    ):
         """
         Calculate the Poisson NLL rate loss for insertion predictions.
 
@@ -447,11 +452,18 @@ class LightningModuleRates(pl.LightningModule):
             )
             > 0
         )
-        
+
         return self._reduce_loss(rate_loss, reduction), batch_has_modified
 
     def class_loss(
-        self, class_pred, class_target, class_weights, num_actions, batch, num_graphs, reduction: str = "mean",
+        self,
+        class_pred,
+        class_target,
+        class_weights,
+        num_actions,
+        batch,
+        num_graphs,
+        reduction: str = "mean",
     ):
         """
         Calculate the class loss for the given class predictions and target classes.
@@ -487,10 +499,12 @@ class LightningModuleRates(pl.LightningModule):
             )
             > 0
         )
-        
+
         return self._reduce_loss(class_loss, reduction), batch_has_modified
 
-    def global_budget_loss(self, graph_rate_pred, target_budget, reduction: str = "mean"):
+    def global_budget_loss(
+        self, graph_rate_pred, target_budget, reduction: str = "mean"
+    ):
         """
         Calculate global budget loss from graph-level expected action counts.
 
@@ -594,7 +608,10 @@ class LightningModuleRates(pl.LightningModule):
 
         # NOTE As per EditFlow, only count class loss for edges that need modification
         do_sub_e_loss = self.do_action_loss(
-            do_sub_e_head_triu, do_sub_e_target_triu, e_batch_triu, mols_t.num_graphs, 
+            do_sub_e_head_triu,
+            do_sub_e_target_triu,
+            e_batch_triu,
+            mols_t.num_graphs,
             reduction="none",
         )
         sub_e_class_loss, sub_e_batch_mask = self.class_loss(
@@ -609,7 +626,7 @@ class LightningModuleRates(pl.LightningModule):
 
         do_del_loss = torch.tensor(0.0, device=self.device)
         do_ins_loss = torch.tensor(0.0, device=self.device)
-        
+
         if self.n_atoms_strategy != "fixed":
             # TODO maybe we should weight the deletion loss and insertion loss by their number of deletions and insertions?
             # TODO e.g. w = n_del / (n_del + n_ins)
@@ -648,7 +665,10 @@ class LightningModuleRates(pl.LightningModule):
 
                 # mask indicating which nodes are focal for insertion
                 ins_loss_rate, ins_batch_mask = self.rate_loss(
-                    ins_rate_pred, num_inserts_per_node, mols_t.batch, mols_t.num_graphs,
+                    ins_rate_pred,
+                    num_inserts_per_node,
+                    mols_t.batch,
+                    mols_t.num_graphs,
                     reduction="none",
                 )
 
@@ -937,14 +957,34 @@ class LightningModuleRates(pl.LightningModule):
 
         # do quick validity check of the generated molecules
         # take the last state of the trajectory and check validity
-        last_mols_rdkit = [i[-1].to_rdkit_mol(self.vocab.atom_tokens, self.vocab.edge_tokens, self.vocab.charge_tokens) for i in gen_mols]
-        mol_is_valid = [mol_is_valid(mol) for mol in last_mols_rdkit]
+        last_mols_rdkit = [
+            i[-1].to_rdkit_mol(
+                self.vocab.atom_tokens, self.vocab.edge_tokens, self.vocab.charge_tokens
+            )
+            for i in gen_mols
+        ]
+        mol_is_valid = []
+        for mol in last_mols_rdkit:
+            if mol is None:
+                mol_is_valid.append(False)
+                continue
+            try:
+                mol_is_valid.append(chemflowRD.mol_is_valid(mol))
+            except Exception as e:
+                print(f"Error checking validity of molecule: {e}")
+                mol_is_valid.append(False)
 
-        valid_mols = [i for i, valid in zip(last_mols_rdkit, mol_is_valid) if valid]
-        invalid_mols = [i for i, valid in zip(last_mols_rdkit, mol_is_valid) if not valid]
+        valid_mols = [i for i, valid in zip(gen_mols, mol_is_valid) if valid]
+        invalid_mols = [i[-1] for i, valid in zip(gen_mols, mol_is_valid) if not valid]
+        invalid_mols_rdkit = [
+            i for i, valid in zip(last_mols_rdkit, mol_is_valid) if not valid
+        ]
 
-        return valid_mols, invalid_mols
-
+        return {
+            "valid_mols": valid_mols,
+            "invalid_mols": invalid_mols,
+            "invalid_mols_rdkit": invalid_mols_rdkit,
+        }
 
     def sample(
         self,
