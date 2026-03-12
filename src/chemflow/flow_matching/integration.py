@@ -430,13 +430,15 @@ class RateIntegrator:
                 e_t_ins = None
 
                 if ins_edge_head is not None and h_latent is not None:
-                    orig_spawn_idx, orig_target_idx, ins_edge_logits = (
+                    orig_spawn_idx, orig_existing_idx, ins_edge_logits = (
                         ins_edge_head.predict_edges_for_insertion(
                             h=h_latent,
                             x=x_t_original,
-                            gmm_dict=ins_gmm_preds,
                             batch=batch_id,
                             insertion_mask=do_ins_valid,
+                            ins_x=new_atoms.x,
+                            ins_a=new_atoms.a,
+                            ins_c=new_atoms.c,
                         )
                     )
 
@@ -469,9 +471,9 @@ class RateIntegrator:
                         # This works for both deleted and non-deleted spawn nodes
                         ins_edge_new_atom_idx = orig_to_new_atom[orig_spawn_idx]
 
-                        # Map target indices to post-deletion space
-                        # Targets must exist in the post-deletion molecule
-                        ins_edge_target_idx = original_to_postdel[orig_target_idx]
+                        # Map existing-endpoint indices to post-deletion space.
+                        # Endpoints must still exist in the post-deletion molecule.
+                        ins_edge_target_idx = original_to_postdel[orig_existing_idx]
 
                         # Filter out edges where:
                         # - Target was deleted (target doesn't exist in mol)

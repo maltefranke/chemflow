@@ -316,10 +316,9 @@ class InsertionEdgeHead(nn.Module):
     to all other existing nodes in the same graph.
 
     The prediction is based on:
-    1. The predicted insertion position (from GMM mean)
-    2. The predicted atom type and charge of the inserted node (from GMM)
-    3. The features/positions of existing nodes
-    4. The features of the spawn node
+    1. Inserted node position/type/charge provided by caller
+    2. Features/positions of existing nodes
+    3. Features of the spawn node
     """
 
     def __init__(
@@ -350,12 +349,11 @@ class InsertionEdgeHead(nn.Module):
             "out_dim", rbf_embedding_args.get("num_rbf", 16)
         )
 
-        # Embeddings for inserted node's atom type and charge (from GMM probabilities)
-        # We use the probability vectors directly as soft embeddings
+        # One-hot atom/charge features for inserted nodes.
         ins_type_feat_dim = n_atom_types + n_charge_types
 
         # MLP for edge prediction
-        # Input: [h_spawn, h_existing, distance_features, ins_atom_probs, ins_charge_probs]
+        # Input: [h_spawn, h_existing, distance_features, ins_atom_one_hot, ins_charge_one_hot]
         input_dim = hidden_dim * 2 + dist_feat_dim + ins_type_feat_dim
         self.edge_mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -381,91 +379,40 @@ class InsertionEdgeHead(nn.Module):
         self,
         h: torch.Tensor,
         x: torch.Tensor,
-        gmm_dict: dict,
         spawn_node_idx: torch.Tensor,
-        target_node_idx: torch.Tensor,
-        hard_sampling: bool = True,  # Controls both Component and Type sampling
+        existing_node_idx: torch.Tensor,
+        ins_x: torch.Tensor,
+        ins_a: torch.Tensor,
+        ins_c: torch.Tensor,
     ) -> torch.Tensor:
         if spawn_node_idx.numel() == 0:
             return torch.empty((0, self.n_edge_types), device=h.device)
 
-        # ------------------------------------------------------------------
-        # 1. PREPARE GMM PARAMETERS
-        # ------------------------------------------------------------------
-        # Slice the GMM dictionary for the relevant spawn nodes
-        # pi: [E_ins, K]
-        pi_spawn = gmm_dict["pi"][spawn_node_idx].detach()
-
-        # mu, sigma: [E_ins, K, 3]
-        mu_spawn = gmm_dict["mu"][spawn_node_idx].detach()
-        # Ensure sigma is positive (softplus or exp usually done in model output)
-        sigma_spawn = gmm_dict["sigma"][spawn_node_idx].detach()
-
-        # probs: [E_ins, K, n_types]
-        a_probs_spawn = gmm_dict["a_probs"][spawn_node_idx].detach()
-        c_probs_spawn = gmm_dict["c_probs"][spawn_node_idx].detach()
-
-        # ------------------------------------------------------------------
-        # 2. HIERARCHICAL SAMPLING
-        # ------------------------------------------------------------------
-
-        # A. Sample the Mixture Component (z)
-        # -----------------------------------
-        # We use log-probs for Gumbel. Add epsilon for stability.
-        z_logits = torch.log(pi_spawn + 1e-9)
-
-        # z: [E_ins, K] (One-hot if hard=True)
-        # NOTE: Since we detach, the differentiation through discrete types is actually not used
-        z = F.gumbel_softmax(z_logits, tau=1.0, hard=hard_sampling)
-
-        # B. Sample Position (x) - Gaussian Reparameterization
-        # ----------------------------------------------------
-        # Select mean and sigma for the chosen component using einsum
-        # [E_ins, K] * [E_ins, K, 3] -> [E_ins, 3]
-        mu_selected = torch.einsum("bk, bkx -> bx", z, mu_spawn)
-        sigma_selected = torch.einsum("bk, bk -> b", z, sigma_spawn)
-        sigma_selected = sigma_selected.unsqueeze(-1)
-
-        # Standard Normal Noise
-        epsilon = torch.randn_like(mu_selected)
-
-        # Reparameterize: x = mu + sigma * eps
-        insertion_pos = mu_selected + sigma_selected * epsilon
-
-        # C. Sample Atom/Charge Types (a, c) - Gumbel Reparameterization
-        # --------------------------------------------------------------
-        # First, select the probability vector for the chosen component
-        # [E_ins, K] * [E_ins, K, n_atom] -> [E_ins, n_atom]
-        a_probs_selected = torch.einsum("bk, bkc -> bc", z, a_probs_spawn)
-        c_probs_selected = torch.einsum("bk, bkc -> bc", z, c_probs_spawn)
-
-        # Now sample the specific type from that selected probability vector
-        # This is the "Sample a given k" step
-        a_logits = torch.log(a_probs_selected + 1e-9)
-        c_logits = torch.log(c_probs_selected + 1e-9)
-
-        # ins_atom_type: [E_ins, n_atom] (One-hot)
-        ins_atom_type = F.gumbel_softmax(a_logits, tau=1.0, hard=hard_sampling)
-        ins_charge_type = F.gumbel_softmax(c_logits, tau=1.0, hard=hard_sampling)
+        insertion_pos = ins_x.detach()
+        ins_atom_type = F.one_hot(ins_a.long(), num_classes=self.n_atom_types).to(
+            dtype=h.dtype, device=h.device
+        )
+        ins_charge_type = F.one_hot(ins_c.long(), num_classes=self.n_charge_types).to(
+            dtype=h.dtype, device=h.device
+        )
 
         # ------------------------------------------------------------------
         # 3. EDGE PREDICTION
         # ------------------------------------------------------------------
 
-        # Get target positions and compute distance based on SAMPLED insertion_pos
-        # make sure gradients for edge prediction are not backpropagated to the pos predictions
+        # Use fixed insertion attributes to decouple edge prediction from GMM sampling.
         x = x.detach()
-        target_pos = x[target_node_idx]
-        distances = torch.norm(insertion_pos - target_pos, dim=-1).clamp(min=1e-6)
+        existing_pos = x[existing_node_idx]
+        distances = torch.norm(insertion_pos - existing_pos, dim=-1).clamp(min=1e-6)
         dist_features = self.rbf_embedding(distances)
 
         h_spawn = h[spawn_node_idx]
-        h_target = h[target_node_idx]
+        # "existing" refers to the already-present node endpoint in current state.
+        h_existing = h[existing_node_idx]
 
         # Concatenate features.
-        # Note: We pass the sampled 'ins_atom_type' (one-hot), not the raw probs.
         edge_features = torch.cat(
-            [h_spawn, h_target, dist_features, ins_atom_type, ins_charge_type],
+            [h_spawn, h_existing, dist_features, ins_atom_type, ins_charge_type],
             dim=-1,
         )
 
@@ -477,10 +424,11 @@ class InsertionEdgeHead(nn.Module):
         self,
         h: torch.Tensor,
         x: torch.Tensor,
-        gmm_dict: dict,
         batch: torch.Tensor,
         insertion_mask: torch.Tensor,
-        hard_sampling: bool = True,
+        ins_x: torch.Tensor,
+        ins_a: torch.Tensor,
+        ins_c: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Predict edges for all insertions to all other nodes in the same graph.
@@ -490,13 +438,15 @@ class InsertionEdgeHead(nn.Module):
         Args:
             h: [N, hidden_dim] - Node features
             x: [N, 3] - Node positions
-            gmm_dict: dict with GMM parameters
             batch: [N] - Batch assignment
             insertion_mask: [N] - Boolean mask of nodes that will spawn insertions
+            ins_x: [N_ins, 3] - Inserted node positions aligned with insertion_mask True indices
+            ins_a: [N_ins] - Inserted atom types aligned with insertion_mask True indices
+            ins_c: [N_ins] - Inserted charge types aligned with insertion_mask True indices
 
         Returns:
             spawn_idx: [E_ins] - Spawn node indices
-            target_idx: [E_ins] - Target node indices
+            existing_idx: [E_ins] - Existing endpoint node indices
             edge_logits: [E_ins, n_edge_types] - Edge type logits
         """
         device = h.device
@@ -511,27 +461,38 @@ class InsertionEdgeHead(nn.Module):
 
         # Build pairs: (spawn_node, all nodes in same graph including spawn)
         spawn_list = []
-        target_list = []
+        existing_list = []
+        ins_x_list = []
+        ins_a_list = []
+        ins_c_list = []
 
-        for ins_idx in insertion_indices:
+        for local_idx, ins_idx in enumerate(insertion_indices):
             graph_id = batch[ins_idx]
             same_graph_mask = batch == graph_id
-            target_indices = torch.where(same_graph_mask)[0]
+            existing_indices = torch.where(same_graph_mask)[0]
+            n_existing = len(existing_indices)
 
-            spawn_list.append(ins_idx.expand(len(target_indices)))
-            target_list.append(target_indices)
+            spawn_list.append(ins_idx.expand(n_existing))
+            existing_list.append(existing_indices)
+            ins_x_list.append(ins_x[local_idx].unsqueeze(0).expand(n_existing, -1))
+            ins_a_list.append(ins_a[local_idx].expand(n_existing))
+            ins_c_list.append(ins_c[local_idx].expand(n_existing))
 
         spawn_idx = torch.cat(spawn_list)
-        target_idx = torch.cat(target_list)
+        existing_idx = torch.cat(existing_list)
+        ins_x_expanded = torch.cat(ins_x_list, dim=0)
+        ins_a_expanded = torch.cat(ins_a_list, dim=0)
+        ins_c_expanded = torch.cat(ins_c_list, dim=0)
 
         # Predict edge types
         edge_logits = self.forward(
             h,
             x,
-            gmm_dict,
             spawn_idx,
-            target_idx,
-            hard_sampling,
+            existing_idx,
+            ins_x_expanded,
+            ins_a_expanded,
+            ins_c_expanded,
         )
 
-        return spawn_idx, target_idx, edge_logits
+        return spawn_idx, existing_idx, edge_logits

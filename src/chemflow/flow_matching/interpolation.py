@@ -187,6 +187,7 @@ class Interpolator:
         ins_targets_list = []
 
         offset = 0
+        ins_offset = 0
         for b in range(len(t)):
             mol_t, mol_1, ins_targets = self.interpolate_single(
                 samples_batched[b], targets_batched[b], t[b].item()
@@ -204,15 +205,21 @@ class Interpolator:
             ):
                 ins_targets.ins_edge_spawn_idx.add_(offset)
             if (
-                hasattr(ins_targets, "ins_edge_target_idx")
-                and ins_targets.ins_edge_target_idx.numel() > 0
+                hasattr(ins_targets, "ins_edge_existing_idx")
+                and ins_targets.ins_edge_existing_idx.numel() > 0
             ):
-                ins_targets.ins_edge_target_idx.add_(offset)
+                ins_targets.ins_edge_existing_idx.add_(offset)
+            if (
+                hasattr(ins_targets, "ins_edge_ins_local_idx")
+                and ins_targets.ins_edge_ins_local_idx.numel() > 0
+            ):
+                ins_targets.ins_edge_ins_local_idx.add_(ins_offset)
 
             mol_t_list.append(mol_t)
             mol_1_list.append(mol_1)
             ins_targets_list.append(ins_targets)
             offset += mol_t.num_nodes
+            ins_offset += ins_targets.num_nodes
 
         mol_t = MoleculeBatch.from_data_list(mol_t_list)
         mol_1 = MoleculeBatch.from_data_list(mol_1_list)
@@ -380,7 +387,6 @@ class Interpolator:
         # F. Filter nodes
         # `mask_future_ins` is defined in the original OT-aligned node space.
         # Apply it before `mask_exists` compaction to keep index spaces consistent.
-        ins_nodes_t = filter_nodes(interp_state_full, mask_future_ins.squeeze())
         ins_nodes = filter_nodes(target, mask_future_ins.squeeze())
         interp_state = filter_nodes(interp_state_full, mask_exists.squeeze())
         target_state = filter_nodes(target, mask_exists.squeeze())
@@ -390,9 +396,8 @@ class Interpolator:
         num_ins_nodes = ins_nodes.x.shape[0]
         ins_counts = torch.zeros(num_interp_nodes, device=device)
 
-        if num_ins_nodes > 0 and num_interp_nodes > 0:
+        if num_ins_nodes > 0:
             t_kappa = self.sub_schedule.kappa_t(t_i)
-            t_kappa_e = self.sub_e_schedule.kappa_t(t_i)
             a_target_one_hot = F.one_hot(
                 ins_nodes.a, num_classes=len(self.vocab.atom_tokens)
             )
@@ -406,6 +411,20 @@ class Interpolator:
             ins_nodes.ins_atom_logits = p_t_a
             ins_nodes.ins_charge_logits = p_t_c
 
+        else:
+            ins_nodes.ins_atom_logits = torch.empty(
+                (0, len(self.vocab.atom_tokens)),
+                device=device,
+                dtype=self._cat_atom.probs.dtype,
+            )
+            ins_nodes.ins_charge_logits = torch.empty(
+                (0, len(self.vocab.charge_tokens)),
+                device=device,
+                dtype=self._cat_charge.probs.dtype,
+            )
+
+        if num_ins_nodes > 0 and num_interp_nodes > 0:
+            t_kappa_e = self.sub_e_schedule.kappa_t(t_i)
             dists = torch.cdist(ins_nodes.x, interp_state.x)
             spawn_idx_local = torch.argmin(dists, dim=1).to(device)
 
@@ -449,14 +468,18 @@ class Interpolator:
                 ins_edge_dst_local = orig_to_interp[ins_edge_dst_orig]
 
                 ins_nodes.ins_edge_spawn_idx = spawn_idx_local[ins_edge_src_local]
-                ins_nodes.ins_edge_target_idx = ins_edge_dst_local
+                ins_nodes.ins_edge_existing_idx = ins_edge_dst_local
                 ins_nodes.ins_edge_types = ins_edge_types
+                # Local index (in future_ins_nodes) of the inserted node for each
+                # insertion-edge supervision pair; used to gather x/a/c downstream.
+                ins_nodes.ins_edge_ins_local_idx = ins_edge_src_local
                 ins_nodes.ins_edge_logits = p_t_e
+
             else:
                 ins_nodes.ins_edge_spawn_idx = torch.empty(
                     (0,), device=device, dtype=torch.long
                 )
-                ins_nodes.ins_edge_target_idx = torch.empty(
+                ins_nodes.ins_edge_existing_idx = torch.empty(
                     (0,), device=device, dtype=torch.long
                 )
                 ins_nodes.ins_edge_types = torch.empty(
@@ -467,24 +490,17 @@ class Interpolator:
                     device=device,
                     dtype=self._cat_edge.probs.dtype,
                 )
+                ins_nodes.ins_edge_ins_local_idx = torch.empty(
+                    (0,), device=device, dtype=torch.long
+                )
         else:
-            ins_nodes.ins_atom_logits = torch.empty(
-                (0, len(self.vocab.atom_tokens)),
-                device=device,
-                dtype=self._cat_atom.probs.dtype,
-            )
-            ins_nodes.ins_charge_logits = torch.empty(
-                (0, len(self.vocab.charge_tokens)),
-                device=device,
-                dtype=self._cat_charge.probs.dtype,
-            )
             ins_nodes.spawn_node_idx = torch.empty(
                 (0,), device=device, dtype=torch.long
             )
             ins_nodes.ins_edge_spawn_idx = torch.empty(
                 (0,), device=device, dtype=torch.long
             )
-            ins_nodes.ins_edge_target_idx = torch.empty(
+            ins_nodes.ins_edge_existing_idx = torch.empty(
                 (0,), device=device, dtype=torch.long
             )
             ins_nodes.ins_edge_types = torch.empty(
@@ -494,6 +510,9 @@ class Interpolator:
                 (0, len(self.vocab.edge_tokens)),
                 device=device,
                 dtype=self._cat_edge.probs.dtype,
+            )
+            ins_nodes.ins_edge_ins_local_idx = torch.empty(
+                (0,), device=device, dtype=torch.long
             )
 
         # H. Attach rate targets
