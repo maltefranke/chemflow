@@ -703,16 +703,18 @@ class LightningModuleRates(pl.LightningModule):
                 ins_loss_gmm = self._reduce_loss(ins_loss_gmm, "none")
 
                 # Compute insertion edge loss if available
-                # Validate indices are within bounds
+                # Index spaces:
+                # - ins_edge_spawn_idx / ins_edge_existing_idx index current-state nodes in mols_t
+                # - ins_edge_ins_local_idx indexes inserted nodes in ins_targets (future nodes)
                 spawn_idx = ins_targets.ins_edge_spawn_idx
-                target_idx = ins_targets.ins_edge_target_idx
+                existing_idx = ins_targets.ins_edge_existing_idx
 
                 # make sure there are insertions to predict edges for
                 assert spawn_idx.numel() > 0, (
                     "No insertions spawn points to predict edges for"
                 )
-                assert target_idx.numel() > 0, (
-                    "No insertions target points to predict edges for"
+                assert existing_idx.numel() > 0, (
+                    "No insertion-edge existing endpoints to predict"
                 )
 
                 # Get edge predictions using the insertion edge head
@@ -720,8 +722,11 @@ class LightningModuleRates(pl.LightningModule):
                     mols_t=mols_t,
                     out_dict=preds,
                     spawn_node_idx=spawn_idx,
-                    target_node_idx=target_idx,
-                    hard_sampling=True,
+                    existing_node_idx=existing_idx,
+                    # Use canonical future node tensors and gather per-edge inserted attrs.
+                    ins_x=ins_targets.x[ins_targets.ins_edge_ins_local_idx],
+                    ins_a=ins_targets.a[ins_targets.ins_edge_ins_local_idx],
+                    ins_c=ins_targets.c[ins_targets.ins_edge_ins_local_idx],
                 )
                 if ins_edge_logits is not None and ins_edge_logits.numel() > 0:
                     ins_loss_e = F.cross_entropy(

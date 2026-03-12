@@ -163,22 +163,24 @@ class BackboneWithHeads(nn.Module):
         mols_t: MoleculeBatch,
         out_dict: Dict[str, Any],
         spawn_node_idx: torch.Tensor,
-        target_node_idx: torch.Tensor,
-        hard_sampling: bool = True,
+        existing_node_idx: torch.Tensor,
+        ins_x: torch.Tensor,
+        ins_a: torch.Tensor,
+        ins_c: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        """Predict edge types between insertion points and existing nodes."""
+        """Predict edge types between inserted nodes and existing current-state nodes."""
 
         x = mols_t.x
         h = out_dict["h_latent"]
-        gmm_dict = out_dict["gmm_head"]
 
         return self.ins_edge_head(
             h=h,
             x=x,
-            gmm_dict=gmm_dict,
             spawn_node_idx=spawn_node_idx,
-            target_node_idx=target_node_idx,
-            hard_sampling=hard_sampling,
+            existing_node_idx=existing_node_idx,
+            ins_x=ins_x,
+            ins_a=ins_a,
+            ins_c=ins_c,
         )
 
     def forward(

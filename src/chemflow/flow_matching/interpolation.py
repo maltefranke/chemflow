@@ -187,6 +187,7 @@ class Interpolator:
         ins_targets_list = []
 
         offset = 0
+        ins_offset = 0
         for b in range(len(t)):
             mol_t, mol_1, ins_targets = self.interpolate_single(
                 samples_batched[b], targets_batched[b], t[b].item()
@@ -204,15 +205,21 @@ class Interpolator:
             ):
                 ins_targets.ins_edge_spawn_idx.add_(offset)
             if (
-                hasattr(ins_targets, "ins_edge_target_idx")
-                and ins_targets.ins_edge_target_idx.numel() > 0
+                hasattr(ins_targets, "ins_edge_existing_idx")
+                and ins_targets.ins_edge_existing_idx.numel() > 0
             ):
-                ins_targets.ins_edge_target_idx.add_(offset)
+                ins_targets.ins_edge_existing_idx.add_(offset)
+            if (
+                hasattr(ins_targets, "ins_edge_ins_local_idx")
+                and ins_targets.ins_edge_ins_local_idx.numel() > 0
+            ):
+                ins_targets.ins_edge_ins_local_idx.add_(ins_offset)
 
             mol_t_list.append(mol_t)
             mol_1_list.append(mol_1)
             ins_targets_list.append(ins_targets)
             offset += mol_t.num_nodes
+            ins_offset += ins_targets.num_nodes
 
         mol_t = MoleculeBatch.from_data_list(mol_t_list)
         mol_1 = MoleculeBatch.from_data_list(mol_1_list)
@@ -417,16 +424,23 @@ class Interpolator:
                 future_ins_nodes.ins_edge_spawn_idx = spawn_idx_local[
                     ins_edge_src_local
                 ]
-                future_ins_nodes.ins_edge_target_idx = ins_edge_dst_local
+                # Existing endpoint in interp_state index space (not future nodes).
+                future_ins_nodes.ins_edge_existing_idx = ins_edge_dst_local
                 future_ins_nodes.ins_edge_types = ins_edge_types
+                # Local index (in future_ins_nodes) of the inserted node for each
+                # insertion-edge supervision pair; used to gather x/a/c downstream.
+                future_ins_nodes.ins_edge_ins_local_idx = ins_edge_src_local
             else:
                 future_ins_nodes.ins_edge_spawn_idx = torch.empty(
                     (0,), device=device, dtype=torch.long
                 )
-                future_ins_nodes.ins_edge_target_idx = torch.empty(
+                future_ins_nodes.ins_edge_existing_idx = torch.empty(
                     (0,), device=device, dtype=torch.long
                 )
                 future_ins_nodes.ins_edge_types = torch.empty(
+                    (0,), device=device, dtype=torch.long
+                )
+                future_ins_nodes.ins_edge_ins_local_idx = torch.empty(
                     (0,), device=device, dtype=torch.long
                 )
         else:
@@ -436,10 +450,13 @@ class Interpolator:
             future_ins_nodes.ins_edge_spawn_idx = torch.empty(
                 (0,), device=device, dtype=torch.long
             )
-            future_ins_nodes.ins_edge_target_idx = torch.empty(
+            future_ins_nodes.ins_edge_existing_idx = torch.empty(
                 (0,), device=device, dtype=torch.long
             )
             future_ins_nodes.ins_edge_types = torch.empty(
+                (0,), device=device, dtype=torch.long
+            )
+            future_ins_nodes.ins_edge_ins_local_idx = torch.empty(
                 (0,), device=device, dtype=torch.long
             )
 

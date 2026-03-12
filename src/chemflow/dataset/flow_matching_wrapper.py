@@ -89,6 +89,7 @@ def train_collate_fn(batch):
     t_list = []
 
     offset = 0
+    ins_offset = 0
     for mol_t, mol_1, ins_targets, t in batch:
         if (
             hasattr(ins_targets, "spawn_node_idx")
@@ -101,10 +102,15 @@ def train_collate_fn(batch):
         ):
             ins_targets.ins_edge_spawn_idx.add_(offset)
         if (
-            hasattr(ins_targets, "ins_edge_target_idx")
-            and ins_targets.ins_edge_target_idx.numel() > 0
+            hasattr(ins_targets, "ins_edge_existing_idx")
+            and ins_targets.ins_edge_existing_idx.numel() > 0
         ):
-            ins_targets.ins_edge_target_idx.add_(offset)
+            ins_targets.ins_edge_existing_idx.add_(offset)
+        if (
+            hasattr(ins_targets, "ins_edge_ins_local_idx")
+            and ins_targets.ins_edge_ins_local_idx.numel() > 0
+        ):
+            ins_targets.ins_edge_ins_local_idx.add_(ins_offset)
 
         mol_t_list.append(mol_t)
         mol_1_list.append(mol_1)
@@ -112,6 +118,7 @@ def train_collate_fn(batch):
         t_list.append(t)
 
         offset += mol_t.num_nodes
+        ins_offset += ins_targets.num_nodes
 
     mol_t_batch = MoleculeBatch.from_data_list(mol_t_list)
     mol_1_batch = MoleculeBatch.from_data_list(mol_1_list)
