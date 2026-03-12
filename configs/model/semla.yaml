@@ -18,6 +18,7 @@ integrator:
   # NOTE can be different from the time strategy used for the model (see below)
   time_strategy: log # "linear" or "log"
   num_integration_steps: 200
+  ins_noise_scale: ${data.ins_noise_scale}
   del_schedule: ${data.interpolator.del_schedule}
   ins_schedule: ${data.interpolator.ins_schedule}
   sub_schedule: ${data.interpolator.sub_schedule}

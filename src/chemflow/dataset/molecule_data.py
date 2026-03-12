@@ -4,7 +4,7 @@ from torch_geometric.utils import to_dense_adj
 from rdkit import Chem
 import numpy as np
 
-from chemflow.utils.utils  import index_to_token, EdgeAligner
+from chemflow.utils.utils import index_to_token, EdgeAligner
 from external_code.egnn import unsorted_segment_mean
 
 from torch_geometric.utils import sort_edge_index
@@ -675,167 +675,10 @@ def join_molecules_with_atoms(
     return result
 
 
-def join_molecules_with_predicted_edges_old(
-    mol: MoleculeBatch,
-    new_atoms: PointCloud,
-    ins_edge_logits: torch.Tensor,
-    spawn_node_idx: torch.Tensor,
-    target_node_idx: torch.Tensor,
-    fallback_edge_dist: torch.Tensor,
-) -> MoleculeBatch:
-    """
-    Join molecules with new atoms using predicted edge types instead of random sampling.
-    Works on upper triangular edges only, then symmetrizes.
-
-    IMPORTANT: spawn_node_idx and target_node_idx must be in post-deletion index space,
-    i.e., they should be valid indices into `mol`.
-
-    Args:
-        mol: Current molecule batch (after any deletions)
-        new_atoms: New atoms to insert (with batch attribute set)
-        ins_edge_logits: [E_ins, n_edge_types] - Predicted edge logits for edges
-                         between new atoms and existing nodes
-        spawn_node_idx: [E_ins] - Spawn node indices in mol (nodes that triggered insertions)
-        target_node_idx: [E_ins] - Target node indices in mol (existing nodes to connect to)
-        fallback_edge_dist: Edge type distribution for edges between new atoms
-
-    Returns:
-        mol: Updated molecule batch with new atoms and predicted edges
-    """
-    device = mol.x.device
-    batch_ids = mol.batch
-    batch_ids_atoms = new_atoms.batch
-    num_existing_nodes = mol.x.shape[0]
-    num_new_atoms = new_atoms.x.shape[0]
-    edge_aligner = EdgeAligner()
-
-    # 1. Concatenate node features
-    new_x = torch.cat([mol.x, new_atoms.x], dim=0)
-    new_a = torch.cat([mol.a, new_atoms.a], dim=0)
-    new_c = torch.cat([mol.c, new_atoms.c], dim=0)
-    new_batch = torch.cat([batch_ids, batch_ids_atoms], dim=0)
-
-    # 2. Keep existing edges (already symmetric)
-    if mol.edge_index is not None and mol.edge_index.numel() > 0:
-        existing_edge_index = mol.edge_index.clone()
-        existing_e = mol.e.clone()
-    else:
-        existing_edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
-        existing_e = torch.empty((0,), dtype=torch.long, device=device)
-
-    # 3. Build mapping: spawn_node_idx (in mol) -> new_atom_idx
-    # Each unique spawn node spawns one new atom, in order
-    unique_spawn_nodes = spawn_node_idx.unique()
-    spawn_to_new_atom = {}
-    for i, spawn_idx in enumerate(unique_spawn_nodes.tolist()):
-        spawn_to_new_atom[spawn_idx] = i + num_existing_nodes
-
-    # 4. Create NEW edges in upper triangular form only (row < col)
-    new_edges_triu_list = []
-    new_e_triu_list = []
-
-    if ins_edge_logits is not None and ins_edge_logits.numel() > 0:
-        # Sample edge types from logits
-        edge_probs = torch.softmax(ins_edge_logits, dim=-1)
-        sampled_edge_types = Categorical(probs=edge_probs).sample()
-
-        # For each predicted edge, create upper triangular edge only
-        for i in range(len(spawn_node_idx)):
-            spawn_idx = spawn_node_idx[i].item()
-            target_idx = target_node_idx[i].item()
-            edge_type = sampled_edge_types[i].item()
-
-            # Validate indices are within bounds
-            if spawn_idx not in spawn_to_new_atom:
-                continue
-            if target_idx < 0 or target_idx >= num_existing_nodes:
-                continue
-
-            # CRITICAL: Validate that new atom and target are in the SAME batch
-            # spawn_idx is the new atom index (0, 1, 2, ...) into batch_ids_atoms
-            # target_idx is the existing node index into batch_ids
-            new_atom_batch = batch_ids_atoms[spawn_idx].item()
-            target_batch = batch_ids[target_idx].item()
-            if new_atom_batch != target_batch:
-                # Skip cross-batch edges - this should not happen if edge prediction
-                # was correct, but we enforce it here as a safety check
-                continue
-
-            new_atom_idx = spawn_to_new_atom[spawn_idx]
-
-            # Store in upper triangular form (min_idx, max_idx)
-            row = min(new_atom_idx, target_idx)
-            col = max(new_atom_idx, target_idx)
-            new_edges_triu_list.append([row, col])
-            new_e_triu_list.append(edge_type)
-
-    # 5. Create edges between new atoms in the same graph (upper triangular only)
-    edge_dist_cat = Categorical(probs=fallback_edge_dist)
-
-    for batch_id in batch_ids_atoms.unique():
-        atom_mask = batch_ids_atoms == batch_id
-        atom_indices = torch.where(atom_mask)[0] + num_existing_nodes
-
-        # Edges between new atoms (upper triangular: i < j)
-        if len(atom_indices) > 1:
-            for i, idx_i in enumerate(atom_indices):
-                for idx_j in atom_indices[i + 1 :]:
-                    edge_type = edge_dist_cat.sample().item()
-                    # idx_i < idx_j by construction
-                    new_edges_triu_list.append([idx_i.item(), idx_j.item()])
-                    new_e_triu_list.append(edge_type)
-
-    # 6. Symmetrize new edges and combine with existing
-    if len(new_edges_triu_list) > 0:
-        new_edge_index_triu = torch.tensor(
-            new_edges_triu_list, dtype=torch.long, device=device
-        ).T
-        new_e_triu = torch.tensor(new_e_triu_list, dtype=torch.long, device=device)
-
-        # Symmetrize the upper triangular edges
-        new_edge_index, new_e_attrs = edge_aligner.symmetrize_edges(
-            new_edge_index_triu, [new_e_triu]
-        )
-        new_e = new_e_attrs[0]
-
-        # Combine with existing edges
-        combined_edge_index = torch.cat([existing_edge_index, new_edge_index], dim=1)
-        combined_e = torch.cat([existing_e, new_e], dim=0)
-
-        # Sort for canonical ordering
-        combined_edge_index, combined_e = sort_edge_index(
-            combined_edge_index, combined_e
-        )
-    else:
-        combined_edge_index = existing_edge_index
-        combined_e = existing_e
-
-    # 7. Validate final edge indices are in bounds
-    total_nodes = num_existing_nodes + num_new_atoms
-    if combined_edge_index.numel() > 0:
-        assert combined_edge_index.max() < total_nodes, (
-            f"Edge index {combined_edge_index.max()} >= total nodes {total_nodes}"
-        )
-
-    # 8. Create result
-    result = MoleculeBatch(
-        x=new_x,
-        a=new_a,
-        c=new_c,
-        e=combined_e,
-        edge_index=combined_edge_index,
-        batch=new_batch,
-    )
-
-    result = sort_nodes_by_batch(result)
-
-    return result
-
-
 def join_molecules_with_predicted_edges(
     mol: MoleculeBatch,
     new_atoms: PointCloud,
-    ins_edge_logits: torch.Tensor,
+    e_ins: torch.Tensor,
     spawn_node_idx: torch.Tensor,
     target_node_idx: torch.Tensor,
     fallback_edge_dist: torch.Tensor,
@@ -877,15 +720,45 @@ def join_molecules_with_predicted_edges(
     new_edges_triu_list = []
     new_e_triu_list = []
 
-    if ins_edge_logits is not None and ins_edge_logits.numel() > 0:
-        edge_probs = torch.softmax(ins_edge_logits, dim=-1)
-        sampled_edge_types = Categorical(probs=edge_probs).sample()
+    if e_ins is not None and e_ins.numel() > 0:
+        # Accept edge classes [E] or per-edge class scores [E, T] (logits/probs).
+        if e_ins.dim() == 1:
+            edge_types = e_ins.to(dtype=torch.long)
+        elif e_ins.dim() == 2:
+            if torch.is_floating_point(e_ins):
+                probs_like = (
+                    torch.all(e_ins >= 0).item()
+                    and torch.all(e_ins <= 1).item()
+                    and torch.allclose(
+                        e_ins.sum(dim=-1),
+                        torch.ones(e_ins.shape[0], device=device, dtype=e_ins.dtype),
+                        atol=1e-4,
+                        rtol=1e-4,
+                    ).item()
+                )
+                if probs_like:
+                    edge_types = Categorical(probs=e_ins).sample()
+                else:
+                    edge_types = Categorical(logits=e_ins).sample()
+            else:
+                edge_types = torch.argmax(e_ins, dim=-1)
+            edge_types = edge_types.to(dtype=torch.long)
+        else:
+            raise ValueError(
+                f"Expected e_ins rank 1 or 2, got shape {tuple(e_ins.shape)}"
+            )
+
+        if edge_types.shape[0] != spawn_node_idx.shape[0]:
+            raise ValueError(
+                "e_ins and spawn_node_idx must match on first dimension: "
+                f"{edge_types.shape[0]} != {spawn_node_idx.shape[0]}"
+            )
 
         # Vectorizing this loop is hard due to the dictionary lookup, keeping Python loop is okay for sparse connectivity
         for i in range(len(spawn_node_idx)):
             spawn_idx = spawn_node_idx[i].item()  # Parent in mol
             target_idx = target_node_idx[i].item()  # Target in mol
-            edge_type = sampled_edge_types[i].item()
+            edge_type = int(edge_types[i].item())
 
             if spawn_idx not in spawn_to_new_atom_global:
                 continue

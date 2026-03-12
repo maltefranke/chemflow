@@ -165,13 +165,12 @@ class GEOM(Dataset):
             data = process_one_conformer(conformer)
             if data is not None:
                 data_list.append(data)
+        print(f"Successfully processed: {len(data_list)} molecules")
+        print(f"Failed: {len(all_conformers) - len(data_list)} molecules")
 
         # Clean up to free memory
         del all_conformers
         del all_smiles_list
-
-        print(f"Successfully processed: {len(data_list)} molecules")
-        print(f"Failed: {len(all_conformers) - len(data_list)} molecules")
 
         # Save processed data
         print(f"Saving processed data to {self.processed_file}...")
@@ -183,11 +182,8 @@ class GEOM(Dataset):
     def __getitem__(self, index):
         data = self.data_list[index]
 
-        # If vocab and distributions are provided, transform to MoleculeData
-        if self.vocab is not None and self.distributions is not None:
-            return self._transform_to_molecule_data(data)
-
         return data
+
 
 class FlowMatchingGEOMDataset(GEOM):
     def __init__(
@@ -238,4 +234,3 @@ class FlowMatchingGEOMDataset(GEOM):
             x=coord, a=atom_types, e=edge_types, c=charges, edge_index=data.edge_index
         )
         return data
-    

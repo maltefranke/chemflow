@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 from chemflow.model.gmm import (
     sample_from_typed_gmm,
@@ -50,6 +51,7 @@ class RateIntegrator:
         n_atoms_strategy="flexible",
         num_integration_steps=100,
         time_strategy="log",
+        ins_noise_scale=0.01,
         del_schedule: KappaSchedule | None = None,
         ins_schedule: KappaSchedule | None = None,
         sub_schedule: KappaSchedule | None = None,
@@ -59,6 +61,7 @@ class RateIntegrator:
         self.vocab = vocab
         self.distributions = distributions
         self.gmm_params = gmm_params
+        self.ins_noise_scale = ins_noise_scale
         self.n_atoms_strategy = n_atoms_strategy
         self.time_strategy = time_strategy
         self.num_integration_steps = num_integration_steps
@@ -89,6 +92,16 @@ class RateIntegrator:
         n_atoms_distribution = self.distributions.n_atoms_distribution
         self.max_atoms = len(n_atoms_distribution) + 1
 
+        self._cat_atom = torch.distributions.Categorical(
+            probs=distributions.atom_type_distribution.to(device)
+        )
+        self._cat_charge = torch.distributions.Categorical(
+            probs=distributions.charge_type_distribution.to(device)
+        )
+        self._cat_edge = torch.distributions.Categorical(
+            probs=distributions.edge_type_distribution.to(device)
+        )
+
     def get_time_steps(self, num_steps: int | None = None) -> list[float]:
         if num_steps is None:
             num_steps = self.num_integration_steps
@@ -114,16 +127,14 @@ class RateIntegrator:
     def sample_insertions(
         self,
         ins_gmm_dict: dict,
-        N_a: int,
-        N_c: int,
+        t: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample birth process for GNN (works with batch_ids).
 
         Args:
             ins_gmm_dict: dict - GMM parameters per graph
-            N_a: Number of atom types
-            N_c: Number of charge types
+            t: Time tensor
 
         Returns:
             new_atoms: PointCloud - new atoms
@@ -131,16 +142,44 @@ class RateIntegrator:
         # We will only do one insertion per provided GMM at a time
         num_ins = 1
 
+        K = self.gmm_params.K
+        D = self.gmm_params.D
+        A = len(self.vocab.atom_tokens)
+        C = len(self.vocab.charge_tokens)
+
         # Sample from GMM for this graph
         # Keep batch dimension
         sampled_x, sampled_a, sampled_c = sample_from_typed_gmm(
-            ins_gmm_dict, num_ins, self.gmm_params.K, self.gmm_params.D, N_a, N_c
+            ins_gmm_dict, num_ins, K, D, A, C
+        )
+
+        # now to interpolation depending on our schedules
+        t_kappa = self.sub_schedule.kappa_t(t).unsqueeze(1)
+        a_1_one_hot = F.one_hot(sampled_a, num_classes=A)
+        c_1_one_hot = F.one_hot(sampled_c, num_classes=C)
+
+        a = (
+            self._cat_atom.probs.repeat(c_1_one_hot.shape[0], 1, 1) * (1 - t_kappa)
+            + a_1_one_hot * t_kappa
+        )
+        a = F.softmax(a, dim=-1)
+        a = torch.distributions.Categorical(probs=a).sample()
+
+        c = (
+            self._cat_charge.probs.repeat(c_1_one_hot.shape[0], 1, 1) * (1 - t_kappa)
+            + c_1_one_hot * t_kappa
+        )
+        c = F.softmax(c, dim=-1)
+        c = torch.distributions.Categorical(probs=c).sample()
+
+        x = sampled_x + self.ins_noise_scale * torch.randn_like(
+            sampled_x, device=self.device
         )
 
         new_atoms = PointCloud(
-            x=sampled_x.view(-1, self.gmm_params.D),
-            a=sampled_a.view(-1),
-            c=sampled_c.view(-1),
+            x=x.view(-1, self.gmm_params.D),
+            a=a.view(-1),
+            c=c.view(-1),
         )
 
         return new_atoms
@@ -366,9 +405,7 @@ class RateIntegrator:
                 }
 
                 new_atoms = self.sample_insertions(
-                    ins_gmm_dict,
-                    len(self.vocab.atom_tokens),
-                    len(self.vocab.charge_tokens),
+                    ins_gmm_dict, t[batch_id[do_ins_valid]]
                 )
 
                 new_atoms.batch = batch_id[do_ins_valid]
@@ -390,6 +427,7 @@ class RateIntegrator:
                 ins_edge_logits = None
                 ins_edge_new_atom_idx = None
                 ins_edge_target_idx = None
+                e_t_ins = None
 
                 if ins_edge_head is not None and h_latent is not None:
                     orig_spawn_idx, orig_target_idx, ins_edge_logits = (
@@ -401,6 +439,30 @@ class RateIntegrator:
                             insertion_mask=do_ins_valid,
                         )
                     )
+
+                    # sample e1_ins_types
+                    ins_edge_probs = F.softmax(ins_edge_logits, dim=-1)
+                    e1_ins_types = torch.distributions.Categorical(
+                        probs=ins_edge_probs
+                    ).sample()
+                    e1_ins_types = F.one_hot(
+                        e1_ins_types, num_classes=len(self.vocab.edge_tokens)
+                    )
+
+                    # interpolate edge types
+                    t_kappa_e = self.sub_e_schedule.kappa_t(
+                        t[batch_id[orig_spawn_idx]]
+                    ).unsqueeze(1)
+
+                    prior_edge_probs = self._cat_edge.probs.unsqueeze(0).expand(
+                        e1_ins_types.shape[0], -1
+                    )
+                    e_t_ins = (
+                        prior_edge_probs * (1 - t_kappa_e)
+                        + e1_ins_types.to(dtype=prior_edge_probs.dtype) * t_kappa_e
+                    )
+                    e_t_ins = F.softmax(e_t_ins, dim=-1)
+                    e_t_ins = torch.distributions.Categorical(probs=e_t_ins).sample()
 
                     if ins_edge_logits is not None and ins_edge_logits.numel() > 0:
                         # Map spawn indices to new atom indices (0, 1, 2, ...)
@@ -421,15 +483,18 @@ class RateIntegrator:
                             ins_edge_new_atom_idx = ins_edge_new_atom_idx[valid_edges]
                             ins_edge_target_idx = ins_edge_target_idx[valid_edges]
                             ins_edge_logits = ins_edge_logits[valid_edges]
+                            e_t_ins = e_t_ins[valid_edges]
                         else:
                             ins_edge_logits = None
+                            e_t_ins = None
 
                 # Check if we have predicted edge logits for insertions
                 use_predicted_edges = (
                     ins_edge_logits is not None
                     and ins_edge_new_atom_idx is not None
                     and ins_edge_target_idx is not None
-                    and ins_edge_logits.numel() > 0
+                    and e_t_ins is not None
+                    and e_t_ins.numel() > 0
                 )
 
                 if use_predicted_edges:
@@ -439,7 +504,7 @@ class RateIntegrator:
                     mol = join_molecules_with_predicted_edges(
                         mol=mol,
                         new_atoms=new_atoms,
-                        ins_edge_logits=ins_edge_logits,
+                        e_ins=e_t_ins,
                         spawn_node_idx=ins_edge_new_atom_idx,
                         target_node_idx=ins_edge_target_idx,
                         fallback_edge_dist=edge_dist,
