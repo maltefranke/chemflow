@@ -349,12 +349,22 @@ class InsertionEdgeHead(nn.Module):
             "out_dim", rbf_embedding_args.get("num_rbf", 16)
         )
 
-        # One-hot atom/charge features for inserted nodes.
+        # One-hot atom/charge features for inserted node and one-hot atom feature
+        # for the existing endpoint node.
         ins_type_feat_dim = n_atom_types + n_charge_types
+        existing_atom_feat_dim = n_atom_types
 
-        # MLP for edge prediction
-        # Input: [h_spawn, h_existing, distance_features, ins_atom_one_hot, ins_charge_one_hot]
-        input_dim = hidden_dim * 2 + dist_feat_dim + ins_type_feat_dim
+        # MLP for edge prediction.
+        # Input:
+        # [h_spawn, rbf(d_spawn), existing_atom_one_hot, rbf(d_existing),
+        #  ins_atom_one_hot, ins_charge_one_hot]
+        input_dim = (
+            hidden_dim
+            + dist_feat_dim
+            + existing_atom_feat_dim
+            + dist_feat_dim
+            + ins_type_feat_dim
+        )
         self.edge_mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -375,10 +385,50 @@ class InsertionEdgeHead(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+    def _prepare_edge_features(
+        self,
+        h_spawn: torch.Tensor,
+        spawn_pos: torch.Tensor,
+        existing_pos: torch.Tensor,
+        existing_atom_idx: torch.Tensor,
+        ins_pos: torch.Tensor,
+        ins_a: torch.Tensor,
+        ins_c: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build edge-MLP features for insertion edge prediction."""
+        ins_atom_type = F.one_hot(ins_a.long(), num_classes=self.n_atom_types).to(
+            dtype=h_spawn.dtype, device=h_spawn.device
+        )
+        ins_charge_type = F.one_hot(ins_c.long(), num_classes=self.n_charge_types).to(
+            dtype=h_spawn.dtype, device=h_spawn.device
+        )
+
+        dist_to_spawn = torch.norm(ins_pos - spawn_pos, dim=-1).clamp(min=1e-6)
+        dist_to_existing = torch.norm(ins_pos - existing_pos, dim=-1).clamp(min=1e-6)
+        dist_spawn_features = self.rbf_embedding(dist_to_spawn)
+        dist_existing_features = self.rbf_embedding(dist_to_existing)
+
+        existing_atom_type = F.one_hot(
+            existing_atom_idx.long(), num_classes=self.n_atom_types
+        ).to(dtype=h_spawn.dtype, device=h_spawn.device)
+
+        return torch.cat(
+            [
+                h_spawn,
+                dist_spawn_features,
+                existing_atom_type,
+                dist_existing_features,
+                ins_atom_type,
+                ins_charge_type,
+            ],
+            dim=-1,
+        )
+
     def forward(
         self,
         h: torch.Tensor,
         x: torch.Tensor,
+        node_atom_types: torch.Tensor,
         spawn_node_idx: torch.Tensor,
         existing_node_idx: torch.Tensor,
         ins_x: torch.Tensor,
@@ -388,42 +438,58 @@ class InsertionEdgeHead(nn.Module):
         if spawn_node_idx.numel() == 0:
             return torch.empty((0, self.n_edge_types), device=h.device)
 
-        insertion_pos = ins_x.detach()
-        ins_atom_type = F.one_hot(ins_a.long(), num_classes=self.n_atom_types).to(
-            dtype=h.dtype, device=h.device
-        )
-        ins_charge_type = F.one_hot(ins_c.long(), num_classes=self.n_charge_types).to(
-            dtype=h.dtype, device=h.device
-        )
-
-        # ------------------------------------------------------------------
-        # 3. EDGE PREDICTION
-        # ------------------------------------------------------------------
-
         # Use fixed insertion attributes to decouple edge prediction from GMM sampling.
-        x = x.detach()
-        existing_pos = x[existing_node_idx]
-        distances = torch.norm(insertion_pos - existing_pos, dim=-1).clamp(min=1e-6)
-        dist_features = self.rbf_embedding(distances)
-
-        h_spawn = h[spawn_node_idx]
-        # "existing" refers to the already-present node endpoint in current state.
-        h_existing = h[existing_node_idx]
-
-        # Concatenate features.
-        edge_features = torch.cat(
-            [h_spawn, h_existing, dist_features, ins_atom_type, ins_charge_type],
-            dim=-1,
+        x_detached = x.detach()
+        edge_features = self._prepare_edge_features(
+            h_spawn=h[spawn_node_idx],
+            spawn_pos=x_detached[spawn_node_idx],
+            existing_pos=x_detached[existing_node_idx],
+            existing_atom_idx=node_atom_types[existing_node_idx],
+            ins_pos=ins_x.detach(),
+            ins_a=ins_a,
+            ins_c=ins_c,
         )
 
         edge_logits = self.edge_mlp(edge_features)
 
         return edge_logits
 
+    def forward_ins_to_ins(
+        self,
+        h: torch.Tensor,
+        x: torch.Tensor,
+        spawn_src_idx: torch.Tensor,
+        ins_x_src: torch.Tensor,
+        ins_a_src: torch.Tensor,
+        ins_c_src: torch.Tensor,
+        ins_a_dst: torch.Tensor,
+        ins_x_dst: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict edge type between two inserted nodes.
+
+        Reuses the same MLP as forward(), treating one inserted node as the
+        "inserted" side and the other inserted node as the "existing" side.
+        """
+        if spawn_src_idx.numel() == 0:
+            return torch.empty((0, self.n_edge_types), device=h.device)
+
+        x_detached = x.detach()
+        edge_features = self._prepare_edge_features(
+            h_spawn=h[spawn_src_idx],
+            spawn_pos=x_detached[spawn_src_idx],
+            existing_pos=ins_x_dst.detach(),
+            existing_atom_idx=ins_a_dst,
+            ins_pos=ins_x_src.detach(),
+            ins_a=ins_a_src,
+            ins_c=ins_c_src,
+        )
+        return self.edge_mlp(edge_features)
+
     def predict_edges_for_insertion(
         self,
         h: torch.Tensor,
         x: torch.Tensor,
+        node_atom_types: torch.Tensor,
         batch: torch.Tensor,
         insertion_mask: torch.Tensor,
         ins_x: torch.Tensor,
@@ -438,11 +504,15 @@ class InsertionEdgeHead(nn.Module):
         Args:
             h: [N, hidden_dim] - Node features
             x: [N, 3] - Node positions
+            node_atom_types: [N] - Atom type index for each current-state node
             batch: [N] - Batch assignment
             insertion_mask: [N] - Boolean mask of nodes that will spawn insertions
-            ins_x: [N_ins, 3] - Inserted node positions aligned with insertion_mask True indices
-            ins_a: [N_ins] - Inserted atom types aligned with insertion_mask True indices
-            ins_c: [N_ins] - Inserted charge types aligned with insertion_mask True indices
+            ins_x: [N_ins, 3] - Inserted node positions aligned with insertion_mask
+                True indices
+            ins_a: [N_ins] - Inserted atom types aligned with insertion_mask
+                True indices
+            ins_c: [N_ins] - Inserted charge types aligned with insertion_mask
+                True indices
 
         Returns:
             spawn_idx: [E_ins] - Spawn node indices
@@ -488,6 +558,7 @@ class InsertionEdgeHead(nn.Module):
         edge_logits = self.forward(
             h,
             x,
+            node_atom_types,
             spawn_idx,
             existing_idx,
             ins_x_expanded,

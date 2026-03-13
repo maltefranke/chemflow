@@ -1,7 +1,8 @@
 import torch
 
+
 class LossAccumulator:
-    """Per-step helper that collects raw losses, applies time and component weights, 
+    """Per-step helper that collects raw losses, applies time and component weights,
     and builds a uniform log dict separating pure losses from fully weighted losses.
 
     Args:
@@ -22,7 +23,7 @@ class LossAccumulator:
         self._groups = groups
         self._device = device
         self._time_weight_modules = time_weight_modules or {}
-        
+
         # Reverse mapping: component_key -> group_name for fast lookups
         self._key_to_group = {
             key: group for group, keys in groups.items() for key in keys
@@ -31,20 +32,20 @@ class LossAccumulator:
         # Track pure and time-weighted losses separately
         self._raw_losses: dict[str, torch.Tensor] = {}
         self._tw_losses: dict[str, torch.Tensor] = {}
-        
+
         self._stats: dict[str, torch.Tensor | float] = {}
         self._current_time_weights: dict[str, float] = {}
 
     # ── Population ───────────────────────────────────────────────────
 
     def set_batch_losses(
-        self, 
-        batch_losses: dict[str, torch.Tensor], 
+        self,
+        batch_losses: dict[str, torch.Tensor],
         t: torch.Tensor | None = None,
-        masks: dict[str, torch.Tensor] | None = None
+        masks: dict[str, torch.Tensor] | None = None,
     ):
         """Processes unreduced batch losses, applies time-weights, applies masks, and reduces.
-        
+
         Args:
             batch_losses: Dict of loss tensors, shape [num_graphs, ...]
             t: Time steps, shape [num_graphs]
@@ -55,7 +56,7 @@ class LossAccumulator:
         self._tw_losses.clear()
         self._current_time_weights.clear()
         masks = masks or {}
-        
+
         # Precompute time-weight tensors
         group_tw_tensors = {}
         if t is not None:
@@ -83,7 +84,7 @@ class LossAccumulator:
                 # Filter both the pure and time-weighted losses
                 valid_raw = loss_b[mask]
                 valid_tw = loss_tw_b[mask]
-                
+
                 # Prevent NaN if mask is entirely False
                 if valid_raw.numel() > 0:
                     self._raw_losses[key] = valid_raw.mean()
@@ -123,18 +124,18 @@ class LossAccumulator:
 
         total_pure = 0.0
         total_fully_weighted = 0.0
-        
+
         # 1. Log individual components
         for key in self._raw_losses.keys():
             pure_val = self._raw_losses[key]
-            
+
             # Use current_weights here
             weight_k = current_weights.get(key, 1.0)
             fully_weighted_val = weight_k * self._tw_losses[key]
-            
+
             entries[f"loss/{key}"] = pure_val
             entries[f"loss_weighted/{key}"] = fully_weighted_val
-            
+
             total_pure += pure_val
             total_fully_weighted += fully_weighted_val
 
@@ -142,10 +143,11 @@ class LossAccumulator:
         for group, keys in self._groups.items():
             pure_terms = [self._raw_losses[k] for k in keys if k in self._raw_losses]
             weighted_terms = [
-                current_weights.get(k, 1.0) * self._tw_losses[k] 
-                for k in keys if k in self._tw_losses
+                current_weights.get(k, 1.0) * self._tw_losses[k]
+                for k in keys
+                if k in self._tw_losses
             ]
-            
+
             if pure_terms:
                 entries[f"loss/{group}"] = sum(pure_terms)
             if weighted_terms:

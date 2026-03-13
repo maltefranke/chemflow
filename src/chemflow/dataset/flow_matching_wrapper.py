@@ -79,9 +79,15 @@ class FlowMatchingDatasetWrapper(Dataset):
 def train_collate_fn(batch):
     """Collate pre-processed training samples into batched tensors.
 
-    Offsets the local ``spawn_node_idx`` / ``ins_edge_*_idx`` attributes on
-    ``ins_targets`` so they become valid global indices into the batched
-    ``mol_t``.
+    Offsets the local insertion metadata on ``ins_targets`` so indices become
+    valid in the batched tensors.
+
+    Downstream contract for ``ins_targets``:
+    - ``spawn_node_idx`` indexes batched ``mol_t`` (for insertion-rate/GMM loss).
+    - ``ins_edge_spawn_idx`` indexes batched ``mol_t`` (query node).
+    - ``ins_edge_existing_idx`` indexes batched ``mol_t`` (existing endpoint).
+    - ``ins_edge_ins_local_idx`` indexes batched ``ins_targets`` (inserted node).
+    - ``ins_edge_types`` stores edge class targets.
     """
     mol_t_list = []
     mol_1_list = []

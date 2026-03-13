@@ -1,5 +1,5 @@
 import torch
-import torch.nn.functional as F
+
 from torch_geometric.utils import to_dense_adj
 
 from chemflow.flow_matching.assignment import partial_optimal_transport_single
@@ -124,7 +124,7 @@ class Interpolator:
             e=e_t,
             edge_index=edge_index_0,
             c=c_t,
-            is_auxiliary=is_auxiliary_t,  # Will not be needed for interpolation.
+            is_auxiliary=is_auxiliary_t,
         )
 
     def interpolate_continuous(self, x0, x1, t):
@@ -214,6 +214,26 @@ class Interpolator:
                 and ins_targets.ins_edge_ins_local_idx.numel() > 0
             ):
                 ins_targets.ins_edge_ins_local_idx.add_(ins_offset)
+            if (
+                hasattr(ins_targets, "ins_to_ins_edge_src_local_idx")
+                and ins_targets.ins_to_ins_edge_src_local_idx.numel() > 0
+            ):
+                ins_targets.ins_to_ins_edge_src_local_idx.add_(ins_offset)
+            if (
+                hasattr(ins_targets, "ins_to_ins_edge_dst_local_idx")
+                and ins_targets.ins_to_ins_edge_dst_local_idx.numel() > 0
+            ):
+                ins_targets.ins_to_ins_edge_dst_local_idx.add_(ins_offset)
+            if (
+                hasattr(ins_targets, "ins_to_ins_edge_spawn_src_idx")
+                and ins_targets.ins_to_ins_edge_spawn_src_idx.numel() > 0
+            ):
+                ins_targets.ins_to_ins_edge_spawn_src_idx.add_(offset)
+            if (
+                hasattr(ins_targets, "ins_to_ins_edge_spawn_dst_idx")
+                and ins_targets.ins_to_ins_edge_spawn_dst_idx.numel() > 0
+            ):
+                ins_targets.ins_to_ins_edge_spawn_dst_idx.add_(offset)
 
             mol_t_list.append(mol_t)
             mol_1_list.append(mol_1)
@@ -248,7 +268,7 @@ class Interpolator:
         Returns:
             interp_state: Interpolated molecule at time t (with rate attributes).
             target_state: Target molecule filtered to existing nodes.
-            ins_nodes: Insertion targets (with local spawn/edge indices).
+            future_ins_nodes: Insertion targets (with local spawn/edge indices).
         """
         device = sample_mol.x.device
         t_i = torch.tensor(t_scalar, device=device)
@@ -263,15 +283,6 @@ class Interpolator:
             c_del=self.c_del,
             optimal_transport=self.optimal_transport,
         )
-
-        # Preserve immutable target edge labels for insertion-edge targets.
-        target_edges_gt = self.edge_aligner.align_edges(
-            source_group=(target.edge_index, [target.e]),
-        )
-        target_edge_index_gt, target_e_gt_tuple = self.edge_aligner.symmetrize_edges(
-            target_edges_gt["edge_index"], target_edges_gt["edge_attr"]
-        )
-        target_e_gt = target_e_gt_tuple[0]
 
         # ===== 2. Per-pair interpolation =====
         N = sample.x.shape[0]
@@ -369,14 +380,14 @@ class Interpolator:
         target.e = e1_triu
 
         # D. Interpolate
-        interp_state_full = self.interpolate_mols(sample, target, t_i)
+        interp_state = self.interpolate_mols(sample, target, t_i)
 
         # E. Symmetrize edges
         full_idx_interp, full_attr_interp = self.edge_aligner.symmetrize_edges(
-            interp_state_full.edge_index, [interp_state_full.e]
+            interp_state.edge_index, [interp_state.e]
         )
-        interp_state_full.edge_index = full_idx_interp
-        interp_state_full.e = full_attr_interp[0]
+        interp_state.edge_index = full_idx_interp
+        interp_state.e = full_attr_interp[0]
 
         full_idx_target, full_attr_target = self.edge_aligner.symmetrize_edges(
             target.edge_index, [target.e]
@@ -385,69 +396,68 @@ class Interpolator:
         target.e = full_attr_target[0]
 
         # F. Filter nodes
-        # `mask_future_ins` is defined in the original OT-aligned node space.
-        # Apply it before `mask_exists` compaction to keep index spaces consistent.
-        ins_nodes = filter_nodes(target, mask_future_ins.squeeze())
-        interp_state = filter_nodes(interp_state_full, mask_exists.squeeze())
+        # future_ins_nodes_at_t = filter_nodes(interp_state, mask_future_ins.squeeze())
+
+        interp_state = filter_nodes(interp_state, mask_exists.squeeze())
         target_state = filter_nodes(target, mask_exists.squeeze())
+        future_ins_nodes = filter_nodes(target, mask_future_ins.squeeze())
+
+        # these will be used to augment x_t for edge insertion supervision
+        # future_ins_nodes.x_t = future_ins_nodes_at_t.x
+        # future_ins_nodes.a_t = future_ins_nodes_at_t.a
+        # future_ins_nodes.c_t = future_ins_nodes_at_t.c
 
         # G. Spawn node logic (LOCAL indices)
         num_interp_nodes = interp_state.x.shape[0]
-        num_ins_nodes = ins_nodes.x.shape[0]
+        num_future_ins_nodes = future_ins_nodes.x.shape[0]
         ins_counts = torch.zeros(num_interp_nodes, device=device)
 
-        if num_ins_nodes > 0:
-            t_kappa = self.sub_schedule.kappa_t(t_i)
-            a_target_one_hot = F.one_hot(
-                ins_nodes.a, num_classes=len(self.vocab.atom_tokens)
-            )
-            c_target_one_hot = F.one_hot(
-                ins_nodes.c, num_classes=len(self.vocab.charge_tokens)
-            )
-
-            p_t_a = self._cat_atom.probs * (1 - t_kappa) + a_target_one_hot * t_kappa
-            p_t_c = self._cat_charge.probs * (1 - t_kappa) + c_target_one_hot * t_kappa
-
-            ins_nodes.ins_atom_logits = p_t_a
-            ins_nodes.ins_charge_logits = p_t_c
-
-        else:
-            ins_nodes.ins_atom_logits = torch.empty(
-                (0, len(self.vocab.atom_tokens)),
-                device=device,
-                dtype=self._cat_atom.probs.dtype,
-            )
-            ins_nodes.ins_charge_logits = torch.empty(
-                (0, len(self.vocab.charge_tokens)),
-                device=device,
-                dtype=self._cat_charge.probs.dtype,
-            )
-
-        if num_ins_nodes > 0 and num_interp_nodes > 0:
-            t_kappa_e = self.sub_e_schedule.kappa_t(t_i)
-            dists = torch.cdist(ins_nodes.x, interp_state.x)
+        if num_future_ins_nodes > 0 and num_interp_nodes > 0:
+            # NOTE: take closest node to final ins position as spawn node
+            dists = torch.cdist(future_ins_nodes.x, interp_state.x)
             spawn_idx_local = torch.argmin(dists, dim=1).to(device)
 
             ones = torch.ones(spawn_idx_local.shape[0], device=device)
             ins_counts.index_add_(0, spawn_idx_local, ones)
 
-            ins_nodes.spawn_node_idx = spawn_idx_local
+            future_ins_nodes.spawn_node_idx = spawn_idx_local
 
-            # Edge targets for insertions
+            # Edge targets for insertions.
+            #
+            # We need per-edge supervision for bonds that connect:
+            #   inserted node -> existing node
+            # in the *target* graph.
+            #
+            # At this point we have three relevant index spaces:
+            # 1) original sample indexing [0..N): indices before any filtering
+            # 2) interp_state indexing: only currently existing nodes
+            # 3) future_ins_nodes indexing: only nodes that will be inserted
+            #
+            # The logic below:
+            # - builds lookup tables from original indices into local filtered spaces,
+            # - selects target edges of type (inserted -> existing),
+            # - stores aligned supervision tensors on `future_ins_nodes` so downstream
+            #   code can gather x/a/c features and edge types for insertion training.
             exists_indices_original = torch.where(mask_exists.squeeze())[0]
             ins_indices_original = torch.where(mask_future_ins.squeeze())[0]
 
+            # Map original node id -> local index in interp_state.
+            # Missing entries are marked as -1.
             orig_to_interp = torch.full((N,), -1, dtype=torch.long, device=device)
             orig_to_interp[exists_indices_original] = torch.arange(
                 num_interp_nodes, device=device
             )
 
+            # Map original node id -> local index in future_ins_nodes.
+            # Missing entries are marked as -1.
             orig_to_ins = torch.full((N,), -1, dtype=torch.long, device=device)
             orig_to_ins[ins_indices_original] = torch.arange(
-                num_ins_nodes, device=device
+                num_future_ins_nodes, device=device
             )
 
-            src, dst = target_edge_index_gt
+            src, dst = target.edge_index
+            # Keep only edges whose source is an inserted node and destination is
+            # an already existing node.
             src_is_ins = orig_to_ins[src] >= 0
             dst_is_exists = orig_to_interp[dst] >= 0
             ins_to_exists_mask = src_is_ins & dst_is_exists
@@ -455,63 +465,109 @@ class Interpolator:
             if ins_to_exists_mask.any():
                 ins_edge_src_orig = src[ins_to_exists_mask]
                 ins_edge_dst_orig = dst[ins_to_exists_mask]
-                ins_edge_types = target_e_gt[ins_to_exists_mask]
-                e_target_one_hot = F.one_hot(
-                    ins_edge_types, num_classes=len(self.vocab.edge_tokens)
-                )
-                p_t_e = (
-                    self._cat_edge.probs * (1 - t_kappa_e)
-                    + e_target_one_hot * t_kappa_e
-                )
+                ins_edge_types = target.e[ins_to_exists_mask]
 
                 ins_edge_src_local = orig_to_ins[ins_edge_src_orig]
                 ins_edge_dst_local = orig_to_interp[ins_edge_dst_orig]
 
-                ins_nodes.ins_edge_spawn_idx = spawn_idx_local[ins_edge_src_local]
-                ins_nodes.ins_edge_existing_idx = ins_edge_dst_local
-                ins_nodes.ins_edge_types = ins_edge_types
+                # Spawn node (in interp_state space) for each inserted endpoint
+                # participating in insertion-edge supervision.
+                future_ins_nodes.ins_edge_spawn_idx = spawn_idx_local[
+                    ins_edge_src_local
+                ]
+                # Existing endpoint in interp_state index space (not future nodes).
+                future_ins_nodes.ins_edge_existing_idx = ins_edge_dst_local
+                # Target bond/edge type for each (inserted -> existing) pair.
+                future_ins_nodes.ins_edge_types = ins_edge_types
                 # Local index (in future_ins_nodes) of the inserted node for each
                 # insertion-edge supervision pair; used to gather x/a/c downstream.
-                ins_nodes.ins_edge_ins_local_idx = ins_edge_src_local
-                ins_nodes.ins_edge_logits = p_t_e
-
+                future_ins_nodes.ins_edge_ins_local_idx = ins_edge_src_local
             else:
-                ins_nodes.ins_edge_spawn_idx = torch.empty(
+                future_ins_nodes.ins_edge_spawn_idx = torch.empty(
                     (0,), device=device, dtype=torch.long
                 )
-                ins_nodes.ins_edge_existing_idx = torch.empty(
+                future_ins_nodes.ins_edge_existing_idx = torch.empty(
                     (0,), device=device, dtype=torch.long
                 )
-                ins_nodes.ins_edge_types = torch.empty(
+                future_ins_nodes.ins_edge_types = torch.empty(
                     (0,), device=device, dtype=torch.long
                 )
-                ins_nodes.ins_edge_logits = torch.empty(
-                    (0, len(self.vocab.edge_tokens)),
-                    device=device,
-                    dtype=self._cat_edge.probs.dtype,
+                future_ins_nodes.ins_edge_ins_local_idx = torch.empty(
+                    (0,), device=device, dtype=torch.long
                 )
-                ins_nodes.ins_edge_ins_local_idx = torch.empty(
+
+            # Collect ins -> ins edge targets (edges between two future-inserted nodes).
+            # Only keep upper-triangular pairs (src_local < dst_local) to avoid duplicates.
+            src_is_ins = orig_to_ins[src] >= 0
+            dst_is_ins = orig_to_ins[dst] >= 0
+            ins_to_ins_mask = src_is_ins & dst_is_ins
+            if ins_to_ins_mask.any():
+                ii_src_orig = src[ins_to_ins_mask]
+                ii_dst_orig = dst[ins_to_ins_mask]
+                ii_edge_types = target.e[ins_to_ins_mask]
+
+                ii_src_local = orig_to_ins[ii_src_orig]
+                ii_dst_local = orig_to_ins[ii_dst_orig]
+
+                triu_mask = ii_src_local < ii_dst_local
+                ii_src_local = ii_src_local[triu_mask]
+                ii_dst_local = ii_dst_local[triu_mask]
+                ii_edge_types = ii_edge_types[triu_mask]
+
+                future_ins_nodes.ins_to_ins_edge_src_local_idx = ii_src_local
+                future_ins_nodes.ins_to_ins_edge_dst_local_idx = ii_dst_local
+                future_ins_nodes.ins_to_ins_edge_spawn_src_idx = spawn_idx_local[
+                    ii_src_local
+                ]
+                future_ins_nodes.ins_to_ins_edge_spawn_dst_idx = spawn_idx_local[
+                    ii_dst_local
+                ]
+                future_ins_nodes.ins_to_ins_edge_types = ii_edge_types
+            else:
+                future_ins_nodes.ins_to_ins_edge_src_local_idx = torch.empty(
+                    (0,), device=device, dtype=torch.long
+                )
+                future_ins_nodes.ins_to_ins_edge_dst_local_idx = torch.empty(
+                    (0,), device=device, dtype=torch.long
+                )
+                future_ins_nodes.ins_to_ins_edge_spawn_src_idx = torch.empty(
+                    (0,), device=device, dtype=torch.long
+                )
+                future_ins_nodes.ins_to_ins_edge_spawn_dst_idx = torch.empty(
+                    (0,), device=device, dtype=torch.long
+                )
+                future_ins_nodes.ins_to_ins_edge_types = torch.empty(
                     (0,), device=device, dtype=torch.long
                 )
         else:
-            ins_nodes.spawn_node_idx = torch.empty(
+            future_ins_nodes.spawn_node_idx = torch.empty(
                 (0,), device=device, dtype=torch.long
             )
-            ins_nodes.ins_edge_spawn_idx = torch.empty(
+            future_ins_nodes.ins_edge_spawn_idx = torch.empty(
                 (0,), device=device, dtype=torch.long
             )
-            ins_nodes.ins_edge_existing_idx = torch.empty(
+            future_ins_nodes.ins_edge_existing_idx = torch.empty(
                 (0,), device=device, dtype=torch.long
             )
-            ins_nodes.ins_edge_types = torch.empty(
+            future_ins_nodes.ins_edge_types = torch.empty(
                 (0,), device=device, dtype=torch.long
             )
-            ins_nodes.ins_edge_logits = torch.empty(
-                (0, len(self.vocab.edge_tokens)),
-                device=device,
-                dtype=self._cat_edge.probs.dtype,
+            future_ins_nodes.ins_edge_ins_local_idx = torch.empty(
+                (0,), device=device, dtype=torch.long
             )
-            ins_nodes.ins_edge_ins_local_idx = torch.empty(
+            future_ins_nodes.ins_to_ins_edge_src_local_idx = torch.empty(
+                (0,), device=device, dtype=torch.long
+            )
+            future_ins_nodes.ins_to_ins_edge_dst_local_idx = torch.empty(
+                (0,), device=device, dtype=torch.long
+            )
+            future_ins_nodes.ins_to_ins_edge_spawn_src_idx = torch.empty(
+                (0,), device=device, dtype=torch.long
+            )
+            future_ins_nodes.ins_to_ins_edge_spawn_dst_idx = torch.empty(
+                (0,), device=device, dtype=torch.long
+            )
+            future_ins_nodes.ins_to_ins_edge_types = torch.empty(
                 (0,), device=device, dtype=torch.long
             )
 
@@ -538,7 +594,7 @@ class Interpolator:
         x_mean = interp_state.x.mean(dim=0)
         interp_state.x = interp_state.x - x_mean
         target_state.x = target_state.x - x_mean
-        if ins_nodes.x.shape[0] > 0:
-            ins_nodes.x = ins_nodes.x - x_mean
+        if future_ins_nodes.x.shape[0] > 0:
+            future_ins_nodes.x = future_ins_nodes.x - x_mean
 
-        return interp_state, target_state, ins_nodes
+        return interp_state, target_state, future_ins_nodes

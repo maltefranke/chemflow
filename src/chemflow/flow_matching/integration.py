@@ -130,7 +130,7 @@ class RateIntegrator:
         t: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Sample birth process for GNN (works with batch_ids).
+        Sample insertions from GMM (works with batch_ids).
 
         Args:
             ins_gmm_dict: dict - GMM parameters per graph
@@ -154,33 +154,34 @@ class RateIntegrator:
         )
 
         # now to interpolation depending on our schedules
-        t_kappa = self.sub_schedule.kappa_t(t).unsqueeze(1)
+        kappa_t = self.sub_schedule.kappa_t(t).unsqueeze(1)
         a_1_one_hot = F.one_hot(sampled_a, num_classes=A)
         c_1_one_hot = F.one_hot(sampled_c, num_classes=C)
 
         a = (
-            self._cat_atom.probs.repeat(c_1_one_hot.shape[0], 1, 1) * (1 - t_kappa)
-            + a_1_one_hot * t_kappa
+            self._cat_atom.probs.repeat(c_1_one_hot.shape[0], 1, 1) * (1 - kappa_t)
+            + a_1_one_hot * kappa_t
         )
         a = F.softmax(a, dim=-1)
         a = torch.distributions.Categorical(probs=a).sample()
 
         c = (
-            self._cat_charge.probs.repeat(c_1_one_hot.shape[0], 1, 1) * (1 - t_kappa)
-            + c_1_one_hot * t_kappa
+            self._cat_charge.probs.repeat(c_1_one_hot.shape[0], 1, 1) * (1 - kappa_t)
+            + c_1_one_hot * kappa_t
         )
         c = F.softmax(c, dim=-1)
         c = torch.distributions.Categorical(probs=c).sample()
 
-        x = sampled_x + self.ins_noise_scale * torch.randn_like(
-            sampled_x, device=self.device
-        )
+        x = sampled_x + self.ins_noise_scale * torch.randn_like(sampled_x)
 
         new_atoms = PointCloud(
             x=x.view(-1, self.gmm_params.D),
             a=a.view(-1),
             c=c.view(-1),
         )
+        new_atoms.x_1 = sampled_x.view(-1, self.gmm_params.D)
+        new_atoms.a_1 = sampled_a.view(-1)
+        new_atoms.c_1 = sampled_c.view(-1)
 
         return new_atoms
 
@@ -291,7 +292,6 @@ class RateIntegrator:
 
         """NODE DELETION or SUBSTITUTION"""
         # 1. Scale probabilities by time (converting prob -> rate * dt)
-        # rate_node is 1 / (1 - t)
         p_sub_scaled = do_sub_a_probs.view(-1) * sub_rate_node * dt
         p_del_scaled = do_del_probs.view(-1) * del_rate_node * dt
 
@@ -404,9 +404,8 @@ class RateIntegrator:
                     "c_probs": ins_gmm_preds["c_probs"][do_ins_valid],
                 }
 
-                new_atoms = self.sample_insertions(
-                    ins_gmm_dict, t[batch_id[do_ins_valid]]
-                )
+                t_ins = t[batch_id[do_ins_valid]] + dt
+                new_atoms = self.sample_insertions(ins_gmm_dict, t_ins)
 
                 new_atoms.batch = batch_id[do_ins_valid]
 
@@ -429,16 +428,24 @@ class RateIntegrator:
                 ins_edge_target_idx = None
                 e_t_ins = None
 
+                # ins -> ins predicted edges (between newly inserted atoms)
+                e_t_ins_ii = None
+                ins_ii_src_local = None
+                ins_ii_dst_local = None
+
                 if ins_edge_head is not None and h_latent is not None:
+                    # ── ins → existing edges ──────────────────────────────────
+                    # Use extrapolated t=1 for edge prediction, then adjust noise level
                     orig_spawn_idx, orig_existing_idx, ins_edge_logits = (
                         ins_edge_head.predict_edges_for_insertion(
                             h=h_latent,
-                            x=x_t_original,
+                            x=x_t_original,  # use original frame for edge prediction
+                            node_atom_types=a_t,
                             batch=batch_id,
                             insertion_mask=do_ins_valid,
-                            ins_x=new_atoms.x,
-                            ins_a=new_atoms.a,
-                            ins_c=new_atoms.c,
+                            ins_x=new_atoms.x_1,
+                            ins_a=new_atoms.a_1,
+                            ins_c=new_atoms.c_1,
                         )
                     )
 
@@ -451,17 +458,16 @@ class RateIntegrator:
                         e1_ins_types, num_classes=len(self.vocab.edge_tokens)
                     )
 
-                    # interpolate edge types
-                    t_kappa_e = self.sub_e_schedule.kappa_t(
-                        t[batch_id[orig_spawn_idx]]
-                    ).unsqueeze(1)
+                    # Adjust to noise level of next time step t+dt
+                    t_ins_orig = t[batch_id[orig_spawn_idx]] + dt
+                    kappa_t_e = self.sub_e_schedule.kappa_t(t_ins_orig).unsqueeze(1)
 
                     prior_edge_probs = self._cat_edge.probs.unsqueeze(0).expand(
                         e1_ins_types.shape[0], -1
                     )
                     e_t_ins = (
-                        prior_edge_probs * (1 - t_kappa_e)
-                        + e1_ins_types.to(dtype=prior_edge_probs.dtype) * t_kappa_e
+                        prior_edge_probs * (1 - kappa_t_e)
+                        + e1_ins_types.to(dtype=prior_edge_probs.dtype) * kappa_t_e
                     )
                     e_t_ins = F.softmax(e_t_ins, dim=-1)
                     e_t_ins = torch.distributions.Categorical(probs=e_t_ins).sample()
@@ -490,6 +496,61 @@ class RateIntegrator:
                             ins_edge_logits = None
                             e_t_ins = None
 
+                    # ── ins → ins edges (between newly inserted atoms) ────────
+                    # Build upper-triangular pairs within the same graph.
+                    ii_src_list = []
+                    ii_dst_list = []
+                    ii_spawn_src_list = []
+
+                    for g in new_atoms.batch.unique():
+                        mask_g = new_atoms.batch == g
+                        local_idx_g = torch.where(mask_g)[0]
+                        if local_idx_g.numel() >= 2:
+                            pairs = torch.combinations(local_idx_g, r=2)
+                            ii_src_list.append(pairs[:, 0])
+                            ii_dst_list.append(pairs[:, 1])
+                            ii_spawn_src_list.append(spawn_orig_indices[pairs[:, 0]])
+
+                    if ii_src_list:
+                        ii_src = torch.cat(ii_src_list)
+                        ii_dst = torch.cat(ii_dst_list)
+                        ii_spawn_src = torch.cat(ii_spawn_src_list)
+
+                        ii_logits = ins_edge_head.forward_ins_to_ins(
+                            h=h_latent,
+                            x=x_t_original,
+                            spawn_src_idx=ii_spawn_src,
+                            ins_x_src=new_atoms.x_1[ii_src],
+                            ins_a_src=new_atoms.a_1[ii_src],
+                            ins_c_src=new_atoms.c_1[ii_src],
+                            ins_a_dst=new_atoms.a_1[ii_dst],
+                            ins_x_dst=new_atoms.x_1[ii_dst],
+                        )
+
+                        ii_probs = F.softmax(ii_logits, dim=-1)
+                        e1_ii = torch.distributions.Categorical(probs=ii_probs).sample()
+                        e1_ii = F.one_hot(
+                            e1_ii, num_classes=len(self.vocab.edge_tokens)
+                        )
+
+                        # Adjust to noise level t+dt using spawn_src's graph time
+                        t_ii = t[batch_id[ii_spawn_src]] + dt
+                        kappa_t_ii = self.sub_e_schedule.kappa_t(t_ii).unsqueeze(1)
+                        prior_ii = self._cat_edge.probs.unsqueeze(0).expand(
+                            e1_ii.shape[0], -1
+                        )
+                        e_t_ins_ii = (
+                            prior_ii * (1 - kappa_t_ii)
+                            + e1_ii.to(dtype=prior_ii.dtype) * kappa_t_ii
+                        )
+                        e_t_ins_ii = F.softmax(e_t_ins_ii, dim=-1)
+                        e_t_ins_ii = torch.distributions.Categorical(
+                            probs=e_t_ins_ii
+                        ).sample()
+
+                        ins_ii_src_local = ii_src
+                        ins_ii_dst_local = ii_dst
+
                 # Check if we have predicted edge logits for insertions
                 use_predicted_edges = (
                     ins_edge_logits is not None
@@ -510,6 +571,9 @@ class RateIntegrator:
                         spawn_node_idx=ins_edge_new_atom_idx,
                         target_node_idx=ins_edge_target_idx,
                         fallback_edge_dist=edge_dist,
+                        e_ins_to_ins=e_t_ins_ii,
+                        ins_to_ins_src_idx=ins_ii_src_local,
+                        ins_to_ins_dst_idx=ins_ii_dst_local,
                     )
                 else:
                     # Fall back to random edge sampling

@@ -62,7 +62,7 @@ class LightningModuleRates(pl.LightningModule):
     LOSS_GROUPS: dict[str, list[str]] = {
         "sub": ["do_sub_a", "sub_a_class", "do_sub_e", "sub_e_class"],
         "del": ["do_del"],
-        "ins": ["do_ins", "ins_rate", "ins_gmm", "ins_e"],
+        "ins": ["do_ins", "ins_rate", "ins_gmm", "ins_e", "ins_e_ii"],
         "x": ["x"],
         "c": ["c"],
         "budget": ["global_ins_budget", "global_del_budget"],
@@ -244,15 +244,6 @@ class LightningModuleRates(pl.LightningModule):
         )
 
         # TODO make these configurable
-        """time_weights = {
-            "x": InverseSquaredTimeLossWeighting(clamp_max=10.0),
-            "c": InverseSquaredTimeLossWeighting(clamp_max=10.0),
-            "ins": ShiftedParabolaTimeLossWeighting(),
-            "del": ShiftedParabolaTimeLossWeighting(),
-            "sub": ShiftedParabolaTimeLossWeighting(shift=-1.0),
-            "budget": ShiftedParabolaTimeLossWeighting()
-        }"""
-
         time_weights = {
             "x": InverseSquaredTimeLossWeighting(clamp_max=100.0),
             "c": InverseSquaredTimeLossWeighting(clamp_max=100.0),
@@ -520,7 +511,7 @@ class LightningModuleRates(pl.LightningModule):
         """
         eps = 1e-8
         graph_rate_pred = graph_rate_pred.float().clamp(min=eps)
-        target_budget = target_budget.float().clamp(min=0.0)
+        target_budget = target_budget.float()
         loss = F.poisson_nll_loss(
             graph_rate_pred,
             target_budget,
@@ -658,6 +649,9 @@ class LightningModuleRates(pl.LightningModule):
 
             # indices of nodes in mol_t that spawn/predict each insertion
             spawn_node_idx = ins_targets.spawn_node_idx
+            ins_batch_mask = torch.zeros(
+                mols_t.num_graphs, dtype=torch.bool, device=self.device
+            )
 
             if spawn_node_idx.numel() > 0:
                 # Count how many insertions each node spawns
@@ -706,47 +700,81 @@ class LightningModuleRates(pl.LightningModule):
                 # Index spaces:
                 # - ins_edge_spawn_idx / ins_edge_existing_idx index current-state nodes in mols_t
                 # - ins_edge_ins_local_idx indexes inserted nodes in ins_targets (future nodes)
+                # - ins_edge_types provides integer edge-class supervision targets
                 spawn_idx = ins_targets.ins_edge_spawn_idx
                 existing_idx = ins_targets.ins_edge_existing_idx
 
-                # make sure there are insertions to predict edges for
-                assert spawn_idx.numel() > 0, (
-                    "No insertions spawn points to predict edges for"
-                )
-                assert existing_idx.numel() > 0, (
-                    "No insertion-edge existing endpoints to predict"
-                )
-
-                # Get edge predictions using the insertion edge head
-                ins_edge_logits = self.model.predict_insertion_edges(
-                    mols_t=mols_t,
-                    out_dict=preds,
-                    spawn_node_idx=spawn_idx,
-                    existing_node_idx=existing_idx,
-                    # Use canonical future node tensors and gather per-edge inserted attrs.
-                    ins_x=ins_targets.x[ins_targets.ins_edge_ins_local_idx],
-                    ins_a=ins_targets.a[ins_targets.ins_edge_ins_local_idx],
-                    ins_c=ins_targets.c[ins_targets.ins_edge_ins_local_idx],
-                )
-                if ins_edge_logits is not None and ins_edge_logits.numel() > 0:
-                    ins_loss_e = F.cross_entropy(
-                        ins_edge_logits,
-                        ins_targets.ins_edge_types,
-                        weight=self.edge_token_weights,
-                        reduction="none",
+                if spawn_idx.numel() > 0 and existing_idx.numel() > 0:
+                    # Get edge predictions using the insertion edge head
+                    ins_edge_logits = self.model.predict_insertion_edges(
+                        mols_t=mols_t,
+                        out_dict=preds,
+                        spawn_node_idx=spawn_idx,
+                        existing_node_idx=existing_idx,
+                        # Use canonical future node tensors and gather per-edge inserted attrs.
+                        # NOTE predict edge types for future nodes, not current nodes
+                        # NOTE then at inference we will adjust to current noise level
+                        ins_x=ins_targets.x[ins_targets.ins_edge_ins_local_idx],
+                        ins_a=ins_targets.a[ins_targets.ins_edge_ins_local_idx],
+                        ins_c=ins_targets.c[ins_targets.ins_edge_ins_local_idx],
                     )
+                    if ins_edge_logits is not None and ins_edge_logits.numel() > 0:
+                        ins_loss_e = F.cross_entropy(
+                            ins_edge_logits,
+                            ins_targets.ins_edge_types,
+                            weight=self.edge_token_weights,
+                            reduction="none",
+                        )
 
-                    # NOTE All inserted edges will have a non-zero target rate
-                    # NOTE Therefore no more filtering needed
+                        # NOTE All inserted edges will have a non-zero target rate
+                        # NOTE Therefore no more filtering needed
 
-                    # reduce the loss to per-graph level
-                    ins_loss_e = unsorted_segment_mean(
-                        ins_loss_e.view(-1, 1),
-                        mols_t.batch[spawn_idx],
-                        mols_t.num_graphs,
+                        # reduce the loss to per-graph level
+                        ins_loss_e = unsorted_segment_mean(
+                            ins_loss_e.view(-1, 1),
+                            mols_t.batch[spawn_idx],
+                            mols_t.num_graphs,
+                        )
+
+                        ins_loss_e = self._reduce_loss(ins_loss_e, "none")
+
+                # Compute ins -> ins edge loss
+                ins_loss_e_ii = torch.tensor(0.0, device=self.device)
+                spawn_src_ii = ins_targets.ins_to_ins_edge_spawn_src_idx
+                if spawn_src_ii.numel() > 0:
+                    ins_ii_logits = self.model.predict_insertion_edges_ins_to_ins(
+                        mols_t=mols_t,
+                        out_dict=preds,
+                        spawn_src_idx=spawn_src_ii,
+                        ins_x_src=ins_targets.x[
+                            ins_targets.ins_to_ins_edge_src_local_idx
+                        ],
+                        ins_a_src=ins_targets.a[
+                            ins_targets.ins_to_ins_edge_src_local_idx
+                        ],
+                        ins_c_src=ins_targets.c[
+                            ins_targets.ins_to_ins_edge_src_local_idx
+                        ],
+                        ins_a_dst=ins_targets.a[
+                            ins_targets.ins_to_ins_edge_dst_local_idx
+                        ],
+                        ins_x_dst=ins_targets.x[
+                            ins_targets.ins_to_ins_edge_dst_local_idx
+                        ],
                     )
-
-                    ins_loss_e = self._reduce_loss(ins_loss_e, "none")
+                    if ins_ii_logits is not None and ins_ii_logits.numel() > 0:
+                        ins_loss_e_ii = F.cross_entropy(
+                            ins_ii_logits,
+                            ins_targets.ins_to_ins_edge_types,
+                            weight=self.edge_token_weights,
+                            reduction="none",
+                        )
+                        ins_loss_e_ii = unsorted_segment_mean(
+                            ins_loss_e_ii.view(-1, 1),
+                            mols_t.batch[spawn_src_ii],
+                            mols_t.num_graphs,
+                        )
+                        ins_loss_e_ii = self._reduce_loss(ins_loss_e_ii, "none")
 
             else:
                 # NOTE ins_rate_head,edge_head, gmm_head unused, throws an error (unused_params)
@@ -762,6 +790,7 @@ class LightningModuleRates(pl.LightningModule):
                 )
 
                 ins_loss_e = 0.0 * edge_head_loss
+                ins_loss_e_ii = 0.0 * edge_head_loss
                 ins_loss_gmm = 0.0 * gmm_head_loss
                 ins_loss_rate = 0.0 * ins_rate_head_loss
 
@@ -796,7 +825,6 @@ class LightningModuleRates(pl.LightningModule):
 
             # Insertion node-wise rates: directly use the predicted rates.
             ins_rate_node = ins_rate_pred.view(-1)
-            ins_rate_node = ins_rate_node.clamp(min=0.0)
             ins_graph_expected = unsorted_segment_sum(
                 ins_rate_node.view(-1, 1),
                 mols_t.batch,
@@ -832,6 +860,7 @@ class LightningModuleRates(pl.LightningModule):
             "c": c_batch_mask,
             "ins_rate": ins_batch_mask,
             "ins_e": ins_batch_mask,
+            "ins_e_ii": ins_batch_mask,
             "ins_gmm": ins_batch_mask,
             "sub_a_class": sub_a_batch_mask,
             "sub_e_class": sub_e_batch_mask,
@@ -849,6 +878,7 @@ class LightningModuleRates(pl.LightningModule):
                 "ins_rate": ins_loss_rate,
                 "ins_gmm": ins_loss_gmm,
                 "ins_e": ins_loss_e,
+                "ins_e_ii": ins_loss_e_ii,
                 "x": x_loss,
                 "c": c_loss,
                 "global_ins_budget": global_ins_budget_loss,
@@ -925,7 +955,8 @@ class LightningModuleRates(pl.LightningModule):
         )
 
         try:
-            pb_metrics = calc_posebusters_metrics(rdkit_mols)
+            # pb_metrics = calc_posebusters_metrics(rdkit_mols)
+            pb_metrics = False
         except Exception as e:
             print(f"Error calculating PoseBusters metrics: {e}")
             pb_metrics = False
@@ -980,7 +1011,8 @@ class LightningModuleRates(pl.LightningModule):
                 mol_is_valid.append(False)
 
         valid_mols = [i for i, valid in zip(gen_mols, mol_is_valid) if valid]
-        invalid_mols = [i[-1] for i, valid in zip(gen_mols, mol_is_valid) if not valid]
+        # Keep full trajectories for invalid molecules so failures can be inspected over time.
+        invalid_mols = [i for i, valid in zip(gen_mols, mol_is_valid) if not valid]
         invalid_mols_rdkit = [
             i for i, valid in zip(last_mols_rdkit, mol_is_valid) if not valid
         ]

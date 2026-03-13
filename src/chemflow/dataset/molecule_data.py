@@ -682,12 +682,30 @@ def join_molecules_with_predicted_edges(
     spawn_node_idx: torch.Tensor,
     target_node_idx: torch.Tensor,
     fallback_edge_dist: torch.Tensor,
+    e_ins_to_ins: torch.Tensor | None = None,
+    ins_to_ins_src_idx: torch.Tensor | None = None,
+    ins_to_ins_dst_idx: torch.Tensor | None = None,
 ) -> MoleculeBatch:
+    """Join existing molecule with newly inserted atoms.
+
+    Args:
+        mol: Existing molecule batch.
+        new_atoms: New atoms to insert (with .batch attribute).
+        e_ins: Predicted edge types for (new_atom -> existing) pairs.
+        spawn_node_idx: Local new-atom indices (0..num_new-1) for e_ins source.
+        target_node_idx: Existing-node indices (in mol) for e_ins destination.
+        fallback_edge_dist: Categorical prior for ins->ins edges when
+            e_ins_to_ins is not provided.
+        e_ins_to_ins: Predicted edge types for (new_atom_i -> new_atom_j)
+            upper-triangular pairs.  If None, falls back to random sampling.
+        ins_to_ins_src_idx: Local new-atom index for source of each ii-edge.
+        ins_to_ins_dst_idx: Local new-atom index for destination of each ii-edge.
+    """
+
     device = mol.x.device
     batch_ids = mol.batch
     batch_ids_atoms = new_atoms.batch
     num_existing_nodes = mol.x.shape[0]
-    # num_new_atoms = new_atoms.x.shape[0] # Not strictly needed with new logic, but good for debug
     edge_aligner = EdgeAligner()
 
     # 1. Concatenate node features
@@ -704,144 +722,69 @@ def join_molecules_with_predicted_edges(
         existing_edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
         existing_e = torch.empty((0,), dtype=torch.long, device=device)
 
-    # 3. Build mapping: spawn_node_idx -> new_atom_idx (GLOBAL index)
-    # WARNING: Assumes new_atoms were generated in the order of sorted(unique(spawn_node_idx))
-    unique_spawn_nodes = sorted(
-        spawn_node_idx.unique().tolist()
-    )  # Ensure explicit sorting
-    spawn_to_new_atom_global = {}
-    spawn_to_new_atom_local = {}  # Helper for batch lookup
+    # 3. spawn_node_idx is expected to index into new_atoms (local new-atom ids).
+    # We map to global ids by offsetting with num_existing_nodes.
 
-    for i, spawn_idx in enumerate(unique_spawn_nodes):
-        spawn_to_new_atom_global[spawn_idx] = i + num_existing_nodes
-        spawn_to_new_atom_local[spawn_idx] = i
-
-    # 4. Create NEW predicted edges (Upper Triangular)
+    # 4. Create NEW predicted edges (Upper Triangular): new_atom -> existing
     new_edges_triu_list = []
     new_e_triu_list = []
 
     if e_ins is not None and e_ins.numel() > 0:
-        # Accept edge classes [E] or per-edge class scores [E, T] (logits/probs).
-        if e_ins.dim() == 1:
-            edge_types = e_ins.to(dtype=torch.long)
-        elif e_ins.dim() == 2:
-            if torch.is_floating_point(e_ins):
-                probs_like = (
-                    torch.all(e_ins >= 0).item()
-                    and torch.all(e_ins <= 1).item()
-                    and torch.allclose(
-                        e_ins.sum(dim=-1),
-                        torch.ones(e_ins.shape[0], device=device, dtype=e_ins.dtype),
-                        atol=1e-4,
-                        rtol=1e-4,
-                    ).item()
-                )
-                if probs_like:
-                    edge_types = Categorical(probs=e_ins).sample()
-                else:
-                    edge_types = Categorical(logits=e_ins).sample()
-            else:
-                edge_types = torch.argmax(e_ins, dim=-1)
-            edge_types = edge_types.to(dtype=torch.long)
-        else:
-            raise ValueError(
-                f"Expected e_ins rank 1 or 2, got shape {tuple(e_ins.shape)}"
-            )
+        edge_types = e_ins.to(dtype=torch.long, device=device)
 
-        if edge_types.shape[0] != spawn_node_idx.shape[0]:
-            raise ValueError(
-                "e_ins and spawn_node_idx must match on first dimension: "
-                f"{edge_types.shape[0]} != {spawn_node_idx.shape[0]}"
-            )
+        # Map the local spawn indices to the global graph space
+        global_new_atom_idx = spawn_node_idx + num_existing_nodes
 
-        # Vectorizing this loop is hard due to the dictionary lookup, keeping Python loop is okay for sparse connectivity
-        for i in range(len(spawn_node_idx)):
-            spawn_idx = spawn_node_idx[i].item()  # Parent in mol
-            target_idx = target_node_idx[i].item()  # Target in mol
-            edge_type = int(edge_types[i].item())
+        # Enforce upper triangular convention (target_idx < global_new_atom_idx is always True)
+        row = target_node_idx
+        col = global_new_atom_idx
 
-            if spawn_idx not in spawn_to_new_atom_global:
-                continue
+        # Stack into a (2, E) tensor
+        predicted_edges_triu = torch.stack([row, col], dim=0)
 
-            # Bounds check
-            if target_idx < 0 or target_idx >= num_existing_nodes:
-                continue
+        new_edges_triu_list.append(predicted_edges_triu)
+        new_e_triu_list.append(edge_types)
 
-            # Use the local index of the new atom to find its batch
-            local_atom_idx = spawn_to_new_atom_local[spawn_idx]
-            new_atom_batch = batch_ids_atoms[local_atom_idx].item()
-            # Check against target batch
-            target_batch = batch_ids[target_idx].item()
+    # 5. Create edges between new atoms
+    use_predicted_ii = (
+        e_ins_to_ins is not None
+        and e_ins_to_ins.numel() > 0
+        and ins_to_ins_src_idx is not None
+        and ins_to_ins_dst_idx is not None
+    )
 
-            if new_atom_batch != target_batch:
-                continue
+    if use_predicted_ii:
+        # Use model-predicted ins->ins edge types (upper triangular, src < dst by construction)
+        global_src = ins_to_ins_src_idx + num_existing_nodes
+        global_dst = ins_to_ins_dst_idx + num_existing_nodes
+        # Ensure triu ordering (src < dst in global space; src_local < dst_local was
+        # already enforced during interpolation, so this holds after the offset too)
+        ii_edge_index = torch.stack([global_src, global_dst], dim=0)
+        new_edges_triu_list.append(ii_edge_index)
+        new_e_triu_list.append(e_ins_to_ins.to(dtype=torch.long, device=device))
+    else:
+        # Fallback: sample ins->ins edge types from the prior distribution
+        edge_dist_cat = Categorical(probs=fallback_edge_dist)
+        for batch_id in batch_ids_atoms.unique():
+            atom_mask_local = batch_ids_atoms == batch_id
+            atom_indices_global = torch.where(atom_mask_local)[0] + num_existing_nodes
 
-            new_atom_idx = spawn_to_new_atom_global[spawn_idx]
+            if len(atom_indices_global) > 1:
+                # Transpose combinations to yield shape (2, N_pairs) to match Step 4
+                pairs = torch.combinations(atom_indices_global, r=2).T
+                new_edges_triu_list.append(pairs)
 
-            # Enforce Upper Triangle (row < col)
-            # Since new_atom_idx >= num_existing_nodes and target_idx < num_existing_nodes,
-            # target_idx is always smaller.
-            row = target_idx
-            col = new_atom_idx
-
-            new_edges_triu_list.append([row, col])
-            new_e_triu_list.append(edge_type)
-
-    # 5. Create fallback edges between new atoms (Vectorized)
-    edge_dist_cat = Categorical(probs=fallback_edge_dist)
-
-    # Iterate over unique batches in the *new* atoms only
-    for batch_id in batch_ids_atoms.unique():
-        # Mask for new atoms in this batch
-        atom_mask_local = batch_ids_atoms == batch_id
-
-        # Get Global Indices directly
-        atom_indices_global = torch.where(atom_mask_local)[0] + num_existing_nodes
-
-        if len(atom_indices_global) > 1:
-            # Vectorized Combinations
-            # torch.combinations returns (N_pairs, 2)
-            pairs = torch.combinations(atom_indices_global, r=2)
-
-            # Because atom_indices_global is sorted, pairs are automatically upper triangular (i < j)
-            # Add to list
-            new_edges_triu_list.append(pairs)
-
-            # Sample types
-            n_pairs = pairs.shape[0]
-            sampled_types = edge_dist_cat.sample((n_pairs,)).to(device)
-            new_e_triu_list.append(sampled_types)
+                n_pairs = pairs.shape[1]
+                sampled_types = edge_dist_cat.sample((n_pairs,)).to(device)
+                new_e_triu_list.append(sampled_types)
 
     # 6. Symmetrize and Combine
-    # Note: We mixed list of lists (from step 4) and tensors (from step 5). Need to handle carefully.
-
-    # Consolidate Step 4 list
     if len(new_edges_triu_list) > 0:
-        # Separate list of lists (manual) and list of tensors (vectorized)
-        tensor_edges = [x for x in new_edges_triu_list if isinstance(x, torch.Tensor)]
-        list_edges = [x for x in new_edges_triu_list if isinstance(x, list)]
-
-        # Consolidate edges
-        cat_list = []
-        if list_edges:
-            cat_list.append(torch.tensor(list_edges, device=device))
-        if tensor_edges:
-            cat_list.append(torch.cat(tensor_edges, dim=0))
-
-        new_edge_index_triu = torch.cat(cat_list, dim=0).T  # (2, E)
-
-        # Consolidate attributes
-        # Similar logic for attributes (some are scalars in list, some are tensors)
-        tensor_attrs = [x for x in new_e_triu_list if isinstance(x, torch.Tensor)]
-        list_attrs = [x for x in new_e_triu_list if isinstance(x, int)]
-
-        attr_cat_list = []
-        if list_attrs:
-            attr_cat_list.append(torch.tensor(list_attrs, device=device))
-        if tensor_attrs:
-            attr_cat_list.append(torch.cat(tensor_attrs, dim=0))
-
-        new_e_triu = torch.cat(attr_cat_list, dim=0)
+        # All items are guaranteed to be tensors now. Direct concatenation.
+        new_edge_index_triu = torch.cat(
+            new_edges_triu_list, dim=1
+        )  # Shape: (2, E_total)
+        new_e_triu = torch.cat(new_e_triu_list, dim=0)  # Shape: (E_total,)
 
         # Symmetrize
         new_edge_index, new_e_attrs = edge_aligner.symmetrize_edges(
