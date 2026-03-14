@@ -102,6 +102,19 @@ class RateIntegrator:
             probs=distributions.edge_type_distribution.to(device)
         )
 
+    def _distr_to_device(self, device: torch.device):
+        # Keep all base categorical distributions on the current batch device.
+        # This avoids mixed-device ops in insertion/substitution branches.
+        self._cat_atom = torch.distributions.Categorical(
+            probs=self._cat_atom.probs.to(device)
+        )
+        self._cat_charge = torch.distributions.Categorical(
+            probs=self._cat_charge.probs.to(device)
+        )
+        self._cat_edge = torch.distributions.Categorical(
+            probs=self._cat_edge.probs.to(device)
+        )
+
     def get_time_steps(self, num_steps: int | None = None) -> list[float]:
         if num_steps is None:
             num_steps = self.num_integration_steps
@@ -225,6 +238,10 @@ class RateIntegrator:
         Returns:
             mol_t_final: MoleculeBatch - updated molecule after one integration step
         """
+        # Keep all base categorical distributions on the current batch device.
+        # This avoids mixed-device ops in insertion/substitution branches.
+        active_device = mol_t.x.device
+        self._distr_to_device(active_device)
 
         x_t, a_t, _, e_t, edge_index, batch_id = mol_t.unpack()
         x_1, a_1, c_1, e_1, edge_index_1, _ = mol_1_pred.unpack()
