@@ -124,7 +124,7 @@ class RateIntegrator:
 
         elif self.time_strategy == "log":
             # torch requires the log of the start and end points
-            start_log = torch.log10(torch.tensor(0.01, device=self.device))
+            start_log = torch.log10(torch.tensor(1e-5, device=self.device))
             end_log = torch.log10(torch.tensor(1.0, device=self.device))
             time_points = (
                 1 - torch.logspace(start_log, end_log, num_steps + 1)
@@ -185,7 +185,9 @@ class RateIntegrator:
         c = F.softmax(c, dim=-1)
         c = torch.distributions.Categorical(probs=c).sample()
 
-        x = sampled_x + self.ins_noise_scale * torch.randn_like(sampled_x)
+        sampled_x = sampled_x.view(-1, self.gmm_params.D)
+        t = t.view(-1, 1)
+        x = sampled_x + self.ins_noise_scale * torch.randn_like(sampled_x) * (1 - t)
 
         new_atoms = PointCloud(
             x=x.view(-1, self.gmm_params.D),
