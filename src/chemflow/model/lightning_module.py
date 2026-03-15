@@ -1192,7 +1192,11 @@ class LightningModuleRates(pl.LightningModule):
 
             # Save  state to trajectory
             mol_traj.append(mol_t_cloned)
-
+        
+        final_mol = mol_1_pred.clone()
+        final_mol.remove_com()
+        final_mol.x = final_mol.x * self.distributions.coordinate_std
+        mol_traj.append(final_mol)
         if return_traj:
             # rectify the trajectory such that we get a traj for each molecule
             traj_lists = [mol_traj_i.to_data_list() for mol_traj_i in mol_traj]
