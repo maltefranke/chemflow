@@ -253,6 +253,8 @@ class LightningModuleRates(pl.LightningModule):
             "budget": lambda t: self.integrator.ins_schedule.rate(t).clamp(max=100.0),
         }
 
+        # time_weights = {}
+
         self.loss_accumulator = LossAccumulator(
             self.loss_weight_wrapper, self.LOSS_GROUPS, self.device, time_weights
         )
@@ -824,9 +826,12 @@ class LightningModuleRates(pl.LightningModule):
             del_budget_target = mols_t.n_del_missing
 
             # Insertion node-wise rates: directly use the predicted rates.
-            ins_rate_node = ins_rate_pred.view(-1)
+            ins_rate_node = ins_rate_pred.view(-1, 1)
+            p_ins = torch.sigmoid(do_ins_head.view(-1, 1))
+            ins_node_expected = ins_rate_node * p_ins
+
             ins_graph_expected = unsorted_segment_sum(
-                ins_rate_node.view(-1, 1),
+                ins_node_expected,
                 mols_t.batch,
                 mols_t.num_graphs,
             ).view(-1)

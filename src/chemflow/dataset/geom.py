@@ -126,7 +126,7 @@ class GEOM(Dataset):
             self.process()
 
         # Load processed data
-        self.data_list = torch.load(self.processed_file)
+        self.data_list = torch.load(self.processed_file, weights_only=False)
 
     def process(self):
         """
@@ -193,11 +193,15 @@ class FlowMatchingGEOMDataset(GEOM):
         distributions: Distributions,
         transform=None,
         pre_transform=None,
+        rotate=False,
+        split="train",
     ):
-        super().__init__(root, transform, pre_transform)
+        super().__init__(root, split, transform, pre_transform)
 
         self.vocab = vocab
         self.distributions = distributions
+
+        self.rotate = rotate
 
     def __getitem__(self, index):
         data = super().__getitem__(index)

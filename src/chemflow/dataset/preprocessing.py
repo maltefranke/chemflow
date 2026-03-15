@@ -3,15 +3,14 @@
 import os
 
 import torch
+from torch_geometric.data import Dataset
 from torch_geometric.utils import to_dense_adj
 
-from chemflow.dataset.vocab import Vocab, Distributions
-from chemflow.dataset.qm9 import QM9Charges
-from chemflow.utils.utils  import (
+from chemflow.dataset.vocab import Distributions, Vocab
+from chemflow.utils.utils import (
     token_to_index,
     z_to_atom_types,
 )
-from torch_geometric.data import Dataset
 
 
 
@@ -218,26 +217,13 @@ class Preprocessing:
 
     def _compute_distributions(self) -> dict[str, torch.Tensor]:
         """Compute distributions from the training dataset."""
-        # Load QM9 dataset to compute distributions
-        dataset = QM9Charges(root=self.root)
-
-        # Compute atom type distribution
-        atom_types = z_to_atom_types(dataset.z.tolist())
-        atom_type_indices = [
-            token_to_index(self.vocab.atom_tokens, token) for token in atom_types
-        ]
-        atom_type_indices = torch.tensor(atom_type_indices, dtype=torch.long)
-
-        # Create distribution over all tokens
-        all_token_indices = torch.arange(len(self.vocab.atom_tokens), dtype=torch.long)
-        atom_type_distribution = (
-            atom_type_indices.unsqueeze(1) == all_token_indices
-        ).sum(dim=0)
-        atom_type_distribution = atom_type_distribution / atom_type_distribution.sum()
+        # Compute distributions from the provided training dataset only.
+        dataset = self.train_dataset
 
         # Compute edge type and number of atoms distributions
         # Also collect coordinates for std calculation
         all_num_atoms = []
+        all_atom_type_indices = []
         all_edge_type_indices = []
         all_coords = []
         all_charges = []
@@ -245,6 +231,14 @@ class Preprocessing:
         for i in range(len(dataset)):
             data = dataset[i]
             num_atoms = data.num_nodes
+
+            atom_types = z_to_atom_types(data.z.tolist())
+            atom_type_indices = [
+                token_to_index(self.vocab.atom_tokens, token) for token in atom_types
+            ]
+            all_atom_type_indices.append(
+                torch.tensor(atom_type_indices, dtype=torch.long)
+            )
 
             # Convert edge_attr (one-hot) to dense adjacency matrix
             # This gives: 0=no bond, 1=single, 2=double, 3=triple, 4=aromatic
@@ -289,6 +283,12 @@ class Preprocessing:
         n_atoms_distribution = all_num_atoms.bincount()
         n_atoms_distribution = n_atoms_distribution / n_atoms_distribution.sum()
 
+        all_atom_type_indices = torch.cat(all_atom_type_indices, dim=0)
+        atom_type_distribution = all_atom_type_indices.bincount(
+            minlength=len(self.vocab.atom_tokens)
+        ).float()
+        atom_type_distribution = atom_type_distribution / atom_type_distribution.sum()
+
         # Concatenate all edge type indices and compute distribution
         all_edge_type_indices = torch.cat(all_edge_type_indices, dim=0)
 
@@ -308,14 +308,22 @@ class Preprocessing:
             edge_type_distribution = torch.ones(num_edge_tokens) / num_edge_tokens
 
         # Compute charge type distribution
-        all_charges = torch.cat(all_charges, dim=0)
-        charge_type_indices = all_charges.long()
-        charge_type_distribution = charge_type_indices.bincount(
-            minlength=len(self.vocab.charge_tokens)
-        )
-        charge_type_distribution = (
-            charge_type_distribution / charge_type_distribution.sum()
-        )
+        if all_charges:
+            all_charges = torch.cat(all_charges, dim=0)
+            charge_type_indices = all_charges.long()
+            charge_type_distribution = charge_type_indices.bincount(
+                minlength=len(self.vocab.charge_tokens)
+            ).float()
+            charge_type_distribution = (
+                charge_type_distribution / charge_type_distribution.sum()
+            )
+        else:
+            charge_type_distribution = torch.ones(
+                len(self.vocab.charge_tokens), dtype=torch.float32
+            )
+            charge_type_distribution = (
+                charge_type_distribution / charge_type_distribution.sum()
+            )
 
         # Compute coordinate std across all coordinates in the dataset
         all_coords = torch.cat(all_coords, dim=0)  # Shape: (total_atoms, 3)

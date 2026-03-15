@@ -194,6 +194,7 @@ class FlowMatchingQM9Dataset(QM9Charges):
         transform=None,
         pre_transform=None,
         rotate=False,
+        split="train",
     ):
         super().__init__(root, transform, pre_transform)
 

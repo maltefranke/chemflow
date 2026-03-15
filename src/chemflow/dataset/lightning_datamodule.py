@@ -11,6 +11,7 @@ from chemflow.dataset.flow_matching_wrapper import (
     worker_init_fn,
 )
 
+
 class LightningDataModule(pl.LightningDataModule):
     def __init__(
         self,
@@ -72,7 +73,7 @@ class LightningDataModule(pl.LightningDataModule):
         # Inject tokens and distributions into dataset configs
         train_cfg = self.datasets.train.copy()
         base_train = hydra.utils.instantiate(
-            train_cfg, vocab=self.vocab, distributions=self.distributions
+            train_cfg, vocab=self.vocab, distributions=self.distributions, split="train"
         )
         self.train_dataset = FlowMatchingDatasetWrapper(
             base_dataset=base_train,
@@ -87,7 +88,7 @@ class LightningDataModule(pl.LightningDataModule):
         for dataset_cfg in self.datasets.val:
             val_cfg = dataset_cfg.copy()
             base_val = hydra.utils.instantiate(
-                val_cfg, vocab=self.vocab, distributions=self.distributions
+                val_cfg, vocab=self.vocab, distributions=self.distributions, split="val"
             )
             self.val_datasets.append(
                 FlowMatchingDatasetWrapper(
@@ -104,7 +105,10 @@ class LightningDataModule(pl.LightningDataModule):
         for dataset_cfg in self.datasets.test:
             test_cfg = dataset_cfg.copy()
             base_test = hydra.utils.instantiate(
-                test_cfg, vocab=self.vocab, distributions=self.distributions
+                test_cfg,
+                vocab=self.vocab,
+                distributions=self.distributions,
+                split="test",
             )
             self.test_datasets.append(
                 FlowMatchingDatasetWrapper(
