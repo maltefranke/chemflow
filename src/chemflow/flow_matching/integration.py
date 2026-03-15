@@ -124,12 +124,8 @@ class RateIntegrator:
 
         elif self.time_strategy == "log":
             # torch requires the log of the start and end points
-            start_log = torch.log10(torch.tensor(1e-5, device=self.device))
-            end_log = torch.log10(torch.tensor(1.0, device=self.device))
-            time_points = (
-                1 - torch.logspace(start_log, end_log, num_steps + 1)
-            ).tolist()
-            time_points.reverse()
+            time_points = (1 - torch.logspace(0, -2, num_steps + 1)).tolist()
+            time_points.reverse()  # reverse to start from 0 and go to 1
         else:
             raise ValueError(f"Invalid time strategy: {self.time_strategy}")
 
