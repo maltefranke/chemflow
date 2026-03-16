@@ -1,15 +1,16 @@
 import numpy as np
-from scipy.optimize import linear_sum_assignment
 import torch
+from rdkit import Chem
+from scipy.optimize import linear_sum_assignment
 
-from chemflow.utils.utils import rigid_alignment
-
+from chemflow.dataset.data_utils import get_mcs_atom_mapping
 from chemflow.dataset.molecule_data import (
     AugmentedMoleculeData,
     MoleculeBatch,
     MoleculeData,
     filter_nodes,
 )
+from chemflow.utils.utils import rigid_alignment
 
 
 def distance_based_assignment(x0, x1):
@@ -129,6 +130,183 @@ def distance_and_class_based_assignment(
     row_ind, col_ind = linear_sum_assignment(aug_cost)
 
     return row_ind, col_ind
+
+
+def mcs_constrained_assignment(
+    x0,
+    x1,
+    a0,
+    a1,
+    mcs_pairs: list[tuple[int, int]],
+    c_move=1.0,
+    c_sub=10.0,
+    c_ins=5.0,
+    c_del=10.0,
+):
+    """Run OT on non-MCS atoms and merge with fixed MCS pairs.
+
+    This enforces backbone matches from ``mcs_pairs`` and computes all
+    remaining assignments with the same partial OT routine used elsewhere.
+    """
+    N = x0.shape[0]
+    M = x1.shape[0]
+
+    # Keep only valid, one-to-one MCS pairs.
+    valid_pairs = []
+    used_src = set()
+    used_tgt = set()
+    for i_s, i_t in mcs_pairs:
+        if not (0 <= i_s < N and 0 <= i_t < M):
+            continue
+        if i_s in used_src or i_t in used_tgt:
+            continue
+        valid_pairs.append((i_s, i_t))
+        used_src.add(i_s)
+        used_tgt.add(i_t)
+
+    unmatched_src = [i for i in range(N) if i not in used_src]
+    unmatched_tgt = [j for j in range(M) if j not in used_tgt]
+    n_u = len(unmatched_src)
+    m_u = len(unmatched_tgt)
+
+    # Pair list in the augmented global index spaces:
+    # source indices in [0, N+M), target indices in [0, M+N)
+    global_pairs: list[tuple[int, int]] = []
+
+    # 1) Force MCS real-real pairs.
+    for i_s, i_t in valid_pairs:
+        global_pairs.append((i_s, i_t))
+
+    # 2) Pair corresponding MCS dummies with each other.
+    #    source dummy for target i_t is N + i_t
+    #    target dummy for source i_s is M + i_s
+    for i_s, i_t in valid_pairs:
+        global_pairs.append((N + i_t, M + i_s))
+
+    # 3) Solve the reduced OT for non-MCS atoms only.
+    if n_u > 0 and m_u > 0:
+        row_u, col_u = distance_and_class_based_assignment(
+            x0[np.array(unmatched_src)],
+            x1[np.array(unmatched_tgt)],
+            a0[np.array(unmatched_src)],
+            a1[np.array(unmatched_tgt)],
+            c_move=c_move,
+            c_sub=c_sub,
+            c_ins=c_ins,
+            c_del=c_del,
+        )
+
+        for r_loc, c_loc in zip(row_u.tolist(), col_u.tolist(), strict=True):
+            # Map reduced augmented indices to full augmented indices.
+            if r_loc < n_u:
+                r_glob = unmatched_src[r_loc]
+            else:
+                r_glob = N + unmatched_tgt[r_loc - n_u]
+
+            if c_loc < m_u:
+                c_glob = unmatched_tgt[c_loc]
+            else:
+                c_glob = M + unmatched_src[c_loc - m_u]
+
+            global_pairs.append((r_glob, c_glob))
+    elif n_u == 0 and m_u > 0:
+        # Only insertions remain (all unmatched targets).
+        global_pairs.extend((N + j, j) for j in unmatched_tgt)
+    elif n_u > 0 and m_u == 0:
+        # Only deletions remain (all unmatched sources).
+        global_pairs.extend((i, M + i) for i in unmatched_src)
+
+    if len(global_pairs) != N + M:
+        raise ValueError(
+            "MCS-constrained assignment did not produce a complete matching "
+            f"(got {len(global_pairs)}, expected {N + M})."
+        )
+
+    row_ind = np.array([p[0] for p in global_pairs], dtype=int)
+    col_ind = np.array([p[1] for p in global_pairs], dtype=int)
+
+    # Safety checks: augmented assignment must be a permutation on both sides.
+    if len(np.unique(row_ind)) != (N + M) or len(np.unique(col_ind)) != (N + M):
+        raise ValueError("MCS-constrained assignment produced duplicate indices.")
+
+    return row_ind, col_ind
+
+
+def mcs_based_assignment_single(
+    sample_mol: MoleculeData,
+    target_mol: MoleculeData,
+    smiles_sample: str,
+    smiles_target: str,
+    c_move: float = 1.0,
+    c_sub: float = 10.0,
+    c_ins: float = 5.0,
+    c_del: float = 10.0,
+    optimal_transport: str = "equivariant",
+) -> tuple[AugmentedMoleculeData, AugmentedMoleculeData]:
+    """MCS-guided partial optimal transport alignment.
+
+    Finds the Maximum Common Substructure between the two SMILES, locks the
+    MCS atom pairs in the assignment, then solves the remaining matching with
+    the standard augmented-cost OT.  The interface mirrors
+    ``partial_optimal_transport_single``.
+
+    Note: the atom ordering in each MoleculeData must match the RDKit ordering
+    obtained via ``Chem.AddHs(Chem.MolFromSmiles(smiles))``.
+    """
+    sample = AugmentedMoleculeData.from_molecule(sample_mol)
+    target = AugmentedMoleculeData.from_molecule(target_mol)
+
+    N, M = sample.x.shape[0], target.x.shape[0]
+    x0 = sample.x.detach().cpu().numpy()
+    x1 = target.x.detach().cpu().numpy()
+    a0 = sample.a.detach().cpu().numpy()
+    a1 = target.a.detach().cpu().numpy()
+
+    mcs_pairs = get_mcs_atom_mapping(smiles_sample, smiles_target)
+
+    # Use heavy-atom MCS anchors only. Hydrogens should be resolved by OT in the
+    # non-MCS stage, not hard-fixed by the backbone match.
+    mol_s = Chem.AddHs(Chem.MolFromSmiles(smiles_sample))
+    mol_t = Chem.AddHs(Chem.MolFromSmiles(smiles_target))
+    if mol_s is not None and mol_t is not None:
+        mcs_pairs = [
+            (i_s, i_t)
+            for i_s, i_t in mcs_pairs
+            if mol_s.GetAtomWithIdx(i_s).GetAtomicNum() > 1
+            and mol_t.GetAtomWithIdx(i_t).GetAtomicNum() > 1
+        ]
+
+    # Kabsch pre-alignment using MCS anchor points
+    if len(mcs_pairs) >= 3:
+        mcs_s_idxs = [p[0] for p in mcs_pairs]
+        mcs_t_idxs = [p[1] for p in mcs_pairs]
+        pts_s = torch.tensor(x0[mcs_s_idxs], dtype=torch.float32)
+        pts_t = torch.tensor(x1[mcs_t_idxs], dtype=torch.float32)
+        R, t = rigid_alignment(pts_s, pts_t)
+        x0 = (torch.tensor(x0, dtype=torch.float32) @ R.T + t).numpy()
+        sample.x = torch.tensor(x0, dtype=sample.x.dtype)
+
+    row_ind, col_ind = mcs_constrained_assignment(
+        x0, x1, a0, a1, mcs_pairs, c_move, c_sub, c_ins, c_del
+    )
+
+    sample.pad(num_auxiliary=M).permute_nodes(row_ind)
+    target.pad(num_auxiliary=N).permute_nodes(col_ind)
+
+    sample_is_aux = sample.is_auxiliary.squeeze()
+    target_is_aux = target.is_auxiliary.squeeze()
+    valid_mask = ~(sample_is_aux & target_is_aux)
+
+    if optimal_transport == "equivariant":
+        match_mask = (~sample_is_aux) & (~target_is_aux)
+        if match_mask.sum() > 0:
+            R, t = rigid_alignment(sample.x[match_mask], target.x[match_mask])
+            sample.x = sample.x @ R.T + t
+
+    sample = filter_nodes(sample, valid_mask)
+    target = filter_nodes(target, valid_mask)
+
+    return sample, target
 
 
 def partial_optimal_transport_single(

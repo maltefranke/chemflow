@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 from chemflow.flow_matching.schedules import FastPowerSchedule
 from chemflow.flow_matching.schedules import SmoothstepSchedule
+from chemflow.utils.utils import init_uniform_prior
 
 # resolvers for more complex config expressions
 OmegaConf.register_new_resolver("oc.eval", eval)
@@ -289,6 +290,7 @@ def run(cfg: DictConfig):
 
     vocab = preprocessing.vocab
     distributions = preprocessing.distributions
+    token_prior_distribution = init_uniform_prior(distributions)
 
     cfg.data.vocab = vocab
     print(distributions)
@@ -306,7 +308,7 @@ def run(cfg: DictConfig):
         cfg.data.datamodule,
         _recursive_=False,
         vocab=vocab,
-        distributions=distributions,
+        distributions=token_prior_distribution,
     )
     datamodule.setup()
 
@@ -319,12 +321,12 @@ def run(cfg: DictConfig):
 
     interpolator = Interpolator(
         vocab=vocab,
-        distributions=distributions,
+        distributions=token_prior_distribution,
         ins_noise_scale=0.25,
         ins_schedule=SmoothstepSchedule(shift=0.65),
         del_schedule=SmoothstepSchedule(shift=0.65),
-        sub_schedule=SmoothstepSchedule(shift=1.0),
-        sub_e_schedule=SmoothstepSchedule(shift=1.0),
+        sub_schedule=SmoothstepSchedule(shift=1.5),
+        sub_e_schedule=SmoothstepSchedule(shift=1.5),
         c_del=0.0,
         c_ins=1e8,
         c_sub=0.0,
@@ -334,7 +336,7 @@ def run(cfg: DictConfig):
     integrator = hydra.utils.instantiate(
         cfg.model.integrator,
         vocab=vocab,
-        distributions=distributions,
+        distributions=token_prior_distribution,
     )
 
     num_steps = 100
