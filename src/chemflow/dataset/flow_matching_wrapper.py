@@ -59,7 +59,7 @@ class FlowMatchingDatasetWrapper(Dataset):
 
         if self.stage == "train":
             t = self.time_dist.sample((1,)).squeeze(0)
-            t = torch.clamp(t, min=0.0, max=1 - 1e-6)
+            t = torch.clamp(t, min=0.0, max=1 - 1e-8)
 
             mol_t, mol_1, ins_targets = self.interpolator.interpolate_single(
                 sample, target, t.item()

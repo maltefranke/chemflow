@@ -1,5 +1,6 @@
 """Preprocessing class for calculating token distributions from datasets."""
 
+import importlib
 import os
 
 import torch
@@ -11,7 +12,6 @@ from chemflow.utils.utils import (
     token_to_index,
     z_to_atom_types,
 )
-
 
 
 class Preprocessing:
@@ -32,7 +32,7 @@ class Preprocessing:
     def __init__(
         self,
         root: str,
-        train_dataset: Dataset,
+        train_dataset: Dataset | dict | None = None,
         atom_tokens_path: str = None,
         edge_tokens_path: str = None,
         charge_tokens_path: str = None,
@@ -43,7 +43,11 @@ class Preprocessing:
 
         Args:
             root: Root directory path for the QM9 dataset
-            tokens_path: Path to save/load tokens. If None, uses root/tokens.txt
+            train_dataset: Training dataset instance or Hydra config for lazy
+                instantiation. It is only instantiated when preprocessing files are
+                missing.
+            atom_tokens_path: Path to save/load atom tokens.
+                If None, uses root/atom_tokens.txt
             edge_tokens_path: Path to save/load edge tokens.
                 If None, uses root/edge_tokens.txt
             charge_tokens_path: Path to save/load charge tokens.
@@ -52,7 +56,8 @@ class Preprocessing:
                 If None, uses root/distributions.pt
         """
         self.root = root
-        self.train_dataset = train_dataset
+        self._train_dataset_cfg = train_dataset
+        self.train_dataset = None
 
         # Set default tokens path if not provided
         if atom_tokens_path is None:
@@ -75,12 +80,45 @@ class Preprocessing:
         self.charge_tokens_path = charge_tokens_path
         self.distributions_path = distributions_path
 
+        has_all_files = (
+            os.path.exists(self.atom_tokens_path)
+            and os.path.exists(self.edge_tokens_path)
+            and os.path.exists(self.charge_tokens_path)
+            and os.path.exists(self.distributions_path)
+        )
+
+        if not has_all_files:
+            self._ensure_train_dataset()
+
         # Load or compute tokens (both computed together if either is missing)
         self.vocab = self._load_or_compute_tokens()
         self.distributions = self._load_or_compute_distributions()
 
         # remove train dataset to free memory
-        del self.train_dataset
+        self.train_dataset = None
+
+    def _ensure_train_dataset(self):
+        """Instantiate train dataset lazily only when preprocessing needs it."""
+        if self.train_dataset is not None:
+            return
+
+        if self._train_dataset_cfg is None:
+            raise ValueError(
+                "train_dataset is required when preprocessing artifacts are missing."
+            )
+
+        if isinstance(self._train_dataset_cfg, Dataset):
+            self.train_dataset = self._train_dataset_cfg
+            return
+
+        try:
+            hydra = importlib.import_module("hydra")
+        except ImportError as e:
+            raise ImportError(
+                "Hydra is required to instantiate train_dataset config lazily."
+            ) from e
+
+        self.train_dataset = hydra.utils.instantiate(self._train_dataset_cfg)
 
     def _load_or_compute_tokens(self) -> Vocab:
         """

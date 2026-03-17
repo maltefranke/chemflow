@@ -1,27 +1,28 @@
-from torch.utils.data import Dataset
-import pickle
-import torch
-from torch_geometric.data import Data
-from rdkit import Chem
-from tqdm import tqdm
 import os
+import pickle
+from multiprocessing import get_context
 
-from chemflow.utils.utils import (
-    edge_types_to_triu_entries,
-    edge_types_to_symmetric,
-    z_to_atom_types,
-    token_to_index,
-)
+import torch
+from rdkit import Chem
+from torch.utils.data import Dataset
+from torch_geometric.data import Data
+from tqdm import tqdm
 
 from chemflow.dataset.molecule_data import MoleculeData
-from chemflow.utils.rdkit import mol_is_valid, sanitize_mol_correctly, BOND_IDX_MAP
+from chemflow.dataset.vocab import Distributions, Vocab
+from chemflow.utils.rdkit import BOND_IDX_MAP, mol_is_valid, sanitize_mol_correctly
+from chemflow.utils.utils import (
+    edge_types_to_symmetric,
+    token_to_index,
+    z_to_atom_types,
+)
 
-from chemflow.dataset.vocab import Vocab, Distributions
+PICKLE_PROTOCOL = 4
 
 
 def process_one_conformer(mol: Chem.Mol):
-    """
-    Process a single conformer (molecule) and extract features.
+    """Process a single RDKit conformer and extract features.
+
     Returns a Data object or None if processing fails.
     """
     if mol is None or not mol_is_valid(mol, allow_charged=True):
@@ -37,7 +38,6 @@ def process_one_conformer(mol: Chem.Mol):
         pos = conf.GetPositions()
         pos = torch.tensor(pos, dtype=torch.float)
 
-        # Extract atomic numbers and charges
         charges = []
         atomic_number = []
         for atom in mol.GetAtoms():
@@ -47,7 +47,6 @@ def process_one_conformer(mol: Chem.Mol):
         z = torch.tensor(atomic_number, dtype=torch.long)
         charges = torch.tensor(charges, dtype=torch.int64)
 
-        # Extract edges
         rows, cols, edge_types = [], [], []
         for bond in mol.GetBonds():
             start, end = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
@@ -56,14 +55,12 @@ def process_one_conformer(mol: Chem.Mol):
             edge_types += 2 * [BOND_IDX_MAP[bond.GetBondType()]]
 
         if len(rows) == 0:
-            # Handle molecules with no bonds
             edge_index = torch.tensor([[], []], dtype=torch.long)
             edge_type = torch.tensor([], dtype=torch.long)
         else:
             edge_index = torch.tensor([rows, cols], dtype=torch.long)
             edge_type = torch.tensor(edge_types, dtype=torch.long)
 
-            # Sort edges
             perm = (edge_index[0] * N + edge_index[1]).argsort()
             edge_index = edge_index[:, perm]
             edge_type = edge_type[perm]
@@ -85,11 +82,108 @@ def process_one_conformer(mol: Chem.Mol):
         return None
 
 
-class GEOM(Dataset):
+def mol_to_bytes(data: Data) -> bytes:
+    """Serialize a processed molecule Data object to compact pickle bytes.
+
+    Stores only the raw tensor data as a plain dict, avoiding the overhead
+    of pickling full PyG Data objects.
     """
-    GEOM dataset with parallel preprocessing.
-    Processes pickle/parquet files containing (smiles, list of conformers) tuples.
-    Each conformer becomes a separate entry in the dataset.
+    dict_repr = {
+        "z": data.z,
+        "pos": data.pos,
+        "charges": data.charges,
+        "edge_index": data.edge_index,
+        "edge_attr": data.edge_attr,
+        "smiles": data.smiles,
+    }
+    return pickle.dumps(dict_repr, protocol=PICKLE_PROTOCOL)
+
+
+def mol_from_bytes(data: bytes) -> Data:
+    """Deserialize pickle bytes back into a PyG Data object."""
+    obj = pickle.loads(data)
+    return Data(
+        z=obj["z"],
+        pos=obj["pos"],
+        charges=obj["charges"],
+        edge_index=obj["edge_index"],
+        smiles=obj["smiles"],
+        edge_attr=obj["edge_attr"],
+    )
+
+
+def save_dataset_bytes(mol_bytes_list: list[bytes], filepath: str) -> None:
+    """Save a list of serialized molecule bytes to a single pickle file."""
+    with open(filepath, "wb") as f:
+        pickle.dump(mol_bytes_list, f, protocol=PICKLE_PROTOCOL)
+
+
+def load_dataset_bytes(filepath: str) -> list[bytes]:
+    """Load a list of serialized molecule bytes from a pickle file."""
+    with open(filepath, "rb") as f:
+        return pickle.load(f)
+
+
+def process_one_conformer_to_bytes(mol: Chem.Mol) -> bytes | None:
+    """Process one conformer and return serialized bytes if valid."""
+    data = process_one_conformer(mol)
+    if data is None:
+        return None
+    return mol_to_bytes(data)
+
+
+def process_conformers_parallel(
+    conformers: list[Chem.Mol],
+    num_workers: int | None = None,
+    chunksize: int = 128,
+) -> tuple[list[bytes], int]:
+    """Process conformers in parallel with multiprocessing.
+
+    Args:
+        conformers: RDKit conformers to process.
+        num_workers: Number of processes. Defaults to ``max(cpu_count - 1, 1)``.
+        chunksize: Chunk size for ``imap_unordered``.
+    """
+    if num_workers is None:
+        cpu_count = os.cpu_count() or 1
+        num_workers = max(1, cpu_count - 1)
+
+    if num_workers <= 1:
+        mol_bytes_list = []
+        n_failed = 0
+        for conformer in tqdm(conformers, desc="Processing conformers"):
+            out = process_one_conformer_to_bytes(conformer)
+            if out is None:
+                n_failed += 1
+            else:
+                mol_bytes_list.append(out)
+        return mol_bytes_list, n_failed
+
+    mol_bytes_list = []
+    n_failed = 0
+    ctx = get_context("spawn")
+    with ctx.Pool(processes=num_workers) as pool:
+        outputs = pool.imap_unordered(
+            process_one_conformer_to_bytes, conformers, chunksize=chunksize
+        )
+        for out in tqdm(outputs, total=len(conformers), desc="Processing conformers"):
+            if out is None:
+                n_failed += 1
+            else:
+                mol_bytes_list.append(out)
+
+    return mol_bytes_list, n_failed
+
+
+class GEOM(Dataset):
+    """GEOM dataset with pickle-bytes serialization for fast loading.
+
+    Raw pickle files containing (smiles, list of conformers) tuples are
+    processed once via ``process()`` or a standalone preprocessing script.
+    Each conformer is serialized to compact pickle bytes (via ``mol_to_bytes``)
+    and stored in a single ``.pkl`` file.  Subsequent loads deserialize only
+    the byte-string list (no tensor reconstruction), and individual molecules
+    are reconstructed lazily in ``__getitem__``.
     """
 
     def __init__(
@@ -99,15 +193,6 @@ class GEOM(Dataset):
         vocab: Vocab = None,
         distributions: Distributions = None,
     ):
-        """
-        Initialize GEOM dataset.
-
-        Args:
-            root: Root directory containing raw data files
-            split: Dataset split ('train', 'val', 'test')
-            vocab: Vocab object for token mapping
-            distributions: Distributions object
-        """
         self.root = root
         self.split = split
         self.vocab = vocab
@@ -116,24 +201,17 @@ class GEOM(Dataset):
         self.raw_dir = os.path.join(root, "raw")
         self.processed_dir = os.path.join(root, "processed")
 
-        # Create processed directory if it doesn't exist
         os.makedirs(self.processed_dir, exist_ok=True)
 
-        self.processed_file = os.path.join(self.processed_dir, f"{split}_data.pt")
+        self.processed_file = os.path.join(self.processed_dir, f"{split}_data.pkl")
 
-        # Process data if not already processed
         if not os.path.exists(self.processed_file):
             self.process()
 
-        # Load processed data
-        self.data_list = torch.load(self.processed_file, weights_only=False)
+        self._mol_bytes = load_dataset_bytes(self.processed_file)
 
     def process(self):
-        """
-        Process raw pickle files serially.
-        Each conformer from the pickle file becomes a separate Data object.
-        """
-        # Load raw data
+        """Process raw pickle files and save as serialized molecule bytes."""
         raw_file = os.path.join(self.raw_dir, f"{self.split}_data.pickle")
 
         if not os.path.exists(raw_file):
@@ -143,46 +221,32 @@ class GEOM(Dataset):
         with open(raw_file, "rb") as f:
             raw_data = pickle.load(f)
 
-        # Flatten: create list of all conformers with their SMILES
         print("Preparing conformers for processing...")
-        all_conformers = []
-        all_smiles_list = []
+        all_conformers = [
+            conformer
+            for _smiles, conformers_list in tqdm(raw_data, desc="Preparing data")
+            for conformer in conformers_list
+        ]
 
-        for smiles, conformers_list in tqdm(raw_data, desc="Preparing data"):
-            for conformer in conformers_list:
-                all_conformers.append(conformer)
-                all_smiles_list.append(smiles)
-
-        # Clean up raw data to free memory
         del raw_data
 
         print(f"Total conformers to process: {len(all_conformers)}")
+        print(f"Processing {len(all_conformers)} conformers with multiprocessing...")
+        mol_bytes_list, n_failed = process_conformers_parallel(all_conformers)
 
-        # Process serially
-        print(f"Processing {len(all_conformers)} conformers...")
-        data_list = []
-        for conformer in tqdm(all_conformers, desc="Processing conformers"):
-            data = process_one_conformer(conformer)
-            if data is not None:
-                data_list.append(data)
-        print(f"Successfully processed: {len(data_list)} molecules")
-        print(f"Failed: {len(all_conformers) - len(data_list)} molecules")
+        print(f"Successfully processed: {len(mol_bytes_list)} molecules")
+        print(f"Failed: {n_failed} molecules")
 
-        # Clean up to free memory
         del all_conformers
-        del all_smiles_list
 
-        # Save processed data
         print(f"Saving processed data to {self.processed_file}...")
-        torch.save(data_list, self.processed_file)
+        save_dataset_bytes(mol_bytes_list, self.processed_file)
 
     def __len__(self):
-        return len(self.data_list)
+        return len(self._mol_bytes)
 
     def __getitem__(self, index):
-        data = self.data_list[index]
-
-        return data
+        return mol_from_bytes(self._mol_bytes[index])
 
 
 class FlowMatchingGEOMDataset(GEOM):
