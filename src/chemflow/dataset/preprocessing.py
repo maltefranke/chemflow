@@ -176,7 +176,7 @@ class Preprocessing:
         all_charge_tokens = set()
 
         for i in range(len(self.train_dataset)):
-            data = self.train_dataset[i]
+            data = self.train_dataset.get(i)
 
             # Extract atom types
             atom_types = z_to_atom_types(data.z.tolist())
@@ -267,7 +267,7 @@ class Preprocessing:
         all_charges = []
 
         for i in range(len(dataset)):
-            data = dataset[i]
+            data = dataset.get(i)
             num_atoms = data.num_nodes
 
             atom_types = z_to_atom_types(data.z.tolist())

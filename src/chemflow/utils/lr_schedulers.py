@@ -1,5 +1,5 @@
-from torch.optim.lr_scheduler import _LRScheduler
 import math
+from torch.optim.lr_scheduler import _LRScheduler
 
 
 class LinearOneCycleLR(_LRScheduler):
@@ -107,3 +107,47 @@ class MultiGroupCosineWarmupLR(_LRScheduler):
         multiplier = self.min_lr_fraction + (1.0 - self.min_lr_fraction) * cosine_decay
 
         return [base_lr * multiplier for base_lr in self.base_lrs]
+
+
+class EMADecayScheduler:
+    """EMA decay scheduler with hold + fast ramp + slow ramp phases."""
+
+    def __init__(
+        self,
+        initial_decay: float,
+        mid_decay: float,
+        final_decay: float,
+        warmup_epochs: int,
+        fast_ramp_epochs: int,
+        total_epochs: int,
+    ):
+        self.initial_decay = float(initial_decay)
+        self.mid_decay = float(mid_decay)
+        self.final_decay = float(final_decay)
+        self.warmup_epochs = max(0, int(warmup_epochs))
+        self.fast_ramp_epochs = max(0, int(fast_ramp_epochs))
+        self.total_epochs = int(total_epochs)
+
+    def get_decay(self, current_epoch: int) -> float:
+        """Return EMA decay for the given epoch within total training epochs."""
+        if self.total_epochs <= 1:
+            return float(self.final_decay)
+
+        current_epoch = min(max(0, int(current_epoch)), self.total_epochs - 1)
+        last_epoch = float(self.total_epochs - 1)
+        warmup = float(min(self.warmup_epochs, self.total_epochs - 1))
+        fast_end = float(
+            min(self.warmup_epochs + self.fast_ramp_epochs, self.total_epochs - 1)
+        )
+
+        if current_epoch < warmup:
+            return float(self.initial_decay)
+
+        if current_epoch < fast_end:
+            progress = (float(current_epoch) - warmup) / max(fast_end - warmup, 1e-8)
+            return float(
+                self.initial_decay + progress * (self.mid_decay - self.initial_decay)
+            )
+
+        progress = (float(current_epoch) - fast_end) / max(last_epoch - fast_end, 1e-8)
+        return float(self.mid_decay + progress * (self.final_decay - self.mid_decay))

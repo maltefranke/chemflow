@@ -9,12 +9,19 @@ from chemflow.utils.utils import (
 )
 
 import sys
-
+import os
 from tqdm import tqdm
+
+from rdkit import Chem, RDLogger
+from rdkit.Chem.rdchem import BondType as BT
+from rdkit.Chem.rdchem import HybridizationType
+
+RDLogger.DisableLog("rdApp.*")  # type: ignore[attr-defined]
 
 from torch_geometric.data import Data
 from torch_geometric.io import fs
 from torch_geometric.utils import one_hot, scatter
+from torch_geometric.data import InMemoryDataset, download_url, extract_zip
 
 from chemflow.dataset.molecule_data import MoleculeData
 from chemflow.dataset.vocab import Vocab, Distributions
@@ -22,48 +29,46 @@ from chemflow.utils.rdkit import mol_is_valid, sanitize_mol_correctly, BOND_IDX_
 from scipy.spatial.transform import Rotation
 
 
-class QM9Charges(QM9):
+class RevisedQM9(InMemoryDataset):
     """
     QM9 dataset from PyG, adapted to also process charges.
-    """  # noqa: E501
+    We use the data from PropMolFlow which fixes some major issues with the original QM9 dataset.
+    """
 
-    # TODO we should overwrite the process methods to use the rQM9 dataset instead!
+    mols_url = "https://zenodo.org/records/15700961/files/all_fixed_gdb9.zip"
+    props_url = "https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/molnet_publish/qm9.zip"
+    split_to_index = {"train": 0, "val": 1, "test": 2}
+
+    @property
+    def raw_file_names(self) -> list[str]:
+        return ["all_fixed_gdb9.sdf", "gdb9.sdf.csv"]
+
+    @property
+    def processed_file_names(self) -> list[str]:
+        return ["train.pt", "val.pt", "test.pt"]
+
+    def load(self, split: str) -> None:
+        if split not in self.split_to_index:
+            raise ValueError(
+                f"Invalid split '{split}'. Expected one of {tuple(self.split_to_index)}."
+            )
+        super().load(self.processed_paths[self.split_to_index[split]])
+
+    def download(self) -> None:
+        file_path = download_url(self.mols_url, self.raw_dir)
+        extract_zip(file_path, self.raw_dir)
+        os.unlink(file_path)
+
+        file_path = download_url(self.props_url, self.raw_dir)
+        extract_zip(file_path, self.raw_dir)
+
+        os.unlink(file_path)
+        # also delete the extra data file in the zip
+        os.unlink(os.path.join(self.raw_dir, "gdb9.sdf"))
 
     def process(self) -> None:
-        try:
-            from rdkit import Chem, RDLogger
-            from rdkit.Chem.rdchem import BondType as BT
-            from rdkit.Chem.rdchem import HybridizationType
-
-            RDLogger.DisableLog("rdApp.*")  # type: ignore[attr-defined]
-            WITH_RDKIT = True
-
-        except ImportError:
-            WITH_RDKIT = False
-
-        if not WITH_RDKIT:
-            print(
-                (
-                    "Using a pre-processed version of the dataset. Please "
-                    "install 'rdkit' to alternatively process the raw data."
-                ),
-                file=sys.stderr,
-            )
-
-            data_list = fs.torch_load(self.raw_paths[0])
-            data_list = [Data(**data_dict) for data_dict in data_list]
-
-            if self.pre_filter is not None:
-                data_list = [d for d in data_list if self.pre_filter(d)]
-
-            if self.pre_transform is not None:
-                data_list = [self.pre_transform(d) for d in data_list]
-
-            self.save(data_list, self.processed_paths[0])
-            return
 
         types = {"H": 0, "C": 1, "N": 2, "O": 3, "F": 4}
-        # bonds = {"NO_BOND": 0, "SINGLE": 1, "DOUBLE": 2, "TRIPLE": 3, "AROMATIC": 4}
         bonds = BOND_IDX_MAP
 
         with open(self.raw_paths[1]) as f:
@@ -74,9 +79,6 @@ class QM9Charges(QM9):
             y = torch.tensor(target, dtype=torch.float)
             y = torch.cat([y[:, 3:], y[:, :3]], dim=-1)
             y = y * conversion.view(1, -1)
-
-        with open(self.raw_paths[2]) as f:
-            skip = [int(x.split()[0]) - 1 for x in f.read().split("\n")[9:-2]]
 
         suppl = Chem.SDMolSupplier(self.raw_paths[0], removeHs=False, sanitize=False)
 
@@ -179,13 +181,18 @@ class QM9Charges(QM9):
 
             data_list.append(data)
 
-        self.save(data_list, self.processed_paths[0])
+        n_train = 100_000
+        n_val = 20_000
+
+        self.save(data_list[:n_train], self.processed_paths[0])
+        self.save(data_list[n_train : n_train + n_val], self.processed_paths[1])
+        self.save(data_list[n_train + n_val :], self.processed_paths[2])
 
         print(f"Errors: {errors}")
         print(f"Skipped: {skipped}")
 
 
-class FlowMatchingQM9Dataset(QM9Charges):
+class FlowMatchingQM9Dataset(RevisedQM9):
     def __init__(
         self,
         root,
@@ -197,6 +204,7 @@ class FlowMatchingQM9Dataset(QM9Charges):
         split="train",
     ):
         super().__init__(root, transform, pre_transform)
+        self.load(split)
 
         self.vocab = vocab
         self.distributions = distributions

@@ -30,6 +30,7 @@ from chemflow.utils.loss_weighing import (
     ShiftedParabolaTimeLossWeighting,
 )
 from chemflow.utils import rdkit as chemflowRD
+from chemflow.utils.lr_schedulers import EMADecayScheduler
 
 
 class LightningModuleRates(pl.LightningModule):
@@ -88,6 +89,7 @@ class LightningModuleRates(pl.LightningModule):
         edit_loss_ema_eps: float = 1e-8,
         # Model EMA (exponential moving average of parameters for stable inference)
         ema_decay: float = 0.999,
+        ema_decay_scheduler: EMADecayScheduler | DictConfig | None = None,
         use_ema_for_eval: bool = True,
         # Classifier-free guidance parameters (property conditioning)
         cfg_dropout_prob: float = 0.0,
@@ -111,6 +113,9 @@ class LightningModuleRates(pl.LightningModule):
         self.edit_loss_ema_decay = float(edit_loss_ema_decay)
         self.edit_loss_ema_eps = float(edit_loss_ema_eps)
         self.ema_decay = float(ema_decay)
+        if isinstance(ema_decay_scheduler, DictConfig):
+            ema_decay_scheduler = hydra.utils.instantiate(ema_decay_scheduler)
+        self.ema_decay_scheduler = ema_decay_scheduler
         self.use_ema_for_eval = use_ema_for_eval
 
         self.gmm_params = gmm_params
@@ -218,7 +223,7 @@ class LightningModuleRates(pl.LightningModule):
         self.register_buffer("ema_do_del_pos", torch.tensor(1.0))
         self.register_buffer("ema_do_del_neg", torch.tensor(1.0))
 
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["ema_decay_scheduler"])
         self.model = hydra.utils.instantiate(model)
 
         self.cfg_adapter = CFGAdapter(
@@ -253,7 +258,7 @@ class LightningModuleRates(pl.LightningModule):
             "budget": lambda t: self.integrator.ins_schedule.rate(t).clamp(max=100.0),
         }
 
-        # time_weights = {}
+        time_weights = {}
 
         self.loss_accumulator = LossAccumulator(
             self.loss_weight_wrapper, self.LOSS_GROUPS, self.device, time_weights
@@ -277,12 +282,26 @@ class LightningModuleRates(pl.LightningModule):
 
     def _update_ema(self):
         """Update EMA parameters: ema = decay * ema + (1 - decay) * model."""
+        ema_decay = float(self.ema_decay)
+        if self.ema_decay_scheduler is not None:
+            ema_decay = self.ema_decay_scheduler.get_decay(
+                current_epoch=self.current_epoch,
+            )
         with torch.no_grad():
             for p_ema, p in zip(
                 self.model_ema.parameters(),
                 self.model.parameters(),
             ):
-                p_ema.mul_(self.ema_decay).add_(p.data, alpha=1.0 - self.ema_decay)
+                p_ema.mul_(ema_decay).add_(p.data, alpha=1.0 - ema_decay)
+
+        self.log(
+            "ema/decay",
+            ema_decay,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            logger=True,
+        )
 
     def _reduce_loss(self, loss, reduction: str = "mean"):
         if reduction == "mean":
@@ -1197,7 +1216,7 @@ class LightningModuleRates(pl.LightningModule):
 
             # Save  state to trajectory
             mol_traj.append(mol_t_cloned)
-        
+
         if return_traj:
             # rectify the trajectory such that we get a traj for each molecule
             traj_lists = [mol_traj_i.to_data_list() for mol_traj_i in mol_traj]
