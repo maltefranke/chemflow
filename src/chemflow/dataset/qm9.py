@@ -223,7 +223,7 @@ class FlowMatchingQM9Dataset(RevisedQM9):
             coord = coord @ rotation.as_matrix()[0]
             coord = coord.to(dtype=data.pos.dtype)
 
-        if self.distributions.coordinate_std is not None:
+        if self.distributions is not None and self.distributions.coordinate_std is not None:
             coord = coord / self.distributions.coordinate_std
 
         atom_types = data.z

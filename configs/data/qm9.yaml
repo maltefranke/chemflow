@@ -20,14 +20,14 @@ preprocessing:
   # Tokens and distributions will be discovered from data and saved to files
   # On subsequent runs, they will be loaded from the files
 
-vocab: None
+vocab: null
 
 interpolator:
   _target_: chemflow.flow_matching.interpolation.Interpolator
   n_atoms_strategy: ${data.n_atoms_strategy}
   # will be set in the instantiate method
   vocab: ${data.vocab}
-  distributions: None
+  distributions: null
   optimal_transport: ${data.optimal_transport}
   ins_noise_scale: ${data.ins_noise_scale}
   del_schedule: ${schedule}
@@ -44,28 +44,28 @@ datamodule:
   # tokens and distributions will be passed from preprocessing in run.py
 
   vocab: ${data.vocab}
-  distributions: None
+  distributions: null
 
   datasets:
     train:
       _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
       root: ${data.root_path}/qm9
       vocab: ${data.vocab}
-      distributions: None
+      distributions: null
       rotate: ${model.rotate}
       
     val:
       - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
         root: ${data.root_path}/qm9
         vocab: ${data.vocab}
-        distributions: None
+        distributions: null
         rotate: ${model.rotate}
 
     test:
       - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
         root: ${data.root_path}/qm9
         vocab: ${data.vocab}
-        distributions: None
+        distributions: null
         rotate: ${model.rotate}
   
   interpolator: ${data.interpolator}
@@ -77,7 +77,7 @@ datamodule:
     predict: 32
 
   batch_size:
-    train: 2048
+    train: 512
     val: 128
     test: 32
 
