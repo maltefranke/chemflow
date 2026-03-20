@@ -2,6 +2,7 @@ import numpy as np
 import torch
 from rdkit import Chem
 from scipy.optimize import linear_sum_assignment
+import hydra
 
 from chemflow.dataset.data_utils import get_mcs_atom_mapping
 from chemflow.dataset.molecule_data import (
@@ -235,8 +236,9 @@ def mcs_constrained_assignment(
 def mcs_based_assignment_single(
     sample_mol: MoleculeData,
     target_mol: MoleculeData,
-    smiles_sample: str,
-    smiles_target: str,
+    smiles_sample: str | None = None,
+    smiles_target: str | None = None,
+    fixed_pairs: list[tuple[int, int]] | None = None,
     c_move: float = 1.0,
     c_sub: float = 10.0,
     c_ins: float = 5.0,
@@ -250,11 +252,17 @@ def mcs_based_assignment_single(
     the standard augmented-cost OT.  The interface mirrors
     ``partial_optimal_transport_single``.
 
+    If ``fixed_pairs`` is provided, it is used directly as the locked atom
+    correspondence (e.g. scaffold pairs) and the MCS computation is skipped;
+    ``smiles_sample`` / ``smiles_target`` are then not required.
+
     Note: the atom ordering in each MoleculeData must match the RDKit ordering
     obtained via ``Chem.AddHs(Chem.MolFromSmiles(smiles))``.
     """
     sample = AugmentedMoleculeData.from_molecule(sample_mol)
     target = AugmentedMoleculeData.from_molecule(target_mol)
+
+    hydra.utils.log.info(f"[MCS] Running MCS-based assignment with {len(fixed_pairs) if fixed_pairs else 'auto-detected'} fixed pairs.")
 
     N, M = sample.x.shape[0], target.x.shape[0]
     x0 = sample.x.detach().cpu().numpy()
@@ -262,19 +270,22 @@ def mcs_based_assignment_single(
     a0 = sample.a.detach().cpu().numpy()
     a1 = target.a.detach().cpu().numpy()
 
-    mcs_pairs = get_mcs_atom_mapping(smiles_sample, smiles_target)
+    if fixed_pairs is not None:
+        mcs_pairs = fixed_pairs
+    else:
+        mcs_pairs = get_mcs_atom_mapping(smiles_sample, smiles_target)
 
-    # Use heavy-atom MCS anchors only. Hydrogens should be resolved by OT in the
-    # non-MCS stage, not hard-fixed by the backbone match.
-    mol_s = Chem.AddHs(Chem.MolFromSmiles(smiles_sample))
-    mol_t = Chem.AddHs(Chem.MolFromSmiles(smiles_target))
-    if mol_s is not None and mol_t is not None:
-        mcs_pairs = [
-            (i_s, i_t)
-            for i_s, i_t in mcs_pairs
-            if mol_s.GetAtomWithIdx(i_s).GetAtomicNum() > 1
-            and mol_t.GetAtomWithIdx(i_t).GetAtomicNum() > 1
-        ]
+        # Use heavy-atom MCS anchors only. Hydrogens should be resolved by OT in the
+        # non-MCS stage, not hard-fixed by the backbone match.
+        mol_s = Chem.AddHs(Chem.MolFromSmiles(smiles_sample))
+        mol_t = Chem.AddHs(Chem.MolFromSmiles(smiles_target))
+        if mol_s is not None and mol_t is not None:
+            mcs_pairs = [
+                (i_s, i_t)
+                for i_s, i_t in mcs_pairs
+                if mol_s.GetAtomWithIdx(i_s).GetAtomicNum() > 1
+                and mol_t.GetAtomWithIdx(i_t).GetAtomicNum() > 1
+            ]
 
     # Kabsch pre-alignment using MCS anchor points
     if len(mcs_pairs) >= 3:

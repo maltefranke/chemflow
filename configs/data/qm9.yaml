@@ -70,6 +70,9 @@ datamodule:
   
   interpolator: ${data.interpolator}
 
+  wrapper:
+    _target_: chemflow.dataset.flow_matching_wrapper.FlowMatchingDatasetWrapper
+
   num_workers:
     train: 32
     val: 32

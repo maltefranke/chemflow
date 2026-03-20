@@ -5,7 +5,6 @@ from omegaconf import DictConfig
 import hydra
 
 from chemflow.dataset.flow_matching_wrapper import (
-    FlowMatchingDatasetWrapper,
     train_collate_fn,
     eval_collate_fn,
     worker_init_fn,
@@ -24,6 +23,7 @@ class LightningDataModule(pl.LightningDataModule):
         n_atoms_strategy: str = "flexible",
         optimal_transport: str = "equivariant",
         time_dist: DictConfig = None,
+        wrapper: DictConfig = None,
     ):
         self.vocab = vocab
         self.distributions = distributions
@@ -33,6 +33,7 @@ class LightningDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.n_atoms_strategy = n_atoms_strategy
         self.optimal_transport = optimal_transport
+        self.wrapper = wrapper
 
         if time_dist is None:
             time_dist = DictConfig(
@@ -75,7 +76,8 @@ class LightningDataModule(pl.LightningDataModule):
         base_train = hydra.utils.instantiate(
             train_cfg, vocab=self.vocab, distributions=self.distributions, split="train"
         )
-        self.train_dataset = FlowMatchingDatasetWrapper(
+        self.train_dataset = hydra.utils.instantiate(
+            self.wrapper,
             base_dataset=base_train,
             distributions=self.distributions,
             interpolator=self.interpolator,
@@ -91,7 +93,8 @@ class LightningDataModule(pl.LightningDataModule):
                 val_cfg, vocab=self.vocab, distributions=self.distributions, split="val"
             )
             self.val_datasets.append(
-                FlowMatchingDatasetWrapper(
+                hydra.utils.instantiate(
+                    self.wrapper,
                     base_dataset=base_val,
                     distributions=self.distributions,
                     interpolator=self.interpolator,
@@ -111,7 +114,8 @@ class LightningDataModule(pl.LightningDataModule):
                 split="test",
             )
             self.test_datasets.append(
-                FlowMatchingDatasetWrapper(
+                hydra.utils.instantiate(
+                    self.wrapper,
                     base_dataset=base_test,
                     distributions=self.distributions,
                     interpolator=self.interpolator,

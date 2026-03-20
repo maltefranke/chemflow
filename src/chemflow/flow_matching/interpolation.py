@@ -252,6 +252,7 @@ class Interpolator:
         sample_mol: MoleculeData,
         target_mol: MoleculeData,
         t_scalar: float,
+        scaffold_pairs: list[tuple[int, int]] | None = None,
     ):
         """Per-sample interpolation (OT alignment + interpolation + rates).
 
@@ -274,15 +275,28 @@ class Interpolator:
         t_i = torch.tensor(t_scalar, device=device)
 
         # ===== 1. OT Alignment =====
-        sample, target = partial_optimal_transport_single(
-            sample_mol,
-            target_mol,
-            c_move=self.c_move,
-            c_sub=self.c_sub,
-            c_ins=self.c_ins,
-            c_del=self.c_del,
-            optimal_transport=self.optimal_transport,
-        )
+        if scaffold_pairs:
+            from chemflow.flow_matching.assignment import mcs_based_assignment_single
+            sample, target = mcs_based_assignment_single(
+                sample_mol,
+                target_mol,
+                fixed_pairs=scaffold_pairs,
+                c_move=self.c_move,
+                c_sub=self.c_sub,
+                c_ins=self.c_ins,
+                c_del=self.c_del,
+                optimal_transport=self.optimal_transport,
+            )
+        else:
+            sample, target = partial_optimal_transport_single(
+                sample_mol,
+                target_mol,
+                c_move=self.c_move,
+                c_sub=self.c_sub,
+                c_ins=self.c_ins,
+                c_del=self.c_del,
+                optimal_transport=self.optimal_transport,
+            )
 
         # ===== 2. Per-pair interpolation =====
         N = sample.x.shape[0]
