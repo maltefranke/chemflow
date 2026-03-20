@@ -5,7 +5,7 @@ preprocess_workers: 0
 
 n_atoms_strategy: "flexible" # "fixed", "approx"
 optimal_transport: "equivariant"
-ins_noise_scale: 0.5
+ins_noise_scale: 0.25
 
 
 # Preprocessing configuration - computes tokens from data and distributions from training dataset only

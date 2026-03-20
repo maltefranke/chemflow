@@ -29,7 +29,8 @@ class Interpolator:
         distributions: Distributions,
         n_atoms_strategy="flexible",
         optimal_transport="equivariant",
-        ins_noise_scale=1.0,
+        move_noise_scale=0.2,
+        ins_noise_scale=0.25,
         ins_schedule: KappaSchedule | None = None,
         del_schedule: KappaSchedule | None = None,
         sub_schedule: KappaSchedule | None = None,
@@ -44,6 +45,7 @@ class Interpolator:
         self.n_atoms_strategy = n_atoms_strategy
 
         self.optimal_transport = optimal_transport
+        self.move_noise_scale = move_noise_scale
         self.ins_noise_scale = ins_noise_scale
 
         if del_schedule is None:
@@ -106,7 +108,9 @@ class Interpolator:
         assert e_0.shape == e_1.shape, "Edge types must have the same shape"
         assert torch.all(edge_index_0 == edge_index_1), "Edge indices must be the same"
 
+        # interpolate positions and add noise
         x_t = self.interpolate_continuous(x_0, x_1, t)
+        x_t = x_t + torch.randn_like(x_t) * self.move_noise_scale
 
         # take kappa_t for discrete variables
         t_kappa = self.sub_schedule.kappa_t(t)
