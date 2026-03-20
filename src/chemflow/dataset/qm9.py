@@ -31,8 +31,7 @@ from scipy.spatial.transform import Rotation
 
 class RevisedQM9(InMemoryDataset):
     """
-    QM9 dataset from PyG, adapted to also process charges.
-    We use the data from PropMolFlow which fixes some major issues with the original QM9 dataset.
+    QM9 dataset from PropMolFlow which fixes some major issues with the original QM9 dataset.
     """
 
     mols_url = "https://zenodo.org/records/15700961/files/all_fixed_gdb9.zip"

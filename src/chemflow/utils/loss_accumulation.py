@@ -81,6 +81,19 @@ class LossAccumulator:
             # 2. Apply masking if provided
             mask = masks.get(key)
             if mask is not None:
+                # Some optional losses can be scalar placeholders (e.g. zeroed dummy
+                # losses when no supervised edges exist). Those are not indexable with
+                # per-graph masks, so treat them as already reduced values.
+                if loss_b.ndim == 0:
+                    if mask.any():
+                        self._raw_losses[key] = loss_b
+                        self._tw_losses[key] = loss_tw_b
+                    else:
+                        zero_loss = (loss_b * 0.0).sum()
+                        self._raw_losses[key] = zero_loss
+                        self._tw_losses[key] = zero_loss
+                    continue
+
                 # Filter both the pure and time-weighted losses
                 valid_raw = loss_b[mask]
                 valid_tw = loss_tw_b[mask]

@@ -123,9 +123,8 @@ class RateIntegrator:
             time_points = torch.linspace(0, 1, num_steps + 1).tolist()
 
         elif self.time_strategy == "log":
-            time_points = (1 - torch.logspace(0, -2, num_steps)).tolist()
-            time_points.reverse()  # reverse to start from 0 and go to 1
-            time_points.append(1.0)
+            time_points = (1 - torch.logspace(0, -4, num_steps)).tolist()
+
         else:
             raise ValueError(f"Invalid time strategy: {self.time_strategy}")
 
@@ -162,7 +161,7 @@ class RateIntegrator:
             ins_gmm_dict, num_ins, K, D, A, C
         )
 
-        # now to interpolation depending on our schedules
+        """# now to interpolation depending on our schedules
         kappa_t = self.sub_schedule.kappa_t(t).unsqueeze(1)
         a_1_one_hot = F.one_hot(sampled_a, num_classes=A)
         c_1_one_hot = F.one_hot(sampled_c, num_classes=C)
@@ -171,14 +170,14 @@ class RateIntegrator:
             self._cat_atom.probs.repeat(c_1_one_hot.shape[0], 1, 1) * (1 - kappa_t)
             + a_1_one_hot * kappa_t
         )
-        a = F.softmax(a, dim=-1)
+        # a = F.softmax(a, dim=-1)
         a = torch.distributions.Categorical(probs=a).sample()
 
         c = (
             self._cat_charge.probs.repeat(c_1_one_hot.shape[0], 1, 1) * (1 - kappa_t)
             + c_1_one_hot * kappa_t
         )
-        c = F.softmax(c, dim=-1)
+        # c = F.softmax(c, dim=-1)
         c = torch.distributions.Categorical(probs=c).sample()
 
         sampled_x = sampled_x.view(-1, self.gmm_params.D)
@@ -192,7 +191,13 @@ class RateIntegrator:
         )
         new_atoms.x_1 = sampled_x.view(-1, self.gmm_params.D)
         new_atoms.a_1 = sampled_a.view(-1)
-        new_atoms.c_1 = sampled_c.view(-1)
+        new_atoms.c_1 = sampled_c.view(-1)"""
+
+        new_atoms = PointCloud(
+            x=sampled_x.view(-1, self.gmm_params.D),
+            a=sampled_a.view(-1),
+            c=sampled_c.view(-1),
+        )
 
         return new_atoms
 
@@ -244,6 +249,12 @@ class RateIntegrator:
         x_t, a_t, _, e_t, edge_index, batch_id = mol_t.unpack()
         x_1, a_1, c_1, e_1, edge_index_1, _ = mol_1_pred.unpack()
 
+        """FOR NOISING"""
+        gamma = torch.clamp(1.0 - t**2, min=0.0)
+        noise_scale = 0.0
+        noise_weight = gamma * noise_scale
+        noise_weight_node = noise_weight[batch_id]
+
         # Rate for movement
         # TODO if we change the position interpolation, need to change this
         move_rate = 1 / (1 - t).clamp(min=eps, max=1.0 - eps)
@@ -281,7 +292,7 @@ class RateIntegrator:
         do_ins = torch.rand_like(p_ins) < p_ins
 
         # for insertion, we will then sample from the poisson distribution
-        expected_num_ins = num_ins_pred * ins_rate_node * dt
+        expected_num_ins = (num_ins_pred + noise_weight_node) * ins_rate_node * dt
         # NOTE in OneFlow, instead of sampling Poisson, they sample Bernoulli
         ins_sampled = torch.rand_like(expected_num_ins) < expected_num_ins
 
@@ -307,8 +318,10 @@ class RateIntegrator:
 
         """NODE DELETION or SUBSTITUTION"""
         # 1. Scale probabilities by time (converting prob -> rate * dt)
-        p_sub_scaled = do_sub_a_probs.view(-1) * sub_rate_node * dt
-        p_del_scaled = do_del_probs.view(-1) * del_rate_node * dt
+        p_sub_scaled = (
+            (do_sub_a_probs.view(-1) + noise_weight_node) * sub_rate_node * dt
+        )
+        p_del_scaled = (do_del_probs.view(-1) + noise_weight_node) * del_rate_node * dt
 
         # 2. Sum rates first (Paper Formulation)
         # "probability of ANY edit is h(lambda_sub + lambda_del)"
@@ -353,9 +366,11 @@ class RateIntegrator:
         # edge_index_triu[0] gives the source node indices for each edge
         batch_id_edge = batch_id[edge_index_triu[0]]
 
+        noise_weight_edge = noise_weight[batch_id_edge]
+
         # Calculate rate for edges using the separate edge substitution schedule
         sub_e_rate_triu = sub_e_rate[batch_id_edge]
-        p_mod_e = p_sub_e * sub_e_rate_triu * dt
+        p_mod_e = (p_sub_e + noise_weight_edge) * sub_e_rate_triu * dt
         p_mod_e = p_mod_e.view(-1)
         do_sub_e = torch.rand_like(p_mod_e) < p_mod_e
         e_triu[do_sub_e] = e_1_triu[do_sub_e]
@@ -444,6 +459,7 @@ class RateIntegrator:
                 e_t_ins = None
 
                 # ins -> ins predicted edges (between newly inserted atoms)
+                e1_ii = None
                 e_t_ins_ii = None
                 ins_ii_src_local = None
                 ins_ii_dst_local = None
@@ -458,9 +474,9 @@ class RateIntegrator:
                             node_atom_types=a_t,
                             batch=batch_id,
                             insertion_mask=do_ins_valid,
-                            ins_x=new_atoms.x_1,
-                            ins_a=new_atoms.a_1,
-                            ins_c=new_atoms.c_1,
+                            ins_x=new_atoms.x,
+                            ins_a=new_atoms.a,
+                            ins_c=new_atoms.c,
                         )
                     )
 
@@ -484,7 +500,7 @@ class RateIntegrator:
                         prior_edge_probs * (1 - kappa_t_e)
                         + e1_ins_types.to(dtype=prior_edge_probs.dtype) * kappa_t_e
                     )
-                    e_t_ins = F.softmax(e_t_ins, dim=-1)
+                    # e_t_ins = F.softmax(e_t_ins, dim=-1)
                     e_t_ins = torch.distributions.Categorical(probs=e_t_ins).sample()
 
                     if ins_edge_logits is not None and ins_edge_logits.numel() > 0:
@@ -535,11 +551,11 @@ class RateIntegrator:
                             h=h_latent,
                             x=x_t_original,
                             spawn_src_idx=ii_spawn_src,
-                            ins_x_src=new_atoms.x_1[ii_src],
-                            ins_a_src=new_atoms.a_1[ii_src],
-                            ins_c_src=new_atoms.c_1[ii_src],
-                            ins_a_dst=new_atoms.a_1[ii_dst],
-                            ins_x_dst=new_atoms.x_1[ii_dst],
+                            ins_x_src=new_atoms.x[ii_src],
+                            ins_a_src=new_atoms.a[ii_src],
+                            ins_c_src=new_atoms.c[ii_src],
+                            ins_a_dst=new_atoms.a[ii_dst],
+                            ins_x_dst=new_atoms.x[ii_dst],
                         )
 
                         ii_probs = F.softmax(ii_logits, dim=-1)
@@ -558,7 +574,7 @@ class RateIntegrator:
                             prior_ii * (1 - kappa_t_ii)
                             + e1_ii.to(dtype=prior_ii.dtype) * kappa_t_ii
                         )
-                        e_t_ins_ii = F.softmax(e_t_ins_ii, dim=-1)
+                        # e_t_ins_ii = F.softmax(e_t_ins_ii, dim=-1)
                         e_t_ins_ii = torch.distributions.Categorical(
                             probs=e_t_ins_ii
                         ).sample()

@@ -798,10 +798,11 @@ class LightningModuleRates(pl.LightningModule):
                         ins_loss_e_ii = self._reduce_loss(ins_loss_e_ii, "none")
 
             else:
-                # NOTE ins_rate_head,edge_head, gmm_head unused, throws an error (unused_params)
+                # NOTE ins_rate_head, edge_head, gmm_head unused, throws an error (unused_params)
                 # NOTE therefore we add a dummy loss wrt. edge_head and gmm_head
                 ins_rate_head_loss = sum(
-                    p.sum() for p in self.model.ins_rate_head.parameters()
+                    p.sum()
+                    for p in self.model.heads.heads["ins_rate_head"].parameters()
                 )
                 edge_head_loss = sum(
                     p.sum() for p in self.model.ins_edge_head.parameters()
@@ -1126,17 +1127,20 @@ class LightningModuleRates(pl.LightningModule):
             x1_pred = preds["pos_head"]  # (N_total, D)
 
             a_pred = preds["atom_type_head"]  # (N_total, num_classes)
-            a_pred = F.softmax(a_pred, dim=-1)
+            T_a = 1.0
+            a_pred = F.softmax(a_pred / T_a, dim=-1)
             a_pred = torch.distributions.Categorical(probs=a_pred).sample()
 
             c_pred = preds["charge_head"]  # (N_total, num_classes)
-            c_pred = F.softmax(c_pred, dim=-1)
+            T_c = 1.0
+            c_pred = F.softmax(c_pred / T_c, dim=-1)
             c_pred = torch.distributions.Categorical(probs=c_pred).sample()
 
             # NOTE: predictions are for full adj matrix.
             # NOTE: Will take triu and resymmetrize in integration step
+            T_e = 1.0
             e_pred = preds["edge_type_head"]
-            e_pred = F.softmax(e_pred, dim=-1)
+            e_pred = F.softmax(e_pred / T_e, dim=-1)
             e_pred = torch.distributions.Categorical(probs=e_pred).sample()
 
             mol_1_pred = MoleculeBatch(
@@ -1266,6 +1270,16 @@ class LightningModuleRates(pl.LightningModule):
             },
             "monitor": self.optimizer_config.monitor,
         }
+
+    def on_train_epoch_start(self) -> None:
+        """Push the current epoch into the train dataset wrapper for annealing."""
+        try:
+            dl = self.trainer.train_dataloader
+            ds = getattr(dl, "dataset", None)
+            if ds is not None and hasattr(ds, "set_epoch"):
+                ds.set_epoch(self.current_epoch)
+        except Exception:
+            pass
 
     def on_before_optimizer_step(self, optimizer):
         # Compute the 2-norm for each layer
