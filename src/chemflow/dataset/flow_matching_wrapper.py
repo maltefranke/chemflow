@@ -1,3 +1,4 @@
+import math
 import torch
 import numpy as np
 from torch.utils.data import Dataset
@@ -15,6 +16,26 @@ class FlowMatchingDatasetWrapper(Dataset):
 
     For **validation / test**, it returns ``(sample, target)`` with the prior
     sample already drawn.
+
+    Annealing strategy (``n_atoms_strategy="annealing"``)
+    -------------------------------------------------------
+    The prior atom count M is sampled from a temperature-controlled
+    distribution that interpolates between *fixed* and *empirical* sampling:
+
+        log P(M | N) = log P_emp(M) - β_epoch · (M - N)²
+
+    where N = target atom count and P_emp is the dataset n-atoms distribution.
+
+    * Large β  → distribution collapses to a delta at M = N  (fixed phase).
+    * β = 0    → recovers the empirical distribution P_emp  (flexible phase).
+    * Intermediate β → a soft neighbourhood around N weighted by P_emp.
+
+    β is annealed from ``anneal_beta_max`` to 0 via an S-shaped (sigmoid)
+    schedule parameterised by ``anneal_start_epoch``, ``anneal_end_epoch``
+    and ``anneal_steepness``.
+
+    Call :py:meth:`set_epoch` each epoch (done automatically by
+    :class:`~chemflow.model.lightning_module.LightningModuleRates`).
     """
 
     def __init__(
@@ -25,6 +46,11 @@ class FlowMatchingDatasetWrapper(Dataset):
         n_atoms_strategy="flexible",
         time_dist=None,
         stage="train",
+        # Annealing curriculum parameters (used only when n_atoms_strategy="annealing")
+        anneal_start_epoch: int = 0,
+        anneal_end_epoch: int = 100,
+        anneal_steepness: float = 6.0,
+        anneal_beta_max: float = 5.0,
     ):
         self.base_dataset = base_dataset
         self.distributions = distributions
@@ -33,12 +59,85 @@ class FlowMatchingDatasetWrapper(Dataset):
         self.time_dist = time_dist
         self.stage = stage
 
+        self.anneal_start_epoch = anneal_start_epoch
+        self.anneal_end_epoch = anneal_end_epoch
+        self.anneal_steepness = anneal_steepness
+        self.anneal_beta_max = anneal_beta_max
+        self.current_epoch = 0
+
         if self.n_atoms_strategy == "median":
             n_atoms_dist = self.distributions.n_atoms_distribution
             n_atoms_cumsum = torch.cumsum(n_atoms_dist, dim=0)
             self._median_n_atoms = int(
                 (n_atoms_cumsum >= 0.5).nonzero(as_tuple=True)[0][0].item()
             )
+
+        if self.n_atoms_strategy == "annealing":
+            n_dist = self.distributions.n_atoms_distribution.float()
+            # log P_emp(M) for each index M; -inf where P_emp = 0
+            self._log_p_emp = torch.log(n_dist.clamp(min=1e-10))
+            self._n_atoms_range = torch.arange(len(self._log_p_emp), dtype=torch.float)
+
+    # ------------------------------------------------------------------
+    # Epoch tracking
+    # ------------------------------------------------------------------
+
+    def set_epoch(self, epoch: int) -> None:
+        """Update the current training epoch for the annealing schedule.
+
+        Called automatically by :class:`LightningModuleRates` at the start
+        of every training epoch.
+        """
+        self.current_epoch = epoch
+
+    # ------------------------------------------------------------------
+    # Annealing helpers
+    # ------------------------------------------------------------------
+
+    def _annealing_alpha(self) -> float:
+        """S-shaped progress alpha in [0, 1] over training epochs.
+
+        alpha = 0  →  start of curriculum (large β, effectively fixed)
+        alpha = 1  →  end of curriculum   (β = 0, fully empirical)
+        """
+        epoch = self.current_epoch
+        if epoch <= self.anneal_start_epoch:
+            return 0.0
+        if epoch >= self.anneal_end_epoch:
+            return 1.0
+        t = (epoch - self.anneal_start_epoch) / (
+            self.anneal_end_epoch - self.anneal_start_epoch
+        )
+        k = self.anneal_steepness
+        # Sigmoid centred at t = 0.5, normalised so alpha(0) = 0, alpha(1) = 1.
+        s = 1.0 / (1.0 + math.exp(-k * (t - 0.5)))
+        s0 = 1.0 / (1.0 + math.exp(k * 0.5))   # value at t = 0
+        s1 = 1.0 / (1.0 + math.exp(-k * 0.5))  # value at t = 1
+        return (s - s0) / (s1 - s0)
+
+    def _get_n_atoms_annealed(self, target) -> int | None:
+        """Sample M from log P(M|N) = log P_emp(M) - β · (M - N)².
+
+        Returns ``None`` once β reaches 0, delegating to the internal
+        empirical sampler in :func:`sample_prior_graph`.
+        """
+        alpha = self._annealing_alpha()
+        beta = self.anneal_beta_max * (1.0 - alpha)
+
+        if beta < 1e-6:
+            return None  # fully empirical — let sample_prior_graph handle it
+
+        n_target = float(target.num_nodes)
+        logits = self._log_p_emp - beta * (self._n_atoms_range - n_target) ** 2
+
+        # Enforce a minimum molecule size of 3 atoms
+        logits = logits.clone()
+        logits[:3] = float("-inf")
+
+        probs = torch.softmax(logits, dim=0)
+        return int(torch.multinomial(probs, 1).item())
+
+    # ------------------------------------------------------------------
 
     def _get_n_atoms(self, target):
         if self.n_atoms_strategy == "fixed":
@@ -48,6 +147,8 @@ class FlowMatchingDatasetWrapper(Dataset):
             return max(3, n)
         elif self.n_atoms_strategy == "median":
             return self._median_n_atoms
+        elif self.n_atoms_strategy == "annealing":
+            return self._get_n_atoms_annealed(target)
         else:
             return None
 
