@@ -2,7 +2,10 @@
 
 import torch
 
+<<<<<<< HEAD
 from collections import deque
+=======
+>>>>>>> 34234e8 (MCS OT)
 from rdkit import Chem
 from rdkit.Chem import RWMol
 from rdkit.Chem.Scaffolds import MurckoScaffold
@@ -203,6 +206,62 @@ def select_scaffold_pairs_by_neighbor_count(
     best_src = src_matches[best // len(tgt_matches)]
     best_tgt = tgt_matches[best  % len(tgt_matches)]
     return list(zip(best_src, best_tgt, strict=True))
+
+
+def compute_scaffold_groups(dataset):
+    """Compute Bemis-Murcko scaffold groups for a dataset.
+
+    Molecules with empty scaffolds (acyclic) or disconnected scaffolds
+    (multiple ring systems, indicated by "." in SMILES) are dropped.
+
+    Returns:
+        mol_to_group: np.ndarray[N] of int64, -1 for dropped molecules
+        groups: list[list[int]], group_id -> list of dataset indices
+    """
+    scaffold_to_group = {}
+    mol_to_group = torch.full((len(dataset),), -1, dtype=torch.long)
+    groups = []
+
+    for idx in range(len(dataset)):
+        data = dataset.get(idx)
+        mol = Chem.MolFromSmiles(data.smiles)
+        scaffold = MurckoScaffold.GetScaffoldForMol(mol)
+        smi = Chem.MolToSmiles(scaffold)
+
+        # Drop empty scaffold (acyclic) and disconnected scaffolds
+        if not smi or "." in smi:
+            continue
+
+        if smi not in scaffold_to_group:
+            scaffold_to_group[smi] = len(groups)
+            groups.append([])
+
+        gid = scaffold_to_group[smi]
+        mol_to_group[idx] = gid
+        groups[gid].append(idx)
+
+    return mol_to_group, groups
+
+
+def compute_scaffold_atom_indices(dataset) -> list[list[tuple[int, ...]]]:
+    """For each molecule, return ALL scaffold atom index matches (handles symmetry).
+
+    Uses GetSubstructMatches(uniquify=False) to capture all automorphisms of the
+    scaffold within the molecule. Returns a list of matches per molecule; each
+    match is a tuple of atom indices. Returns an empty list for molecules with
+    no valid scaffold.
+    """
+    result = []
+    for idx in range(len(dataset)):
+        data = dataset.get(idx)
+        mol = Chem.MolFromSmiles(data.smiles)
+        if mol is None:
+            result.append([])
+            continue
+        scaffold = MurckoScaffold.GetScaffoldForMol(mol)
+        matches = mol.GetSubstructMatches(scaffold, uniquify=False)
+        result.append(list(matches))
+    return result
 
 
 def sort_by_scaffold(data_list):
