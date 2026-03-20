@@ -48,7 +48,7 @@ class FlowMatchingDatasetWrapper(Dataset):
         stage="train",
         # Annealing curriculum parameters (used only when n_atoms_strategy="annealing")
         anneal_start_epoch: int = 0,
-        anneal_end_epoch: int = 100,
+        anneal_end_epoch: int = 150,
         anneal_steepness: float = 6.0,
         anneal_beta_max: float = 5.0,
     ):
@@ -111,7 +111,7 @@ class FlowMatchingDatasetWrapper(Dataset):
         k = self.anneal_steepness
         # Sigmoid centred at t = 0.5, normalised so alpha(0) = 0, alpha(1) = 1.
         s = 1.0 / (1.0 + math.exp(-k * (t - 0.5)))
-        s0 = 1.0 / (1.0 + math.exp(k * 0.5))   # value at t = 0
+        s0 = 1.0 / (1.0 + math.exp(k * 0.5))  # value at t = 0
         s1 = 1.0 / (1.0 + math.exp(-k * 0.5))  # value at t = 1
         return (s - s0) / (s1 - s0)
 
@@ -218,6 +218,26 @@ def train_collate_fn(batch):
             and ins_targets.ins_edge_ins_local_idx.numel() > 0
         ):
             ins_targets.ins_edge_ins_local_idx.add_(ins_offset)
+        if (
+            hasattr(ins_targets, "ins_to_ins_edge_src_local_idx")
+            and ins_targets.ins_to_ins_edge_src_local_idx.numel() > 0
+        ):
+            ins_targets.ins_to_ins_edge_src_local_idx.add_(ins_offset)
+        if (
+            hasattr(ins_targets, "ins_to_ins_edge_dst_local_idx")
+            and ins_targets.ins_to_ins_edge_dst_local_idx.numel() > 0
+        ):
+            ins_targets.ins_to_ins_edge_dst_local_idx.add_(ins_offset)
+        if (
+            hasattr(ins_targets, "ins_to_ins_edge_spawn_src_idx")
+            and ins_targets.ins_to_ins_edge_spawn_src_idx.numel() > 0
+        ):
+            ins_targets.ins_to_ins_edge_spawn_src_idx.add_(offset)
+        if (
+            hasattr(ins_targets, "ins_to_ins_edge_spawn_dst_idx")
+            and ins_targets.ins_to_ins_edge_spawn_dst_idx.numel() > 0
+        ):
+            ins_targets.ins_to_ins_edge_spawn_dst_idx.add_(offset)
 
         mol_t_list.append(mol_t)
         mol_1_list.append(mol_1)

@@ -797,24 +797,23 @@ class LightningModuleRates(pl.LightningModule):
                         )
                         ins_loss_e_ii = self._reduce_loss(ins_loss_e_ii, "none")
 
-            else:
-                # NOTE ins_rate_head, edge_head, gmm_head unused, throws an error (unused_params)
-                # NOTE therefore we add a dummy loss wrt. edge_head and gmm_head
-                ins_rate_head_loss = sum(
-                    p.sum()
-                    for p in self.model.heads.heads["ins_rate_head"].parameters()
-                )
-                edge_head_loss = sum(
-                    p.sum() for p in self.model.ins_edge_head.parameters()
-                )
-                gmm_head_loss = sum(
-                    p.sum() for p in self.model.ins_gmm_head.parameters()
-                )
+        else:
+            # NOTE ins_rate_head, edge_head, gmm_head unused, throws an error (unused_params)
+            # NOTE therefore we add a dummy loss wrt. edge_head and gmm_head
+            ins_rate_head_loss = sum(
+                p.sum() for p in self.model.heads.heads["ins_rate_head"].parameters()
+            )
+            edge_head_loss = sum(p.sum() for p in self.model.ins_edge_head.parameters())
+            gmm_head_loss = sum(p.sum() for p in self.model.ins_gmm_head.parameters())
 
-                ins_loss_e = 0.0 * edge_head_loss
-                ins_loss_e_ii = 0.0 * edge_head_loss
-                ins_loss_gmm = 0.0 * gmm_head_loss
-                ins_loss_rate = 0.0 * ins_rate_head_loss
+            ins_loss_e = 0.0 * edge_head_loss
+            ins_loss_e_ii = 0.0 * edge_head_loss
+            ins_loss_gmm = 0.0 * gmm_head_loss
+            ins_loss_rate = 0.0 * ins_rate_head_loss
+
+            ins_batch_mask = torch.zeros(
+                mols_t.num_graphs, dtype=torch.bool, device=self.device
+            )
 
         # 4. Calculate the flow matching loss
         # Only compute the loss for nodes that are not to be deleted
@@ -1186,6 +1185,7 @@ class LightningModuleRates(pl.LightningModule):
             if self.n_atoms_strategy == "fixed":
                 num_ins_pred = torch.zeros_like(num_ins_pred)
                 do_del_probs = torch.zeros_like(do_del_probs)
+                do_ins_probs = torch.zeros_like(do_ins_probs)
 
             # Get insertion edge head if available
             ins_edge_head = getattr(model, "ins_edge_head", None)
