@@ -6,11 +6,13 @@ preprocess_workers: 0
 n_atoms_strategy: "flexible" # "fixed", "approx"
 optimal_transport: "equivariant"
 ins_noise_scale: 0.25
+move_noise_scale: 0.2
 
 
 # Preprocessing configuration - computes tokens from data and distributions from training dataset only
 preprocessing:
   _target_: chemflow.dataset.preprocessing.Preprocessing
+  _recursive_: false
   root: ${data.root_path}/qm9
   train_dataset: ${data.datamodule.datasets.train}
   atom_tokens_path: ${data.preprocessing.root}/processed/atom_tokens.txt
@@ -77,7 +79,7 @@ datamodule:
     predict: 32
 
   batch_size:
-    train: 2048
+    train: 1280
     val: 128
     test: 32
 

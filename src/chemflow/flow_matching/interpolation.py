@@ -197,47 +197,7 @@ class Interpolator:
                 samples_batched[b], targets_batched[b], t[b].item()
             )
 
-            # Offset local spawn / edge indices to global mol_t indices
-            if (
-                hasattr(ins_targets, "spawn_node_idx")
-                and ins_targets.spawn_node_idx.numel() > 0
-            ):
-                ins_targets.spawn_node_idx.add_(offset)
-            if (
-                hasattr(ins_targets, "ins_edge_spawn_idx")
-                and ins_targets.ins_edge_spawn_idx.numel() > 0
-            ):
-                ins_targets.ins_edge_spawn_idx.add_(offset)
-            if (
-                hasattr(ins_targets, "ins_edge_existing_idx")
-                and ins_targets.ins_edge_existing_idx.numel() > 0
-            ):
-                ins_targets.ins_edge_existing_idx.add_(offset)
-            if (
-                hasattr(ins_targets, "ins_edge_ins_local_idx")
-                and ins_targets.ins_edge_ins_local_idx.numel() > 0
-            ):
-                ins_targets.ins_edge_ins_local_idx.add_(ins_offset)
-            if (
-                hasattr(ins_targets, "ins_to_ins_edge_src_local_idx")
-                and ins_targets.ins_to_ins_edge_src_local_idx.numel() > 0
-            ):
-                ins_targets.ins_to_ins_edge_src_local_idx.add_(ins_offset)
-            if (
-                hasattr(ins_targets, "ins_to_ins_edge_dst_local_idx")
-                and ins_targets.ins_to_ins_edge_dst_local_idx.numel() > 0
-            ):
-                ins_targets.ins_to_ins_edge_dst_local_idx.add_(ins_offset)
-            if (
-                hasattr(ins_targets, "ins_to_ins_edge_spawn_src_idx")
-                and ins_targets.ins_to_ins_edge_spawn_src_idx.numel() > 0
-            ):
-                ins_targets.ins_to_ins_edge_spawn_src_idx.add_(offset)
-            if (
-                hasattr(ins_targets, "ins_to_ins_edge_spawn_dst_idx")
-                and ins_targets.ins_to_ins_edge_spawn_dst_idx.numel() > 0
-            ):
-                ins_targets.ins_to_ins_edge_spawn_dst_idx.add_(offset)
+            self._add_ins_offsets(ins_targets, offset, ins_offset)
 
             mol_t_list.append(mol_t)
             mol_1_list.append(mol_1)
@@ -602,3 +562,46 @@ class Interpolator:
             future_ins_nodes.x = future_ins_nodes.x - x_mean
 
         return interp_state, target_state, future_ins_nodes
+
+    def _add_ins_offsets(self, ins_targets, offset, ins_offset):
+        # Offset local spawn / edge indices to global mol_t indices
+        if (
+            hasattr(ins_targets, "spawn_node_idx")
+            and ins_targets.spawn_node_idx.numel() > 0
+        ):
+            ins_targets.spawn_node_idx.add_(offset)
+        if (
+            hasattr(ins_targets, "ins_edge_spawn_idx")
+            and ins_targets.ins_edge_spawn_idx.numel() > 0
+        ):
+            ins_targets.ins_edge_spawn_idx.add_(offset)
+        if (
+            hasattr(ins_targets, "ins_edge_existing_idx")
+            and ins_targets.ins_edge_existing_idx.numel() > 0
+        ):
+            ins_targets.ins_edge_existing_idx.add_(offset)
+        if (
+            hasattr(ins_targets, "ins_edge_ins_local_idx")
+            and ins_targets.ins_edge_ins_local_idx.numel() > 0
+        ):
+            ins_targets.ins_edge_ins_local_idx.add_(ins_offset)
+        if (
+            hasattr(ins_targets, "ins_to_ins_edge_src_local_idx")
+            and ins_targets.ins_to_ins_edge_src_local_idx.numel() > 0
+        ):
+            ins_targets.ins_to_ins_edge_src_local_idx.add_(ins_offset)
+        if (
+            hasattr(ins_targets, "ins_to_ins_edge_dst_local_idx")
+            and ins_targets.ins_to_ins_edge_dst_local_idx.numel() > 0
+        ):
+            ins_targets.ins_to_ins_edge_dst_local_idx.add_(ins_offset)
+        if (
+            hasattr(ins_targets, "ins_to_ins_edge_spawn_src_idx")
+            and ins_targets.ins_to_ins_edge_spawn_src_idx.numel() > 0
+        ):
+            ins_targets.ins_to_ins_edge_spawn_src_idx.add_(offset)
+        if (
+            hasattr(ins_targets, "ins_to_ins_edge_spawn_dst_idx")
+            and ins_targets.ins_to_ins_edge_spawn_dst_idx.numel() > 0
+        ):
+            ins_targets.ins_to_ins_edge_spawn_dst_idx.add_(offset)

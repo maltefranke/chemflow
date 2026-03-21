@@ -145,6 +145,7 @@ class LightningModuleRates(pl.LightningModule):
                     "ins_rate": 1.0,
                     "ins_gmm": 1.0,
                     "ins_e": 1.0,
+                    "ins_e_ii": 1.0,
                     "x": 1.0,
                     "c": 1.0,
                     "global_ins_budget": 1.0,
@@ -318,7 +319,7 @@ class LightningModuleRates(pl.LightningModule):
         # substitution losses
         "l_do_sub_a", "l_sub_a_class", "l_do_sub_e", "l_sub_e_class",
         # deletion and insertion losses
-        "l_do_del", "l_do_ins", "l_ins_rate", "l_ins_gmm", "l_ins_e",
+        "l_do_del", "l_do_ins", "l_ins_rate", "l_ins_gmm", "l_ins_e", "l_ins_e_ii",
         # move, charge and budget losses
         "l_x", "l_c", "l_global_ins_budget", "l_global_del_budget",
         # EMA counts for balancing BCE pos_weight in do_action_loss.
