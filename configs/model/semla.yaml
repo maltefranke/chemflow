@@ -19,7 +19,6 @@ integrator:
   time_strategy: log # "linear" or "log"
   num_integration_steps: 200
   ins_noise_scale: ${data.ins_noise_scale}
-  move_noise_scale: 0.2
   del_schedule: ${data.interpolator.del_schedule}
   ins_schedule: ${data.interpolator.ins_schedule}
   sub_schedule: ${data.interpolator.sub_schedule}
@@ -57,13 +56,13 @@ module:
   ema_decay: 0.999
   ema_decay_scheduler:
     _target_: chemflow.utils.lr_schedulers.EMADecayScheduler
-    initial_decay: 1.0e-4
+    initial_decay: 0.7
     mid_decay: 0.99
     final_decay: 0.9999
     warmup_epochs: 90
     fast_ramp_epochs: 20
     total_epochs: ${trainer.trainer.max_epochs}
-  use_ema_for_eval: false
+  use_ema_for_eval: true
   time_dist: ${if:${eq:${model.sample_time_strategy}, log}, ${model.beta_sched}, ${model.linear_sched}}
 
   # Classifier-free guidance on molecular properties (controlled by model.do_cfg)
@@ -104,6 +103,7 @@ module:
     l_ins_rate: 1.0
     l_ins_gmm: 1.0
     l_ins_e: 1.0
+    l_ins_e_ii: 1.0
     l_x: 1.0
     l_c: 1.0
     l_global_ins_budget: 0.1
