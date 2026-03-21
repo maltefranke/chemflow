@@ -252,6 +252,7 @@ def compute_state_at_t(
 
     # ---- G. Filter to existing nodes only ----
     interp_state = filter_nodes(interp_state, mask_exists.squeeze())
+    interp_state.scaffold_mask = is_sub[mask_exists.squeeze()]
 
     # ---- H. Centre coordinates ----
     x_mean = interp_state.x.mean(dim=0)
@@ -361,8 +362,8 @@ def run(cfg: DictConfig):
     for sample_single, target_single in zip(samples_list, targets_list):
         trajectory = smooth_trajectory(
             interpolator,
-            sample_single,
-            target_single,
+            sample_single.to(device),
+            target_single.to(device),
             time_points,
             device,
         )
