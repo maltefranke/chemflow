@@ -594,13 +594,18 @@ class LightningModuleRates(pl.LightningModule):
         do_sub_a_head = preds["do_sub_a_head"]
         do_sub_e_head = preds["do_sub_e_head"]
 
-        # NOTE charges not in mol_t, so we need to predict them for all atoms
-        pred_all_atoms = torch.ones_like(mols_1.c, dtype=torch.bool)
+        # Mask for nodes that are scheduled for deletion — reused for x, c, and a losses.
+        # Deletion nodes have their target type/charge frozen to the prior sample, so
+        # supervising against them would bias predictions towards the prior distribution.
+        to_delete_mask = mols_t.lambda_del > 0.0
+        non_del_mask = ~to_delete_mask
+
+        # Predict charges for all non-deletion nodes (deletion nodes have prior charges as targets)
         c_loss, c_batch_mask = self.class_loss(
             c_pred,
             mols_1.c,
             self.charge_token_weights,
-            pred_all_atoms,
+            non_del_mask.float(),
             mols_t.batch,
             mols_t.num_graphs,
             reduction="none",
@@ -616,11 +621,14 @@ class LightningModuleRates(pl.LightningModule):
             mols_t.num_graphs,
             ema_key="sub_a",
         )
+        # Supervise a_pred on all non-deletion nodes (not just substitution nodes).
+        # This gives the atom type head a direct training signal for already-correct
+        # atoms, preventing marginal drift when do_sub_a fires as a false positive.
         sub_a_class_loss, sub_a_batch_mask = self.class_loss(
             a_pred,
             mols_1.a,
             self.atom_type_weights,
-            mols_t.lambda_a_sub,
+            non_del_mask.float(),
             mols_t.batch,
             mols_t.num_graphs,
             reduction="none",
@@ -835,19 +843,18 @@ class LightningModuleRates(pl.LightningModule):
         # 4. Calculate the flow matching loss
         # Only compute the loss for nodes that are not to be deleted
         # NOTE Edge case all deletes would lead to unused params error, but is highly unlikely
-        to_delete_mask = mols_t.lambda_del > 0.0
         x_loss = F.mse_loss(
-            x_pred[~to_delete_mask], mols_1.x[~to_delete_mask], reduction="none"
+            x_pred[non_del_mask], mols_1.x[non_del_mask], reduction="none"
         )
         x_loss = unsorted_segment_mean(
-            x_loss, mols_t.batch[~to_delete_mask], mols_t.num_graphs
+            x_loss, mols_t.batch[non_del_mask], mols_t.num_graphs
         )
         # Keep only graphs that have at least one node contributing to x_loss
         # (i.e., at least one node that is not marked for deletion).
         x_batch_mask = torch.zeros(
             mols_t.num_graphs, dtype=torch.bool, device=self.device
         )
-        x_batch_mask[mols_t.batch[~to_delete_mask]] = True
+        x_batch_mask[mols_t.batch[non_del_mask]] = True
 
         if not x_batch_mask.any():
             x_loss = 0.0 * sum(p.sum() for p in self.model.pos_head.parameters())
