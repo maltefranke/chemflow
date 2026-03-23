@@ -2,7 +2,6 @@
 
 import os
 from concurrent.futures import ProcessPoolExecutor
-from typing import Literal
 
 import torch
 from rdkit import Chem
@@ -10,6 +9,73 @@ from torchmetrics import Metric
 from torchmetrics import MetricCollection
 
 from chemflow.utils import rdkit as chemflowRD
+from chemflow.utils.utils import token_to_index
+
+
+_BOND_TYPE_TO_EDGE_TOKEN = {
+    Chem.BondType.SINGLE: "1",
+    Chem.BondType.DOUBLE: "2",
+    Chem.BondType.TRIPLE: "3",
+    Chem.BondType.AROMATIC: "4",
+}
+
+
+def _rdkit_mols_atom_type_indices(
+    mols: list,
+    atom_tokens: list[str],
+    device: torch.device,
+) -> torch.Tensor:
+    """Map each atom in each non-None RDKit mol to an atom token index; skip mols with unknown symbols."""
+    vals: list[int] = []
+    for mol in mols:
+        if mol is None:
+            continue
+        try:
+            for atom in mol.GetAtoms():
+                vals.append(token_to_index(atom_tokens, atom.GetSymbol()))
+        except ValueError:
+            continue
+    if not vals:
+        return torch.tensor([], dtype=torch.long, device=device)
+    return torch.tensor(vals, dtype=torch.long, device=device)
+
+
+def _rdkit_mols_edge_type_indices(
+    mols: list,
+    edge_tokens: list[str],
+    device: torch.device,
+) -> torch.Tensor:
+    """Upper-triangular pair types (incl. NO_BOND at index 0) aligned with training preprocessing."""
+    vals: list[int] = []
+    for mol in mols:
+        if mol is None:
+            continue
+        n = mol.GetNumAtoms()
+        try:
+            for i in range(n):
+                for j in range(i + 1, n):
+                    bond = mol.GetBondBetweenAtoms(i, j)
+                    if bond is None:
+                        vals.append(0)
+                    else:
+                        bt = bond.GetBondType()
+                        if bt not in _BOND_TYPE_TO_EDGE_TOKEN:
+                            raise ValueError("unsupported bond type")
+                        tok = _BOND_TYPE_TO_EDGE_TOKEN[bt]
+                        vals.append(token_to_index(edge_tokens, tok))
+        except ValueError:
+            continue
+    if not vals:
+        return torch.tensor([], dtype=torch.long, device=device)
+    return torch.tensor(vals, dtype=torch.long, device=device)
+
+
+def _kl_divergence(
+    gen: torch.Tensor, target: torch.Tensor, eps: float
+) -> torch.Tensor:
+    return torch.sum(
+        gen * (torch.log(gen.clamp(min=eps)) - torch.log(target.clamp(min=eps)))
+    )
 
 
 def atom_count_distribution_metrics(
@@ -18,15 +84,10 @@ def atom_count_distribution_metrics(
     device: torch.device | str,
     eps: float = 1e-8,
 ) -> dict[str, torch.Tensor]:
-    """Compare generated atom-count distribution to a target atom-count distribution."""
+    """Compare generated atom-count distribution to a target atom-count distribution (KL only)."""
     if len(mols) == 0:
         zero = torch.tensor(0.0, device=device)
-        return {
-            "atom_count_dist_tvd": zero,
-            "atom_count_dist_l1": zero,
-            "atom_count_dist_kl": zero,
-            "atom_count_mean_abs_diff": zero,
-        }
+        return {"atom_count_dist_kl": zero}
 
     n_atoms_gen = torch.tensor(
         [mol.num_nodes for mol in mols],
@@ -54,23 +115,7 @@ def atom_count_distribution_metrics(
 
     target = target / target.sum().clamp(min=eps)
 
-    l1 = torch.sum(torch.abs(gen - target))
-    tvd = 0.5 * l1
-    kl = torch.sum(
-        gen * (torch.log(gen.clamp(min=eps)) - torch.log(target.clamp(min=eps)))
-    )
-
-    support = torch.arange(gen.numel(), device=device, dtype=torch.float32)
-    mean_gen = torch.sum(gen * support)
-    mean_target = torch.sum(target * support)
-    mean_abs_diff = torch.abs(mean_gen - mean_target)
-
-    return {
-        "atom_count_dist_tvd": tvd,
-        "atom_count_dist_l1": l1,
-        "atom_count_dist_kl": kl,
-        "atom_count_mean_abs_diff": mean_abs_diff,
-    }
+    return {"atom_count_dist_kl": _kl_divergence(gen, target, eps)}
 
 def calc_atom_stabilities(mol):
     problems = Chem.DetectChemistryProblems(mol)
@@ -152,23 +197,19 @@ class MoleculeStability(Metric):
 
 
 class AtomCountDistributionMetric(GenerativeMetric):
-    """Distribution metric comparing generated atom counts to target distribution."""
+    """KL(gen || target) for generated atom counts vs training atom-count distribution."""
 
     def __init__(
         self,
         target_distribution: torch.Tensor,
-        metric_type: Literal["tvd", "l1", "kl", "mean_abs_diff"],
         eps: float = 1e-8,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        if metric_type not in {"tvd", "l1", "kl", "mean_abs_diff"}:
-            raise ValueError(f"Unknown metric_type: {metric_type}")
 
         target = target_distribution.detach().to(dtype=torch.float32)
         target = target / target.sum().clamp(min=eps)
 
-        self.metric_type = metric_type
         self.eps = eps
         self.target_len = int(target.numel())
 
@@ -204,26 +245,115 @@ class AtomCountDistributionMetric(GenerativeMetric):
         target = self.target_distribution
         target = target / target.sum().clamp(min=self.eps)
 
-        l1 = torch.sum(torch.abs(gen - target))
-        if self.metric_type == "l1":
-            return l1
+        return _kl_divergence(gen, target, self.eps)
 
-        if self.metric_type == "tvd":
-            return 0.5 * l1
 
-        if self.metric_type == "kl":
-            return torch.sum(
-                gen
-                * (
-                    torch.log(gen.clamp(min=self.eps))
-                    - torch.log(target.clamp(min=self.eps))
-                )
+class AtomTypeDistributionMetric(GenerativeMetric):
+    """KL(gen || target) for atom-type histogram vs training distribution."""
+
+    def __init__(
+        self,
+        target_distribution: torch.Tensor,
+        atom_tokens: list[str],
+        eps: float = 1e-8,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+        target = target_distribution.detach().to(dtype=torch.float32)
+        target = target / target.sum().clamp(min=eps)
+
+        self.eps = eps
+        self.target_len = int(target.numel())
+        self.atom_tokens = list(atom_tokens)
+
+        if self.target_len != len(self.atom_tokens):
+            raise ValueError(
+                "atom_type_distribution length must match len(atom_tokens)"
             )
 
-        support = torch.arange(self.target_len, device=gen.device, dtype=torch.float32)
-        mean_gen = torch.sum(gen * support)
-        mean_target = torch.sum(target * support)
-        return torch.abs(mean_gen - mean_target)
+        self.register_buffer("target_distribution", target)
+        self.add_state(
+            "gen_hist",
+            default=torch.zeros(self.target_len, dtype=torch.float32),
+            dist_reduce_fx="sum",
+        )
+        self.add_state("n_total", default=torch.tensor(0.0), dist_reduce_fx="sum")
+
+    def update(self, mols: list[Chem.rdchem.Mol]) -> None:
+        idx = _rdkit_mols_atom_type_indices(
+            mols, self.atom_tokens, self.gen_hist.device
+        )
+        if idx.numel() == 0:
+            return
+        idx = idx.clamp(min=0, max=self.target_len - 1)
+        hist = torch.bincount(idx, minlength=self.target_len).to(dtype=torch.float32)
+        self.gen_hist += hist
+        self.n_total += float(idx.numel())
+
+    def compute(self) -> torch.Tensor:
+        if self.n_total <= 0:
+            return torch.tensor(0.0, device=self.gen_hist.device)
+
+        gen = self.gen_hist / self.gen_hist.sum().clamp(min=1.0)
+        target = self.target_distribution
+        target = target / target.sum().clamp(min=self.eps)
+
+        return _kl_divergence(gen, target, self.eps)
+
+
+class EdgeTypeDistributionMetric(GenerativeMetric):
+    """KL(gen || target) for edge-type pairs (upper triangle, incl. NO_BOND) vs training."""
+
+    def __init__(
+        self,
+        target_distribution: torch.Tensor,
+        edge_tokens: list[str],
+        eps: float = 1e-8,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+        target = target_distribution.detach().to(dtype=torch.float32)
+        target = target / target.sum().clamp(min=eps)
+
+        self.eps = eps
+        self.target_len = int(target.numel())
+        self.edge_tokens = list(edge_tokens)
+
+        if self.target_len != len(self.edge_tokens):
+            raise ValueError(
+                "edge_type_distribution length must match len(edge_tokens)"
+            )
+
+        self.register_buffer("target_distribution", target)
+        self.add_state(
+            "gen_hist",
+            default=torch.zeros(self.target_len, dtype=torch.float32),
+            dist_reduce_fx="sum",
+        )
+        self.add_state("n_total", default=torch.tensor(0.0), dist_reduce_fx="sum")
+
+    def update(self, mols: list[Chem.rdchem.Mol]) -> None:
+        idx = _rdkit_mols_edge_type_indices(
+            mols, self.edge_tokens, self.gen_hist.device
+        )
+        if idx.numel() == 0:
+            return
+        idx = idx.clamp(min=0, max=self.target_len - 1)
+        hist = torch.bincount(idx, minlength=self.target_len).to(dtype=torch.float32)
+        self.gen_hist += hist
+        self.n_total += float(idx.numel())
+
+    def compute(self) -> torch.Tensor:
+        if self.n_total <= 0:
+            return torch.tensor(0.0, device=self.gen_hist.device)
+
+        gen = self.gen_hist / self.gen_hist.sum().clamp(min=1.0)
+        target = self.target_distribution
+        target = target / target.sum().clamp(min=self.eps)
+
+        return _kl_divergence(gen, target, self.eps)
 
 
 class Validity(GenerativeMetric):
@@ -472,7 +602,14 @@ class AverageOptRmsd(GenerativeMetric):
         return self.total_rmsd / self.n_valid
 
 
-def init_metrics(train_mols=None, target_n_atoms_distribution: torch.Tensor | None = None):
+def init_metrics(
+    train_mols=None,
+    target_n_atoms_distribution: torch.Tensor | None = None,
+    atom_type_distribution: torch.Tensor | None = None,
+    edge_type_distribution: torch.Tensor | None = None,
+    atom_tokens: list[str] | None = None,
+    edge_tokens: list[str] | None = None,
+):
 
     metrics = {
         "validity": Validity(),
@@ -487,21 +624,18 @@ def init_metrics(train_mols=None, target_n_atoms_distribution: torch.Tensor | No
         "opt-rmsd": AverageOptRmsd(),
     }
     if target_n_atoms_distribution is not None:
-        metrics["atom_count_dist_tvd"] = AtomCountDistributionMetric(
-            target_distribution=target_n_atoms_distribution,
-            metric_type="tvd",
-        )
-        metrics["atom_count_dist_l1"] = AtomCountDistributionMetric(
-            target_distribution=target_n_atoms_distribution,
-            metric_type="l1",
-        )
         metrics["atom_count_dist_kl"] = AtomCountDistributionMetric(
             target_distribution=target_n_atoms_distribution,
-            metric_type="kl",
         )
-        metrics["atom_count_mean_abs_diff"] = AtomCountDistributionMetric(
-            target_distribution=target_n_atoms_distribution,
-            metric_type="mean_abs_diff",
+    if atom_type_distribution is not None and atom_tokens is not None:
+        metrics["atom_type_dist_kl"] = AtomTypeDistributionMetric(
+            target_distribution=atom_type_distribution,
+            atom_tokens=atom_tokens,
+        )
+    if edge_type_distribution is not None and edge_tokens is not None:
+        metrics["edge_type_dist_kl"] = EdgeTypeDistributionMetric(
+            target_distribution=edge_type_distribution,
+            edge_tokens=edge_tokens,
         )
     stability_metrics = {
         "atom-stability": AtomStability(),
