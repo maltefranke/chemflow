@@ -635,11 +635,20 @@ class LightningModuleRates(pl.LightningModule):
             mols_t.num_graphs,
             reduction="none",
         )
+        # Supervise e_pred on all non-deletion edges (same fix as sub_a_class_loss).
+        # Edges where either endpoint is scheduled for deletion are excluded:
+        # their targets are frozen to the source value, so supervising e_pred on them
+        # would train it to predict prior edge types — the wrong signal.
+        _src_idx = edge_infos["edge_index"][0][0]
+        _dst_idx = edge_infos["edge_index"][0][1]
+        non_del_edge_mask = (
+            ~to_delete_mask[_src_idx] & ~to_delete_mask[_dst_idx]
+        ).float()
         sub_e_class_loss, sub_e_batch_mask = self.class_loss(
             e_pred_triu,
             e_target_triu,
             self.edge_token_weights,
-            do_sub_e_target_triu,
+            non_del_edge_mask,
             e_batch_triu,
             mols_t.num_graphs,
             reduction="none",
