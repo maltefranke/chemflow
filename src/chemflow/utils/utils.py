@@ -263,7 +263,7 @@ def compute_token_weights(
         final_weights[token_idx] = special_weight
 
     # set the minimum weight to 1.0
-    final_weights = final_weights / final_weights.min()
+    # final_weights = final_weights / final_weights.min()
 
     return final_weights
 

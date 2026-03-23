@@ -215,7 +215,11 @@ class LightningModuleRates(pl.LightningModule):
         self.register_buffer("charge_token_weights", charge_weights)
 
         self.metrics, self.stability_metrics = init_metrics(
-            target_n_atoms_distribution=self.distributions.n_atoms_distribution
+            target_n_atoms_distribution=self.distributions.n_atoms_distribution,
+            atom_type_distribution=self.distributions.atom_type_distribution,
+            edge_type_distribution=self.distributions.edge_type_distribution,
+            atom_tokens=list(self.vocab.atom_tokens),
+            edge_tokens=list(self.vocab.edge_tokens),
         )
 
         # EMA counts for balancing BCE pos_weight in do_action_loss.
@@ -223,6 +227,10 @@ class LightningModuleRates(pl.LightningModule):
         self.register_buffer("ema_do_ins_neg", torch.tensor(1.0))
         self.register_buffer("ema_do_del_pos", torch.tensor(1.0))
         self.register_buffer("ema_do_del_neg", torch.tensor(1.0))
+        self.register_buffer("ema_do_sub_a_pos", torch.tensor(1.0))
+        self.register_buffer("ema_do_sub_a_neg", torch.tensor(1.0))
+        self.register_buffer("ema_do_sub_e_pos", torch.tensor(1.0))
+        self.register_buffer("ema_do_sub_e_neg", torch.tensor(1.0))
 
         self.save_hyperparameters(ignore=["ema_decay_scheduler"])
         self.model = hydra.utils.instantiate(model)
@@ -377,7 +385,8 @@ class LightningModuleRates(pl.LightningModule):
             batch: The batch indices for each node.
             num_graphs: The number of graphs in the batch.
             ema_key: Optional key for EMA-balanced BCE `pos_weight`.
-                Supported values are "ins" and "del".
+                Supported values: "ins", "del", "sub_a", "sub_e". If None, uses the
+                per-batch ratio num_no_action / num_total_actions (no EMA).
         """
         do_action = num_actions > 0.0
 
@@ -389,7 +398,7 @@ class LightningModuleRates(pl.LightningModule):
         )
         num_no_action = (num_total - num_total_actions).clamp(min=0.0)
 
-        if ema_key in {"ins", "del"}:
+        if ema_key in {"ins", "del", "sub_a", "sub_e"}:
             pos_name = f"ema_do_{ema_key}_pos"
             neg_name = f"ema_do_{ema_key}_neg"
             ema_pos = getattr(self, pos_name)
@@ -412,6 +421,8 @@ class LightningModuleRates(pl.LightningModule):
                 min=self.edit_loss_ema_eps
             )
             pos_weight = pos_weight.to(device=self.device, dtype=dtype)
+
+        pos_weight = torch.tensor(1.0, device=self.device, dtype=dtype)
 
         # NOTE: we use BCEWithLogitsLoss for scalar logit predictions
         # do_action_pred is shape (N,) with logits
@@ -604,7 +615,11 @@ class LightningModuleRates(pl.LightningModule):
 
         #### Handle atom type substitutions
         do_sub_a_loss = self.do_action_loss(
-            do_sub_a_head, mols_t.lambda_a_sub, mols_t.batch, mols_t.num_graphs
+            do_sub_a_head,
+            mols_t.lambda_a_sub,
+            mols_t.batch,
+            mols_t.num_graphs,
+            ema_key="sub_a",
         )
         # Supervise a_pred on all non-deletion nodes (not just substitution nodes).
         # This gives the atom type head a direct training signal for already-correct
@@ -633,6 +648,7 @@ class LightningModuleRates(pl.LightningModule):
             do_sub_e_target_triu,
             e_batch_triu,
             mols_t.num_graphs,
+            ema_key="sub_e",
             reduction="none",
         )
         # Supervise e_pred on all non-deletion edges (same fix as sub_a_class_loss).
@@ -937,6 +953,10 @@ class LightningModuleRates(pl.LightningModule):
                 "ema_do_ins_neg": self.ema_do_ins_neg,
                 "ema_do_del_pos": self.ema_do_del_pos,
                 "ema_do_del_neg": self.ema_do_del_neg,
+                "ema_do_sub_a_pos": self.ema_do_sub_a_pos,
+                "ema_do_sub_a_neg": self.ema_do_sub_a_neg,
+                "ema_do_sub_e_pos": self.ema_do_sub_e_pos,
+                "ema_do_sub_e_neg": self.ema_do_sub_e_neg,
             }
         )
 
