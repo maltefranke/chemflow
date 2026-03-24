@@ -24,7 +24,7 @@ class OutputHead(nn.Module):
         output_dim: int,
         hidden_dim: int | None = None,
         num_layers: int = 2,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
     ):
         super().__init__()
 
@@ -43,7 +43,7 @@ class OutputHead(nn.Module):
             layers.append(nn.LayerNorm(hidden_dim))
 
             # Activation
-            layers.append(nn.SiLU())
+            layers.append(nn.SiLU(inplace=True))
 
             # Dropout (Regularization)
             if dropout > 0:
@@ -58,12 +58,20 @@ class OutputHead(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Xavier initialization for better convergence."""
-        for m in self.modules():
+        for i, m in enumerate(self.mlp):
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+                # Check if it is the final projection layer
+                if i == len(self.mlp) - 1:
+                    # ZERO INIT: Crucial for flow matching/diffusion type prediction
+                    # Starts the model off predicting a uniform distribution.
+                    nn.init.zeros_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+                else:
+                    # Hidden Layers: Kaiming init optimized for SiLU
+                    nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         return self.mlp(h)
@@ -184,7 +192,7 @@ class EquivariantGMMHead(nn.Module):
         self.scalar_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),  # Stabilizer
-            nn.SiLU(),
+            nn.SiLU(inplace=True),
             nn.Linear(hidden_dim, scalar_out_dim),
         )
 
@@ -195,7 +203,7 @@ class EquivariantGMMHead(nn.Module):
         self.coord_mlp = nn.Sequential(
             nn.Linear(input_dim_coord, hidden_dim),
             nn.LayerNorm(hidden_dim),  # Stabilizer
-            nn.SiLU(),
+            nn.SiLU(inplace=True),
             nn.Linear(hidden_dim, K, bias=False),
         )
 
@@ -204,23 +212,21 @@ class EquivariantGMMHead(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        # 1. Standard Init for Hidden Layers
-        # (Note: RBFEmbedding has its own init, so we skip it here)
-        for m in [self.scalar_mlp[0], self.coord_mlp[0]]:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
+        # 1. Kaiming Init for Hidden Layers (Optimized for SiLU)
+        nn.init.kaiming_normal_(self.scalar_mlp[0].weight, nonlinearity="relu")
+        nn.init.zeros_(self.scalar_mlp[0].bias)
 
-        # 2. "Near-Zero" Init for Coordinate Output
-        # CRITICAL: Ensures mu starts as current position
-        last_coord = self.coord_mlp[-1]
-        nn.init.uniform_(last_coord.weight, -1e-4, 1e-4)
-        # nn.init.zeros_(last_coord.bias)
+        nn.init.kaiming_normal_(self.coord_mlp[0].weight, nonlinearity="relu")
+        nn.init.zeros_(self.coord_mlp[0].bias)
 
-        # 3. Stable Init for Scalar Output
-        last_scalar = self.scalar_mlp[-1]
-        nn.init.xavier_uniform_(last_scalar.weight, gain=0.1)
-        nn.init.zeros_(last_scalar.bias)
+        # 2. EXACT Zero Init for Scalar Output
+        # Forces uniform Pi, uniform class probs, and stable ~0.69 Sigma
+        nn.init.zeros_(self.scalar_mlp[-1].weight)
+        nn.init.zeros_(self.scalar_mlp[-1].bias)
+
+        # 3. EXACT Zero Init for Coordinate Output
+        # Ensures initial mu == x exactly, creating a stable starting geometry
+        nn.init.zeros_(self.coord_mlp[-1].weight)
 
     def forward(self, h, x, edge_index):
         """
@@ -368,22 +374,29 @@ class InsertionEdgeHead(nn.Module):
         self.edge_mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
+            nn.SiLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
-            nn.SiLU(),
+            nn.SiLU(inplace=True),
             nn.Linear(hidden_dim // 2, n_edge_types),
         )
 
         self._init_weights()
 
     def _init_weights(self):
-        """Xavier initialization."""
-        for m in self.modules():
+        """Optimized initialization for flow-matching edge prediction."""
+        for i, m in enumerate(self.edge_mlp):
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+                # Final logit projection
+                if i == len(self.edge_mlp) - 1:
+                    nn.init.zeros_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+                # Hidden layers
+                else:
+                    nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
 
     def _prepare_edge_features(
         self,

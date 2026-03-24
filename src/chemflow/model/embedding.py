@@ -16,7 +16,7 @@ class Embedding(nn.Module):
         num_embeddings: int,
         embedding_dim: int,
         out_dim: int = None,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
     ):
         """
         Args:
