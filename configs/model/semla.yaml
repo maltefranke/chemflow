@@ -49,9 +49,9 @@ module:
   type_loss_token_weights: training
   cat_weighting:
     _target_: DictConfig
-    weight_alpha: 0.4
+    weight_alpha: 1.0
   ins_noise_scale: ${data.ins_noise_scale}
-  edit_loss_ema_decay: 0.99
+  edit_loss_ema_decay: 0.95
   edit_loss_ema_eps: 1.0e-8
   ema_decay: 0.999
   ema_decay_scheduler:
@@ -59,10 +59,11 @@ module:
     initial_decay: 0.7
     mid_decay: 0.99
     final_decay: 0.9999
-    warmup_epochs: 90
+    warmup_epochs: 100
     fast_ramp_epochs: 20
     total_epochs: ${trainer.trainer.max_epochs}
   use_ema_for_eval: true
+  use_time_weights: false
   time_dist: ${if:${eq:${model.sample_time_strategy}, log}, ${model.beta_sched}, ${model.linear_sched}}
 
   # Classifier-free guidance on molecular properties (controlled by model.do_cfg)
@@ -160,7 +161,7 @@ module:
         num_rbf: 128
         rbf_dmax: 3.5
         out_dim: 64
-        dropout: 0.05
+        dropout: 0.0
         trainable: false
 
 atom_type_embedding:
@@ -308,5 +309,5 @@ gmm_head_args:
     num_rbf: 128
     rbf_dmax: 3.5
     out_dim: 64
-    dropout: 0.05
+    dropout: 0.0
     trainable: false

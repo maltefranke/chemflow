@@ -97,6 +97,7 @@ class LightningModuleRates(pl.LightningModule):
         # Classifier-free guidance parameters (target n_atoms conditioning)
         natoms_cfg_dropout_prob: float = 0.15,
         natoms_cfg_guidance_scale: float = 2.5,
+        use_time_weights: bool = False,
     ):
         super().__init__()
 
@@ -215,9 +216,9 @@ class LightningModuleRates(pl.LightningModule):
         self.register_buffer("charge_token_weights", charge_weights)
 
         self.metrics, self.stability_metrics = init_metrics(
-            target_n_atoms_distribution=self.distributions.n_atoms_distribution,
-            atom_type_distribution=self.distributions.atom_type_distribution,
-            edge_type_distribution=self.distributions.edge_type_distribution,
+            target_n_atoms_distribution=self.loss_weight_distributions.n_atoms_distribution,
+            atom_type_distribution=self.loss_weight_distributions.atom_type_distribution,
+            edge_type_distribution=self.loss_weight_distributions.edge_type_distribution,
             atom_tokens=list(self.vocab.atom_tokens),
             edge_tokens=list(self.vocab.edge_tokens),
         )
@@ -257,17 +258,17 @@ class LightningModuleRates(pl.LightningModule):
             use_learnable=use_learnable_loss_weights,
         )
 
-        # TODO make these configurable
-        time_weights = {
-            "x": InverseSquaredTimeLossWeighting(clamp_max=100.0),
-            "c": InverseSquaredTimeLossWeighting(clamp_max=100.0),
-            "ins": lambda t: self.integrator.ins_schedule.rate(t).clamp(max=100.0),
-            "del": lambda t: self.integrator.del_schedule.rate(t).clamp(max=100.0),
-            "sub": lambda t: self.integrator.sub_schedule.rate(t).clamp(max=100.0),
-            "budget": lambda t: self.integrator.ins_schedule.rate(t).clamp(max=100.0),
-        }
-
-        time_weights = {}
+        if use_time_weights:
+            time_weights = {
+                "x": InverseSquaredTimeLossWeighting(clamp_max=100.0),
+                "c": InverseSquaredTimeLossWeighting(clamp_max=100.0),
+                "ins": lambda t: self.integrator.ins_schedule.rate(t).clamp(max=100.0),
+                "del": lambda t: self.integrator.del_schedule.rate(t).clamp(max=100.0),
+                "sub": lambda t: self.integrator.sub_schedule.rate(t).clamp(max=100.0),
+                "budget": lambda t: self.integrator.ins_schedule.rate(t).clamp(max=100.0),
+            }
+        else:
+            time_weights = {}
 
         self.loss_accumulator = LossAccumulator(
             self.loss_weight_wrapper, self.LOSS_GROUPS, self.device, time_weights
