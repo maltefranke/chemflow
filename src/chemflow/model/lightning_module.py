@@ -265,7 +265,9 @@ class LightningModuleRates(pl.LightningModule):
                 "ins": lambda t: self.integrator.ins_schedule.rate(t).clamp(max=100.0),
                 "del": lambda t: self.integrator.del_schedule.rate(t).clamp(max=100.0),
                 "sub": lambda t: self.integrator.sub_schedule.rate(t).clamp(max=100.0),
-                "budget": lambda t: self.integrator.ins_schedule.rate(t).clamp(max=100.0),
+                "budget": lambda t: self.integrator.ins_schedule.rate(t).clamp(
+                    max=100.0
+                ),
             }
         else:
             time_weights = {}
@@ -485,40 +487,45 @@ class LightningModuleRates(pl.LightningModule):
         class_pred,
         class_target,
         class_weights,
-        num_actions,
+        do_action_mask,
         batch,
         num_graphs,
         reduction: str = "mean",
     ):
         """
-        Calculate the class loss for the given class predictions and target classes.
-        Is only used for atom type, edge type, and charge classes.
-
-        Args:
-            class_pred: The predicted class values.
-            class_target: The target class values.
-            class_weights: The weights for each class.
-            num_actions: The number of actions for each node.
-            batch: The batch indices for each node.
-            num_graphs: The number of graphs in the batch.
+        Calculate the class loss. Is not applied to masked nodes / edges.
+        Concretely:
+            c: class_loss is applied to all non-del nodes.
+            a: class_loss is applied to all non-del & to-be-substituted nodes.
+            e: class_loss is applied to all edges between non-del nodes that need to be substituted.
+            ins_e : class_loss is applied to all edges between ins & non-del nodes.
+            ins_e_ii: class_loss is applied to all edges between ins & ins nodes.
         """
-        do_action = num_actions > 0.0
+        # 1. Safety check for empty actions to prevent NaNs or crashes
+        if not do_action_mask.any():
+            zero_loss = torch.zeros(num_graphs, 1, device=class_pred.device)
+            zero_mask = torch.zeros(
+                num_graphs, dtype=torch.bool, device=class_pred.device
+            )
+            return self._reduce_loss(zero_loss, reduction), zero_mask
 
-        class_loss = F.cross_entropy(
-            class_pred,
-            class_target,
+        # 2. Compute CE ONLY on the nodes that actually need modification
+        masked_loss = F.cross_entropy(
+            class_pred[do_action_mask],
+            class_target[do_action_mask],
             weight=class_weights,
             reduction="none",
         )
 
-        # NOTE As per EditFlow, only count class loss for nodes that need modification
+        # 3. Pool the masked losses per graph
         class_loss = unsorted_segment_mean(
-            class_loss[do_action].view(-1, 1), batch[do_action], num_graphs
+            masked_loss.view(-1, 1), batch[do_action_mask], num_graphs
         )
 
+        # 4. Determine which graphs had modifications
         batch_has_modified = (
             unsorted_segment_sum(
-                do_action.view(-1, 1),
+                do_action_mask.float().view(-1, 1),
                 batch,
                 num_graphs,
             )
@@ -601,12 +608,12 @@ class LightningModuleRates(pl.LightningModule):
         to_delete_mask = mols_t.lambda_del > 0.0
         non_del_mask = ~to_delete_mask
 
-        # Predict charges for all non-deletion nodes (deletion nodes have prior charges as targets)
+        # NOTE take loss on all non-deletion nodes
         c_loss, c_batch_mask = self.class_loss(
             c_pred,
             mols_1.c,
             self.charge_token_weights,
-            non_del_mask.float(),
+            non_del_mask,
             mols_t.batch,
             mols_t.num_graphs,
             reduction="none",
@@ -615,6 +622,7 @@ class LightningModuleRates(pl.LightningModule):
         # 1. Handle substitutions
 
         #### Handle atom type substitutions
+        # NOTE take loss on all nodes
         do_sub_a_loss = self.do_action_loss(
             do_sub_a_head,
             mols_t.lambda_a_sub,
@@ -622,14 +630,14 @@ class LightningModuleRates(pl.LightningModule):
             mols_t.num_graphs,
             ema_key="sub_a",
         )
-        # Supervise a_pred on all non-deletion nodes (not just substitution nodes).
-        # This gives the atom type head a direct training signal for already-correct
-        # atoms, preventing marginal drift when do_sub_a fires as a false positive.
+        # NOTE take loss on all non-deletion & to-be-substituted nodes
+        # del nodes have lambda_a_sub = 0 anyway, this is just for clarity
+        to_sub_mask = (non_del_mask) & (mols_t.lambda_a_sub > 0.0)
         sub_a_class_loss, sub_a_batch_mask = self.class_loss(
             a_pred,
             mols_1.a,
             self.atom_type_weights,
-            non_del_mask.float(),
+            to_sub_mask,
             mols_t.batch,
             mols_t.num_graphs,
             reduction="none",
@@ -643,6 +651,14 @@ class LightningModuleRates(pl.LightningModule):
         e_pred_triu, do_sub_e_head_triu = edge_infos["edge_attr"][:2]
         e_target_triu, do_sub_e_target_triu = edge_infos["edge_attr"][2:]
 
+        # Supervise e_pred on all non-deletion edges (same fix as sub_a_class_loss).
+        # Edges where either endpoint is scheduled for deletion are excluded:
+        # their targets are frozen to the source value, so supervising e_pred on them
+        # would train it to predict prior edge types — the wrong signal.
+        _src_idx = edge_infos["edge_index"][0][0]
+        _dst_idx = edge_infos["edge_index"][0][1]
+        non_del_edge_mask = ~to_delete_mask[_src_idx] & ~to_delete_mask[_dst_idx]
+
         # NOTE As per EditFlow, only count class loss for edges that need modification
         do_sub_e_loss = self.do_action_loss(
             do_sub_e_head_triu,
@@ -652,20 +668,14 @@ class LightningModuleRates(pl.LightningModule):
             ema_key="sub_e",
             reduction="none",
         )
-        # Supervise e_pred on all non-deletion edges (same fix as sub_a_class_loss).
-        # Edges where either endpoint is scheduled for deletion are excluded:
-        # their targets are frozen to the source value, so supervising e_pred on them
-        # would train it to predict prior edge types — the wrong signal.
-        _src_idx = edge_infos["edge_index"][0][0]
-        _dst_idx = edge_infos["edge_index"][0][1]
-        non_del_edge_mask = (
-            ~to_delete_mask[_src_idx] & ~to_delete_mask[_dst_idx]
-        ).float()
+
+        # NOTE take loss on all non-deletion & to-be-substituted edges
+        to_sub_edge_mask = (non_del_edge_mask) & (do_sub_e_target_triu > 0.0)
         sub_e_class_loss, sub_e_batch_mask = self.class_loss(
             e_pred_triu,
             e_target_triu,
             self.edge_token_weights,
-            non_del_edge_mask,
+            to_sub_edge_mask,
             e_batch_triu,
             mols_t.num_graphs,
             reduction="none",
@@ -675,8 +685,17 @@ class LightningModuleRates(pl.LightningModule):
         do_ins_loss = torch.tensor(0.0, device=self.device)
 
         if self.n_atoms_strategy != "fixed":
-            # TODO maybe we should weight the deletion loss and insertion loss by their number of deletions and insertions?
-            # TODO e.g. w = n_del / (n_del + n_ins)
+            # Per-graph masks for insertion *edge* losses: only average over graphs that
+            # have at least one supervised (non-del-filtered) edge. Using ins_batch_mask
+            # from rate loss would include graphs with insertions but no edge targets, or
+            # graphs whose ins edge rows are all-zero from unsorted_segment_mean.
+            ins_e_batch_mask = torch.zeros(
+                mols_t.num_graphs, dtype=torch.bool, device=self.device
+            )
+            ins_e_ii_batch_mask = torch.zeros(
+                mols_t.num_graphs, dtype=torch.bool, device=self.device
+            )
+
             # 2. Handle deletions (no class changes here!)
             do_del_loss = self.do_action_loss(
                 do_del_head,
@@ -700,7 +719,6 @@ class LightningModuleRates(pl.LightningModule):
             # Count number of insertions per node
             # Initialize with zeros for all nodes
             ins_loss_gmm = torch.tensor(0.0, device=self.device)
-            ins_loss_e = torch.tensor(0.0, device=self.device)
             ins_loss_rate = torch.tensor(0.0, device=self.device)
 
             # indices of nodes in mol_t that spawn/predict each insertion
@@ -710,6 +728,14 @@ class LightningModuleRates(pl.LightningModule):
             )
 
             if spawn_node_idx.numel() > 0:
+                _ins_dtype = ins_rate_pred.dtype
+                ins_loss_e = torch.zeros(
+                    mols_t.num_graphs, 1, device=self.device, dtype=_ins_dtype
+                )
+                ins_loss_e_ii = torch.zeros(
+                    mols_t.num_graphs, 1, device=self.device, dtype=_ins_dtype
+                )
+
                 # Count how many insertions each node spawns
                 num_inserts_per_node = mols_t.n_ins
 
@@ -761,76 +787,80 @@ class LightningModuleRates(pl.LightningModule):
                 existing_idx = ins_targets.ins_edge_existing_idx
 
                 if spawn_idx.numel() > 0 and existing_idx.numel() > 0:
-                    # Get edge predictions using the insertion edge head
-                    ins_edge_logits = self.model.predict_insertion_edges(
-                        mols_t=mols_t,
-                        out_dict=preds,
-                        spawn_node_idx=spawn_idx,
-                        existing_node_idx=existing_idx,
-                        # Use canonical future node tensors and gather per-edge inserted attrs.
-                        # NOTE predict edge types for future nodes, not current nodes
-                        # NOTE then at inference we will adjust to current noise level
-                        ins_x=ins_targets.x[ins_targets.ins_edge_ins_local_idx],
-                        ins_a=ins_targets.a[ins_targets.ins_edge_ins_local_idx],
-                        ins_c=ins_targets.c[ins_targets.ins_edge_ins_local_idx],
+                    ins_edge_non_del = (
+                        non_del_mask[spawn_idx] & non_del_mask[existing_idx]
                     )
-                    if ins_edge_logits is not None and ins_edge_logits.numel() > 0:
-                        ins_loss_e = F.cross_entropy(
-                            ins_edge_logits,
-                            ins_targets.ins_edge_types,
-                            weight=self.edge_token_weights,
-                            reduction="none",
+                    if ins_edge_non_del.any():
+                        # Get edge predictions using the insertion edge head
+                        ins_edge_logits = self.model.predict_insertion_edges(
+                            mols_t=mols_t,
+                            out_dict=preds,
+                            spawn_node_idx=spawn_idx,
+                            existing_node_idx=existing_idx,
+                            # Use canonical future node tensors and gather per-edge inserted attrs.
+                            # NOTE predict edge types for future nodes, not current nodes
+                            # NOTE then at inference we will adjust to current noise level
+                            ins_x=ins_targets.x[ins_targets.ins_edge_ins_local_idx],
+                            ins_a=ins_targets.a[ins_targets.ins_edge_ins_local_idx],
+                            ins_c=ins_targets.c[ins_targets.ins_edge_ins_local_idx],
                         )
-
-                        # NOTE All inserted edges will have a non-zero target rate
-                        # NOTE Therefore no more filtering needed
-
-                        # reduce the loss to per-graph level
-                        ins_loss_e = unsorted_segment_mean(
-                            ins_loss_e.view(-1, 1),
-                            mols_t.batch[spawn_idx],
-                            mols_t.num_graphs,
-                        )
-
-                        ins_loss_e = self._reduce_loss(ins_loss_e, "none")
+                        if ins_edge_logits is not None and ins_edge_logits.numel() > 0:
+                            # Reuse the shared class loss helper (same masking +
+                            # per-graph averaging) to compute insertion edge loss.
+                            ins_loss_e, ins_e_batch_mask = self.class_loss(
+                                ins_edge_logits,
+                                ins_targets.ins_edge_types,
+                                self.edge_token_weights,
+                                ins_edge_non_del,
+                                mols_t.batch[spawn_idx],
+                                mols_t.num_graphs,
+                                reduction="none",
+                            )
 
                 # Compute ins -> ins edge loss
-                ins_loss_e_ii = torch.tensor(0.0, device=self.device)
                 spawn_src_ii = ins_targets.ins_to_ins_edge_spawn_src_idx
+                spawn_dst_ii = ins_targets.ins_to_ins_edge_spawn_dst_idx
                 if spawn_src_ii.numel() > 0:
-                    ins_ii_logits = self.model.predict_insertion_edges_ins_to_ins(
-                        mols_t=mols_t,
-                        out_dict=preds,
-                        spawn_src_idx=spawn_src_ii,
-                        ins_x_src=ins_targets.x[
-                            ins_targets.ins_to_ins_edge_src_local_idx
-                        ],
-                        ins_a_src=ins_targets.a[
-                            ins_targets.ins_to_ins_edge_src_local_idx
-                        ],
-                        ins_c_src=ins_targets.c[
-                            ins_targets.ins_to_ins_edge_src_local_idx
-                        ],
-                        ins_a_dst=ins_targets.a[
-                            ins_targets.ins_to_ins_edge_dst_local_idx
-                        ],
-                        ins_x_dst=ins_targets.x[
-                            ins_targets.ins_to_ins_edge_dst_local_idx
-                        ],
-                    )
-                    if ins_ii_logits is not None and ins_ii_logits.numel() > 0:
-                        ins_loss_e_ii = F.cross_entropy(
-                            ins_ii_logits,
-                            ins_targets.ins_to_ins_edge_types,
-                            weight=self.edge_token_weights,
-                            reduction="none",
+                    ii_non_del = non_del_mask[spawn_src_ii] & non_del_mask[spawn_dst_ii]
+                    if ii_non_del.any():
+                        ins_ii_logits = self.model.predict_insertion_edges_ins_to_ins(
+                            mols_t=mols_t,
+                            out_dict=preds,
+                            spawn_src_idx=spawn_src_ii,
+                            ins_x_src=ins_targets.x[
+                                ins_targets.ins_to_ins_edge_src_local_idx
+                            ],
+                            ins_a_src=ins_targets.a[
+                                ins_targets.ins_to_ins_edge_src_local_idx
+                            ],
+                            ins_c_src=ins_targets.c[
+                                ins_targets.ins_to_ins_edge_src_local_idx
+                            ],
+                            ins_a_dst=ins_targets.a[
+                                ins_targets.ins_to_ins_edge_dst_local_idx
+                            ],
+                            ins_x_dst=ins_targets.x[
+                                ins_targets.ins_to_ins_edge_dst_local_idx
+                            ],
                         )
-                        ins_loss_e_ii = unsorted_segment_mean(
-                            ins_loss_e_ii.view(-1, 1),
-                            mols_t.batch[spawn_src_ii],
-                            mols_t.num_graphs,
-                        )
-                        ins_loss_e_ii = self._reduce_loss(ins_loss_e_ii, "none")
+                        if ins_ii_logits is not None and ins_ii_logits.numel() > 0:
+                            # Reuse the shared class loss helper (same masking +
+                            # per-graph averaging) to compute ins->ins edge loss.
+                            ins_loss_e_ii, ins_e_ii_batch_mask = self.class_loss(
+                                ins_ii_logits,
+                                ins_targets.ins_to_ins_edge_types,
+                                self.edge_token_weights,
+                                ii_non_del,
+                                mols_t.batch[spawn_src_ii],
+                                mols_t.num_graphs,
+                                reduction="none",
+                            )
+
+            else:
+                # No insertion targets in this batch: keep scalar placeholders so the
+                # loss accumulator's mask path stays consistent with ndim-0 dummy losses.
+                ins_loss_e = torch.tensor(0.0, device=self.device)
+                ins_loss_e_ii = torch.tensor(0.0, device=self.device)
 
         else:
             # NOTE ins_rate_head, edge_head, gmm_head unused, throws an error (unused_params)
@@ -849,6 +879,8 @@ class LightningModuleRates(pl.LightningModule):
             ins_batch_mask = torch.zeros(
                 mols_t.num_graphs, dtype=torch.bool, device=self.device
             )
+            ins_e_batch_mask = ins_batch_mask
+            ins_e_ii_batch_mask = ins_batch_mask
 
         # 4. Calculate the flow matching loss
         # Only compute the loss for nodes that are not to be deleted
@@ -917,8 +949,8 @@ class LightningModuleRates(pl.LightningModule):
             "x": x_batch_mask,
             "c": c_batch_mask,
             "ins_rate": ins_batch_mask,
-            "ins_e": ins_batch_mask,
-            "ins_e_ii": ins_batch_mask,
+            "ins_e": ins_e_batch_mask,
+            "ins_e_ii": ins_e_ii_batch_mask,
             "ins_gmm": ins_batch_mask,
             "sub_a_class": sub_a_batch_mask,
             "sub_e_class": sub_e_batch_mask,
