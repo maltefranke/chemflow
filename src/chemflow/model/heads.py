@@ -224,9 +224,9 @@ class EquivariantGMMHead(nn.Module):
         nn.init.zeros_(self.scalar_mlp[-1].weight)
         nn.init.zeros_(self.scalar_mlp[-1].bias)
 
-        # 3. EXACT Zero Init for Coordinate Output
-        # Ensures initial mu == x exactly, creating a stable starting geometry
-        nn.init.zeros_(self.coord_mlp[-1].weight)
+        # 3. Normal Init for Coordinate Output
+        # Break symmetry so the K components can learn different spatial modes!
+        nn.init.normal_(self.coord_mlp[-1].weight, mean=0.0, std=1e-3)
 
     def forward(self, h, x, edge_index):
         """
@@ -290,7 +290,9 @@ class EquivariantGMMHead(nn.Module):
         # Aggregate over neighbors (scatter_add)
         # Result: [N, K, 3]
         shift = torch.zeros(N, self.K, 3, device=x.device)
-        shift.index_add_(0, row, weighted_diff)
+        # Expand 'row' to match the [E, K, 3] shape of weighted_diff
+        row_expanded = row.view(-1, 1, 1).expand(-1, self.K, 3)
+        shift.scatter_add_(0, row_expanded, weighted_diff)
 
         # If an atom has 50 neighbors, the sum is huge. Divide by degree.
         # Calculate degree
@@ -355,6 +357,12 @@ class InsertionEdgeHead(nn.Module):
             "out_dim", rbf_embedding_args.get("num_rbf", 16)
         )
 
+        # A learned embedding for nodes that don't have a GNN embedding yet
+        # Initialize it with small random values
+        self.unseen_node_embedding = nn.Parameter(
+            torch.randn(hidden_dim) / (hidden_dim**0.5)
+        )
+
         # One-hot atom/charge features for inserted node and one-hot atom feature
         # for the existing endpoint node.
         ins_type_feat_dim = n_atom_types + n_charge_types
@@ -366,6 +374,7 @@ class InsertionEdgeHead(nn.Module):
         #  ins_atom_one_hot, ins_charge_one_hot]
         input_dim = (
             hidden_dim
+            + hidden_dim
             + dist_feat_dim
             + existing_atom_feat_dim
             + dist_feat_dim
@@ -375,32 +384,32 @@ class InsertionEdgeHead(nn.Module):
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.SiLU(inplace=True),
-            nn.Linear(hidden_dim // 2, n_edge_types),
+            nn.Linear(hidden_dim, n_edge_types),
         )
 
         self._init_weights()
 
     def _init_weights(self):
         """Optimized initialization for flow-matching edge prediction."""
-        for i, m in enumerate(self.edge_mlp):
-            if isinstance(m, nn.Linear):
-                # Final logit projection
-                if i == len(self.edge_mlp) - 1:
-                    nn.init.zeros_(m.weight)
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
+        # Find all linear layers
+        linear_layers = [m for m in self.edge_mlp if isinstance(m, nn.Linear)]
+
+        for i, m in enumerate(linear_layers):
+            if i == len(linear_layers) - 1:
+                # Final logit projection: initialize to zero for flow matching prior
+                nn.init.zeros_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            else:
                 # Hidden layers
-                else:
-                    nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def _prepare_edge_features(
         self,
         h_spawn: torch.Tensor,
+        h_existing: torch.Tensor,
         spawn_pos: torch.Tensor,
         existing_pos: torch.Tensor,
         existing_atom_idx: torch.Tensor,
@@ -428,6 +437,7 @@ class InsertionEdgeHead(nn.Module):
         return torch.cat(
             [
                 h_spawn,
+                h_existing,
                 dist_spawn_features,
                 existing_atom_type,
                 dist_existing_features,
@@ -455,6 +465,7 @@ class InsertionEdgeHead(nn.Module):
         x_detached = x.detach()
         edge_features = self._prepare_edge_features(
             h_spawn=h[spawn_node_idx],
+            h_existing=h[existing_node_idx],
             spawn_pos=x_detached[spawn_node_idx],
             existing_pos=x_detached[existing_node_idx],
             existing_atom_idx=node_atom_types[existing_node_idx],
@@ -487,8 +498,15 @@ class InsertionEdgeHead(nn.Module):
             return torch.empty((0, self.n_edge_types), device=h.device)
 
         x_detached = x.detach()
+
+        n_edges = spawn_src_idx.size(0)
+
+        # NEW: Expand the learned parameter to shape [N_edges, hidden_dim]
+        h_dummy = self.unseen_node_embedding.unsqueeze(0).expand(n_edges, -1)
+
         edge_features = self._prepare_edge_features(
             h_spawn=h[spawn_src_idx],
+            h_existing=h_dummy,
             spawn_pos=x_detached[spawn_src_idx],
             existing_pos=ins_x_dst.detach(),
             existing_atom_idx=ins_a_dst,
