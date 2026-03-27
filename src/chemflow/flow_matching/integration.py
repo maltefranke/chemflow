@@ -161,38 +161,6 @@ class RateIntegrator:
             ins_gmm_dict, num_ins, K, D, A, C
         )
 
-        """# now to interpolation depending on our schedules
-        kappa_t = self.sub_schedule.kappa_t(t).unsqueeze(1)
-        a_1_one_hot = F.one_hot(sampled_a, num_classes=A)
-        c_1_one_hot = F.one_hot(sampled_c, num_classes=C)
-
-        a = (
-            self._cat_atom.probs.repeat(c_1_one_hot.shape[0], 1, 1) * (1 - kappa_t)
-            + a_1_one_hot * kappa_t
-        )
-        # a = F.softmax(a, dim=-1)
-        a = torch.distributions.Categorical(probs=a).sample()
-
-        c = (
-            self._cat_charge.probs.repeat(c_1_one_hot.shape[0], 1, 1) * (1 - kappa_t)
-            + c_1_one_hot * kappa_t
-        )
-        # c = F.softmax(c, dim=-1)
-        c = torch.distributions.Categorical(probs=c).sample()
-
-        sampled_x = sampled_x.view(-1, self.gmm_params.D)
-        t = t.view(-1, 1)
-        x = sampled_x + self.ins_noise_scale * torch.randn_like(sampled_x) * (1 - t)
-
-        new_atoms = PointCloud(
-            x=x.view(-1, self.gmm_params.D),
-            a=a.view(-1),
-            c=c.view(-1),
-        )
-        new_atoms.x_1 = sampled_x.view(-1, self.gmm_params.D)
-        new_atoms.a_1 = sampled_a.view(-1)
-        new_atoms.c_1 = sampled_c.view(-1)"""
-
         new_atoms = PointCloud(
             x=sampled_x.view(-1, self.gmm_params.D),
             a=sampled_a.view(-1),
@@ -289,14 +257,27 @@ class RateIntegrator:
         # Sample whether to insert with probability h * lambda_ins
         p_ins = do_ins_probs
         p_ins = p_ins.view(-1)
-        do_ins = torch.rand_like(p_ins) < p_ins
 
-        # for insertion, we will then sample from the poisson distribution
-        expected_num_ins = (num_ins_pred + noise_weight_node) * ins_rate_node * dt
-        # NOTE in OneFlow, instead of sampling Poisson, they sample Bernoulli
-        ins_sampled = torch.rand_like(expected_num_ins) < expected_num_ins
+        ins_strategy = "poisson"
+        if ins_strategy == "gate":
+            ins_gate = torch.rand_like(p_ins) < p_ins
 
-        do_ins = do_ins & ins_sampled
+            # for insertion, we will then sample from the poisson distribution
+            expected_num_ins = (num_ins_pred + noise_weight_node) * ins_rate_node * dt
+
+            # NOTE in OneFlow, instead of sampling Poisson, they sample Bernoulli
+            ins_sampled = torch.rand_like(expected_num_ins) < expected_num_ins
+
+            do_ins = ins_gate & ins_sampled
+
+        else:
+            expected_num_ins = (
+                p_ins * (num_ins_pred + noise_weight_node) * ins_rate_node * dt
+            )
+            # NOTE in OneFlow, instead of sampling Poisson, they sample Bernoulli
+            ins_sampled = torch.rand_like(expected_num_ins) < expected_num_ins
+
+            do_ins = ins_sampled
 
         # Fail-safe: ensure that the number of atoms per graph won't be greater than the max number of atoms
         if do_ins.any():
@@ -590,6 +571,39 @@ class RateIntegrator:
                     and e_t_ins is not None
                     and e_t_ins.numel() > 0
                 )
+
+                """# Finally, we turn the new atoms to the current noise level
+                kappa_t = self.sub_schedule.kappa_t(t_ins).unsqueeze(1)
+                a_1_one_hot = F.one_hot(
+                    new_atoms.a, num_classes=len(self.vocab.atom_tokens)
+                )
+                c_1_one_hot = F.one_hot(
+                    new_atoms.c, num_classes=len(self.vocab.charge_tokens)
+                )
+
+                a = (
+                    self._cat_atom.probs.repeat(c_1_one_hot.shape[0], 1) * (1 - kappa_t)
+                    + a_1_one_hot * kappa_t
+                )
+                # a = F.softmax(a, dim=-1)
+                a = torch.distributions.Categorical(probs=a).sample()
+
+                c = (
+                    self._cat_charge.probs.repeat(c_1_one_hot.shape[0], 1)
+                    * (1 - kappa_t)
+                    + c_1_one_hot * kappa_t
+                )
+                # c = F.softmax(c, dim=-1)
+                c = torch.distributions.Categorical(probs=c).sample()
+
+                t_ins = t_ins.view(-1, 1)
+                x = new_atoms.x + self.ins_noise_scale * torch.randn_like(
+                    new_atoms.x, device=self.device
+                ) * (1 - t_ins)
+
+                new_atoms.x = x
+                new_atoms.a = a
+                new_atoms.c = c"""
 
                 if use_predicted_edges:
                     # Use predicted edges from InsertionEdgeHead
