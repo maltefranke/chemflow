@@ -50,11 +50,13 @@ module:
   time_dist: ${if:${eq:${model.sample_time_strategy}, log}, ${model.beta_sched}, ${model.linear_sched}}
   integrator: ${model.integrator}
 
-  cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.dropout_prob}, 0.0}
-  cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.guidance_scale}, 0.0}
-
-  natoms_cfg_dropout_prob: ${if:${model.do_natoms_cfg}, ${model.natoms_cfg.dropout_prob}, 0.0}
-  natoms_cfg_guidance_scale: ${if:${model.do_natoms_cfg}, ${model.natoms_cfg.guidance_scale}, 0.0}
+  # Classifier-free guidance
+  cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.property_dropout_prob}, 0.0}
+  cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.property_guidance_scale}, 0.0}
+  natoms_cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.natoms_dropout_prob}, 0.0}
+  natoms_cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.natoms_guidance_scale}, 0.0}
+  mw_cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.mw_dropout_prob}, 0.0}
+  mw_cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.mw_guidance_scale}, 0.0}
 
   vocab: ${data.vocab}
   
@@ -118,8 +120,7 @@ module:
 
     heads_args: ${model.heads}
     ins_gmm_head_args: ${model.gmm_head_args}
-    property_embedding_args: ${model.property_embedding}
-    natoms_cfg_embedding_args: ${model.natoms_cfg_embedding}
+    cfg_embedding_args: ${model.cfg_embedding}
     ins_edge_head_args:
       _target_: chemflow.model.heads.InsertionEdgeHead
       _recursive_: false
@@ -157,36 +158,35 @@ node_count_embedding:
   embedding_dim: 64
   out_dim: 128
 
-# ── Classifier-free guidance master switch (property conditioning) ──
-do_cfg: false
+# ── Unified classifier-free guidance ──
+do_cfg: true
 
 cfg:
-  dropout_prob: 0.15
-  guidance_scale: 1.5
-  property_embed_dim: 128
-  property_embedding:
-    _target_: chemflow.model.embedding.PropertyEmbedding
-    num_properties: 19
-    embedding_dim: 128
-    out_dim: 128
-
-property_embedding: ${if:${model.do_cfg}, ${model.cfg.property_embedding}, null}
-property_embed_dim: ${if:${model.do_cfg}, ${model.cfg.property_embed_dim}, 0}
-
-# ── Classifier-free guidance for target n_atoms (enabled by default) ──
-do_natoms_cfg: true
-
-natoms_cfg:
-  dropout_prob: 0.35
-  guidance_scale: 1.0
   embed_dim: 128
+  # Property conditioning (num_properties=0 disables)
+  num_properties: 0
+  property_hidden_dim: 128
+  property_dropout_prob: 0.15
+  property_guidance_scale: 1.5
+  # N-atoms conditioning
+  use_natoms: true
+  natoms_dropout_prob: 0.35
+  natoms_guidance_scale: 1.0
+  # MW conditioning
+  use_mw: false
+  mw_dropout_prob: 0.15
+  mw_guidance_scale: 0.0
+  # Unified embedding
   embedding:
-    _target_: chemflow.model.embedding.NAtomsCFGEmbedding
-    embedding_dim: 64
-    out_dim: 128
+    _target_: chemflow.model.embedding.UnifiedCFGEmbedding
+    out_dim: ${model.cfg.embed_dim}
+    num_properties: ${model.cfg.num_properties}
+    property_hidden_dim: ${model.cfg.property_hidden_dim}
+    use_natoms: ${model.cfg.use_natoms}
+    use_mw: ${model.cfg.use_mw}
 
-natoms_cfg_embedding: ${if:${model.do_natoms_cfg}, ${model.natoms_cfg.embedding}, null}
-natoms_cfg_embed_dim: ${if:${model.do_natoms_cfg}, ${model.natoms_cfg.embed_dim}, 0}
+cfg_embedding: ${if:${model.do_cfg}, ${model.cfg.embedding}, null}
+cfg_embed_dim: ${if:${model.do_cfg}, ${model.cfg.embed_dim}, 0}
 
 bond_degree_embedding:
   _target_: chemflow.model.embedding.BondDegreeEmbedding
@@ -198,7 +198,7 @@ backbone:
   _target_: chemflow.model.backbones.dit.DiTBackbone
   _recursive_: false
   d_input: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.bond_degree_embed_dim}"}
-  d_cond: ${oc.eval:"${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.property_embed_dim} + ${model.natoms_cfg_embed_dim}"}
+  d_cond: ${oc.eval:"${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.cfg_embed_dim}"}
   d_model: 512
   out_node_nf: 256
   num_layers: 8

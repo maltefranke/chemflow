@@ -2,6 +2,10 @@ import torch.nn as nn
 import torch
 import math
 
+from rdkit.Chem import GetPeriodicTable
+
+_PERIODIC_TABLE = GetPeriodicTable()
+
 
 class Embedding(nn.Module):
     """
@@ -305,6 +309,212 @@ class NAtomsCFGEmbedding(nn.Module):
             emb = torch.where(drop_mask.unsqueeze(-1), null, emb)
 
         return emb
+
+
+def compute_molecular_weight(
+    atom_indices: torch.Tensor,
+    atom_tokens: list[str],
+    batch: torch.Tensor | None = None,
+    num_graphs: int | None = None,
+) -> torch.Tensor:
+    """Compute molecular weight per graph from atom token indices.
+
+    Uses RDKit's periodic table for accurate atomic weights.
+
+    Args:
+        atom_indices: (N,) integer tensor of atom type indices.
+        atom_tokens: ordered list of element symbols (vocab).
+        batch: (N,) graph membership for each atom.
+        num_graphs: number of graphs in the batch.
+
+    Returns:
+        (num_graphs,) tensor of molecular weights in Daltons.
+        If batch / num_graphs are not provided, returns a scalar.
+    """
+    weights = torch.tensor(
+        [_PERIODIC_TABLE.GetAtomicWeight(tok) for tok in atom_tokens],
+        dtype=torch.float,
+        device=atom_indices.device,
+    )
+    per_atom_mw = weights[atom_indices.long()]
+
+    if batch is not None and num_graphs is not None:
+        mw = torch.zeros(num_graphs, device=atom_indices.device)
+        mw.scatter_add_(0, batch, per_atom_mw)
+        return mw
+
+    return per_atom_mw.sum().unsqueeze(0)
+
+
+def _encode_signal(
+    value: torch.Tensor | None,
+    encoder: nn.Module,
+    null_emb: nn.Parameter,
+    drop_mask: torch.Tensor | None,
+    batch_size: int,
+) -> torch.Tensor:
+    """Shared logic for encoding a single CFG signal with dropout."""
+    if value is None:
+        return null_emb.unsqueeze(0).expand(batch_size, -1)
+    if value.ndim == 1:
+        value = value.unsqueeze(-1) if value.dtype.is_floating_point else value
+    emb = encoder(value)
+    if drop_mask is not None:
+        null = null_emb.unsqueeze(0).expand_as(emb)
+        emb = torch.where(drop_mask.unsqueeze(-1), null, emb)
+    return emb
+
+
+class UnifiedCFGEmbedding(nn.Module):
+    """Unified classifier-free guidance embedding.
+
+    Bundles property, n_atoms, and molecular weight conditioning into a
+    single module.  Each signal has its own sub-encoder and learnable null
+    embedding; the sub-embeddings are concatenated and projected to
+    ``out_dim``.
+
+    Accepts a ``cfg_inputs`` dict so callers do not need separate kwargs
+    per signal.
+
+    Input dict keys (all optional):
+        properties, property_drop_mask,
+        target_n_atoms, natoms_drop_mask,
+        target_mw, mw_drop_mask
+
+    Output: Float Tensor [Batch, out_dim]
+    """
+
+    def __init__(
+        self,
+        out_dim: int,
+        # Property conditioning (num_properties=0 disables)
+        num_properties: int = 0,
+        property_hidden_dim: int = 128,
+        # N-atoms conditioning
+        use_natoms: bool = False,
+        natoms_sinusoidal_dim: int = 64,
+        natoms_max_period: float = 100.0,
+        # MW conditioning
+        use_mw: bool = False,
+        mw_sinusoidal_dim: int = 64,
+        mw_max_period: float = 1000.0,
+    ):
+        super().__init__()
+        self.out_dim = out_dim
+        internal_dim = 0
+
+        self.property_encoder = None
+        self._property_null = None
+        if num_properties > 0:
+            prop_out = property_hidden_dim
+            self.property_encoder = nn.Sequential(
+                nn.Linear(num_properties, property_hidden_dim),
+                nn.LayerNorm(property_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(property_hidden_dim, prop_out),
+            )
+            self._property_null = nn.Parameter(torch.randn(prop_out) * 0.02)
+            internal_dim += prop_out
+
+        self.natoms_encoder = None
+        self._natoms_null = None
+        if use_natoms:
+            self.natoms_encoder = CountEmbedding(
+                embedding_dim=natoms_sinusoidal_dim,
+                out_dim=natoms_sinusoidal_dim,
+                max_period=natoms_max_period,
+            )
+            self._natoms_null = nn.Parameter(torch.randn(natoms_sinusoidal_dim) * 0.02)
+            internal_dim += natoms_sinusoidal_dim
+
+        self.mw_encoder = None
+        self._mw_null = None
+        if use_mw:
+            self._mw_sinusoidal = SinusoidalEncoding(
+                mw_sinusoidal_dim, max_period=mw_max_period
+            )
+            self.mw_encoder = nn.Sequential(
+                nn.Linear(mw_sinusoidal_dim, mw_sinusoidal_dim),
+                nn.SiLU(),
+                nn.Linear(mw_sinusoidal_dim, mw_sinusoidal_dim),
+            )
+            self._mw_null = nn.Parameter(torch.randn(mw_sinusoidal_dim) * 0.02)
+            internal_dim += mw_sinusoidal_dim
+
+        if internal_dim > 0:
+            self.projection = nn.Sequential(
+                nn.Linear(internal_dim, out_dim),
+                nn.SiLU(),
+                nn.Linear(out_dim, out_dim),
+            )
+        else:
+            self.projection = None
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def _encode_mw(self, value, drop_mask, batch_size):
+        if value is None:
+            return self._mw_null.unsqueeze(0).expand(batch_size, -1)
+        if value.ndim == 1:
+            value = value.unsqueeze(-1)
+        emb = self.mw_encoder(self._mw_sinusoidal(value))
+        if drop_mask is not None:
+            null = self._mw_null.unsqueeze(0).expand_as(emb)
+            emb = torch.where(drop_mask.unsqueeze(-1), null, emb)
+        return emb
+
+    def forward(
+        self,
+        cfg_inputs: dict,
+        batch_size: int,
+    ) -> torch.Tensor:
+        parts: list[torch.Tensor] = []
+
+        if self.property_encoder is not None:
+            parts.append(
+                _encode_signal(
+                    cfg_inputs.get("properties"),
+                    self.property_encoder,
+                    self._property_null,
+                    cfg_inputs.get("property_drop_mask"),
+                    batch_size,
+                )
+            )
+
+        if self.natoms_encoder is not None:
+            parts.append(
+                _encode_signal(
+                    cfg_inputs.get("target_n_atoms"),
+                    self.natoms_encoder,
+                    self._natoms_null,
+                    cfg_inputs.get("natoms_drop_mask"),
+                    batch_size,
+                )
+            )
+
+        if self.mw_encoder is not None:
+            parts.append(
+                self._encode_mw(
+                    cfg_inputs.get("target_mw"),
+                    cfg_inputs.get("mw_drop_mask"),
+                    batch_size,
+                )
+            )
+
+        if not parts:
+            device = next(self.parameters()).device
+            return torch.zeros(
+                batch_size, self.out_dim, device=device,
+            )
+
+        return self.projection(torch.cat(parts, dim=-1))
 
 
 class RBFEncoding(nn.Module):

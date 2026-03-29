@@ -54,14 +54,16 @@ module:
   edit_loss_ema_eps: 1.0e-8
   ema_decay: 0.999
   use_ema_for_eval: false
+  use_time_weights: false
   time_dist: ${if:${eq:${model.sample_time_strategy}, log}, ${model.beta_sched}, ${model.linear_sched}}
 
-  # Classifier-free guidance on molecular properties (controlled by model.do_cfg)
-  cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.dropout_prob}, 0.0}
-  cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.guidance_scale}, 0.0}
-
-  natoms_cfg_dropout_prob: ${if:${model.do_natoms_cfg}, ${model.natoms_cfg.dropout_prob}, 0.0}
-  natoms_cfg_guidance_scale: ${if:${model.do_natoms_cfg}, ${model.natoms_cfg.guidance_scale}, 0.0}
+  # Classifier-free guidance
+  cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.property_dropout_prob}, 0.0}
+  cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.property_guidance_scale}, 0.0}
+  natoms_cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.natoms_dropout_prob}, 0.0}
+  natoms_cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.natoms_guidance_scale}, 0.0}
+  mw_cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.mw_dropout_prob}, 0.0}
+  mw_cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.mw_guidance_scale}, 0.0}
 
   integrator: ${model.integrator}
 
@@ -155,37 +157,35 @@ node_count_embedding:
   embedding_dim: 64
   out_dim: 128
 
-# ── Classifier-free guidance master switch (property conditioning) ──
-do_cfg: false
+# ── Unified classifier-free guidance ──
+do_cfg: true
 
 cfg:
-  dropout_prob: 0.15
-  guidance_scale: 1.5
-  property_embed_dim: 128
-  property_embedding:
-    _target_: chemflow.model.embedding.PropertyEmbedding
-    num_properties: 19   # QM9 has 19 properties
-    embedding_dim: 128
-    out_dim: 128
-
-# Resolved from do_cfg: either the real config or null / 0
-property_embedding: ${if:${model.do_cfg}, ${model.cfg.property_embedding}, null}
-property_embed_dim: ${if:${model.do_cfg}, ${model.cfg.property_embed_dim}, 0}
-
-# ── Classifier-free guidance for target n_atoms (enabled by default) ──
-do_natoms_cfg: true
-
-natoms_cfg:
-  dropout_prob: 0.35
-  guidance_scale: 1.5
   embed_dim: 128
+  # Property conditioning (num_properties=0 disables)
+  num_properties: 0
+  property_hidden_dim: 128
+  property_dropout_prob: 0.15
+  property_guidance_scale: 1.5
+  # N-atoms conditioning
+  use_natoms: true
+  natoms_dropout_prob: 0.35
+  natoms_guidance_scale: 1.5
+  # MW conditioning
+  use_mw: false
+  mw_dropout_prob: 0.15
+  mw_guidance_scale: 0.0
+  # Unified embedding
   embedding:
-    _target_: chemflow.model.embedding.NAtomsCFGEmbedding
-    embedding_dim: 64
-    out_dim: 128
+    _target_: chemflow.model.embedding.UnifiedCFGEmbedding
+    out_dim: ${model.cfg.embed_dim}
+    num_properties: ${model.cfg.num_properties}
+    property_hidden_dim: ${model.cfg.property_hidden_dim}
+    use_natoms: ${model.cfg.use_natoms}
+    use_mw: ${model.cfg.use_mw}
 
-natoms_cfg_embedding: ${if:${model.do_natoms_cfg}, ${model.natoms_cfg.embedding}, null}
-natoms_cfg_embed_dim: ${if:${model.do_natoms_cfg}, ${model.natoms_cfg.embed_dim}, 0}
+cfg_embedding: ${if:${model.do_cfg}, ${model.cfg.embedding}, null}
+cfg_embed_dim: ${if:${model.do_cfg}, ${model.cfg.embed_dim}, 0}
 
 embedding_backbone:
   _target_: chemflow.model.model.EmbeddingBackbone
@@ -194,10 +194,9 @@ embedding_backbone:
   edge_type_embedding_args: ${model.edge_type_embedding}
   time_embedding_args: ${model.time_embedding}
   node_count_embedding_args: ${model.node_count_embedding}
-  property_embedding_args: ${model.property_embedding}
-  natoms_cfg_embedding_args: ${model.natoms_cfg_embedding}
-  h0_input_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.property_embed_dim} + ${model.natoms_cfg_embed_dim}"}
-  h0_projection_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.property_embed_dim} + ${model.natoms_cfg_embed_dim}"}
+  cfg_embedding_args: ${model.cfg_embedding}
+  h0_input_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.cfg_embed_dim}"}
+  h0_projection_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.cfg_embed_dim}"}
   e_input_dim: ${model.edge_type_embedding.out_dim}
   e_projection_dim: ${model.edge_type_embedding.out_dim}
 
