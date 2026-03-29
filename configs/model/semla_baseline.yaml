@@ -46,7 +46,7 @@ module:
   # tokens and atom_type_distribution will be passed from preprocessing in run.py
   gmm_params: ${model.gmm_params}
   n_atoms_strategy: ${data.n_atoms_strategy}
-  type_loss_token_weights: uniform
+  type_loss_token_weights: training
   cat_weighting:
     _target_: DictConfig
     weight_alpha: 1.0
@@ -56,11 +56,11 @@ module:
   ema_decay: 0.999
   ema_decay_scheduler:
     _target_: chemflow.utils.lr_schedulers.EMADecayScheduler
-    initial_decay: 0.8
-    mid_decay: 0.99
-    final_decay: 0.9999
+    initial_decay: 0.1
+    mid_decay: 0.9
+    final_decay: 0.99
     warmup_epochs: 10
-    fast_ramp_epochs: 90
+    fast_ramp_epochs: 140
     total_epochs: ${trainer.trainer.max_epochs}
   use_ema_for_eval: true
   use_time_weights: false
@@ -80,21 +80,36 @@ module:
 
   # Loss component weights
   use_learnable_loss_weights: false
-  
+  # loss_weights:
+  #   l_do_sub_a: 5.0 # 1.0
+  #   l_sub_a_class: 1.6 # 1.0
+  #   l_do_sub_e: 5.0 # 1.0
+  #   l_sub_e_class: 3.0 # 1.0
+  #   l_do_del: 1.4 # 1.0
+  #   l_do_ins: 1.4 # 1.0
+  #   l_ins_rate: 0.8 # 1.0
+  #   l_ins_gmm: 1.0
+  #   l_ins_e: 5.9 # 1.0
+  #   l_x: 12.5 # 1.0
+  #   l_c: 1.2 # 1.0
+  #   l_global_ins_budget: 0.3 # 0.1
+  #   l_global_del_budget: 0.5 # 0.1
+
   loss_weights:
     l_do_sub_a: 1.0
     l_sub_a_class: 1.0
     l_do_sub_e: 1.0
     l_sub_e_class: 1.0
-    l_do_del: 1.0
-    l_do_ins: 1.0
-    l_ins_rate: 1.0
-    l_ins_gmm: 1.0
-    l_ins_e: 1.0
-    l_ins_e_ii: 1.0
+    l_do_del: 0.0
+    l_do_ins: 0.0
+    l_ins_rate: 0.0
+    l_ins_gmm: 0.0
+    l_ins_e: 0.0
+    l_ins_e_ii: 0.0
     l_x: 1.0
     l_c: 1.0
-    
+    l_global_ins_budget: 0.0
+    l_global_del_budget: 0.0
 
   # Optimizer configuration
   # MuonWithAuxAdam: Muon for 2D backbone weights, AdamW for the rest.
@@ -177,20 +192,16 @@ do_cfg: false
 
 cfg:
   embed_dim: 128
-  # Property conditioning (num_properties=0 disables)
   num_properties: 0
   property_hidden_dim: 128
   property_dropout_prob: 0.15
   property_guidance_scale: 1.5
-  # N-atoms conditioning
   use_natoms: false
   natoms_dropout_prob: 0.15
   natoms_guidance_scale: 0.0
-  # MW conditioning
   use_mw: false
   mw_dropout_prob: 0.15
   mw_guidance_scale: 0.0
-  # Unified embedding
   embedding:
     _target_: chemflow.model.embedding.UnifiedCFGEmbedding
     out_dim: ${model.cfg.embed_dim}

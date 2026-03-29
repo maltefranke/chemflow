@@ -3,29 +3,31 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from chemflow.model.embedding import compute_molecular_weight
+
 
 class CFGAdapter:
-    """Classifier-free guidance adapter for both property and n_atoms conditioning.
+    """Classifier-free guidance adapter.
 
-    Encapsulates all CFG parameters, masking logic, and the type-aware
-    guidance interpolation used during training and inference.
+    Manages per-signal dropout, guidance scales, and multi-pass CFG
+    inference for property, n_atoms, and molecular-weight conditioning.
     """
 
     # Head categories for type-aware classifier-free guidance.
-    # Linear extrapolation (positions, logits before softmax/sigmoid)
     _cfg_linear_keys = {
-        "atom_type_head",
-        "charge_head",
-        "edge_type_head",
         "do_ins_head",
         "do_del_head",
         "do_sub_a_head",
         "do_sub_e_head",
     }
-    # Log-space CFG for strictly-positive rate outputs (post-softplus)
-    _cfg_rate_keys = {"ins_rate_head"}
-    # Use conditional predictions directly
-    _cfg_use_cond_keys = {"pos_head"}
+    _cfg_rate_keys: set[str] = set()
+    _cfg_use_cond_keys = {
+        "pos_head",
+        "atom_type_head",
+        "charge_head",
+        "edge_type_head",
+        "ins_rate_head",
+    }
 
     def __init__(
         self,
@@ -34,23 +36,41 @@ class CFGAdapter:
         cfg_guidance_scale: float = 0.0,
         natoms_cfg_dropout_prob: float = 0.15,
         natoms_cfg_guidance_scale: float = 2.5,
+        mw_cfg_dropout_prob: float = 0.15,
+        mw_cfg_guidance_scale: float = 0.0,
+        atom_tokens: list[str] | None = None,
     ):
         self.model = model
         self.cfg_dropout_prob = float(cfg_dropout_prob)
         self.cfg_guidance_scale = float(cfg_guidance_scale)
         self.natoms_cfg_dropout_prob = float(natoms_cfg_dropout_prob)
         self.natoms_cfg_guidance_scale = float(natoms_cfg_guidance_scale)
+        self.mw_cfg_dropout_prob = float(mw_cfg_dropout_prob)
+        self.mw_cfg_guidance_scale = float(mw_cfg_guidance_scale)
+        self.atom_tokens = atom_tokens
+
+    @property
+    def _cfg_embedding(self):
+        return getattr(
+            self.model.embedding_backbone, "cfg_embedding", None
+        )
 
     @property
     def _has_property_conditioning(self) -> bool:
-        return self.model.embedding_backbone.property_embedding is not None
+        e = self._cfg_embedding
+        return e is not None and getattr(e, "property_encoder", None) is not None
 
     @property
     def _has_natoms_cfg(self) -> bool:
-        return self.model.embedding_backbone.natoms_cfg_embedding is not None
+        e = self._cfg_embedding
+        return e is not None and getattr(e, "natoms_encoder", None) is not None
+
+    @property
+    def _has_mw_cfg(self) -> bool:
+        e = self._cfg_embedding
+        return e is not None and getattr(e, "mw_encoder", None) is not None
 
     def extract_properties(self, mols_t) -> torch.Tensor | None:
-        """Return graph-level properties from the batch, or None."""
         if not self._has_property_conditioning:
             return None
         if hasattr(mols_t, "y") and mols_t.y is not None:
@@ -58,26 +78,48 @@ class CFGAdapter:
         return None
 
     def extract_target_n_atoms(self, mols) -> torch.Tensor | None:
-        """Return per-graph target atom counts, or None if n_atoms CFG is off."""
         if not self._has_natoms_cfg:
             return None
         return torch.bincount(mols.batch)
 
-    def sample_cfg_drop_mask(
-        self, batch_size: int, device: torch.device, training: bool
+    def extract_target_mw(
+        self, mols, batch: torch.Tensor | None = None
     ) -> torch.Tensor | None:
-        """During training, randomly mask out properties for CFG."""
-        if self.cfg_dropout_prob <= 0.0 or not training:
+        if not self._has_mw_cfg or self.atom_tokens is None:
             return None
-        return torch.rand(batch_size, device=device) < self.cfg_dropout_prob
+        b = batch if batch is not None else mols.batch
+        return compute_molecular_weight(
+            mols.a, self.atom_tokens, b, mols.num_graphs
+        )
 
-    def sample_natoms_cfg_drop_mask(
-        self, batch_size: int, device: torch.device, training: bool
+    def _sample_drop_mask(
+        self, prob: float, batch_size: int,
+        device: torch.device, training: bool,
     ) -> torch.Tensor | None:
-        """During training, randomly mask out target n_atoms for CFG."""
-        if self.natoms_cfg_dropout_prob <= 0.0 or not training:
+        if prob <= 0.0 or not training:
             return None
-        return torch.rand(batch_size, device=device) < self.natoms_cfg_dropout_prob
+        return torch.rand(batch_size, device=device) < prob
+
+    def should_use_property_cfg(self, properties) -> bool:
+        return (
+            self.cfg_guidance_scale > 0.0
+            and properties is not None
+            and self._has_property_conditioning
+        )
+
+    def should_use_natoms_cfg(self, target_n_atoms) -> bool:
+        return (
+            self.natoms_cfg_guidance_scale > 0.0
+            and target_n_atoms is not None
+            and self._has_natoms_cfg
+        )
+
+    def should_use_mw_cfg(self, target_mw) -> bool:
+        return (
+            self.mw_cfg_guidance_scale > 0.0
+            and target_mw is not None
+            and self._has_mw_cfg
+        )
 
     def apply_cfg(
         self,
@@ -126,39 +168,33 @@ class CFGAdapter:
     def get_training_inputs(
         self, mols_t, mols_1, device: torch.device, training: bool
     ) -> dict:
-        """Prepare all CFG-related inputs for a training forward pass.
+        """Build the ``cfg_inputs`` dict for a training forward pass."""
+        bs = mols_t.num_graphs
+        return {
+            "properties": self.extract_properties(mols_t),
+            "property_drop_mask": self._sample_drop_mask(
+                self.cfg_dropout_prob, bs, device, training,
+            ),
+            "target_n_atoms": self.extract_target_n_atoms(mols_1),
+            "natoms_drop_mask": self._sample_drop_mask(
+                self.natoms_cfg_dropout_prob, bs, device, training,
+            ),
+            "target_mw": self.extract_target_mw(mols_1),
+            "mw_drop_mask": self._sample_drop_mask(
+                self.mw_cfg_dropout_prob, bs, device, training,
+            ),
+        }
 
-        Returns a dict with keys: properties, cfg_drop_mask,
-        target_n_atoms, natoms_drop_mask.
-        """
-        properties = self.extract_properties(mols_t)
-        cfg_drop_mask = self.sample_cfg_drop_mask(
-            mols_t.num_graphs, device, training
-        )
-        target_n_atoms = self.extract_target_n_atoms(mols_1)
-        natoms_drop_mask = self.sample_natoms_cfg_drop_mask(
-            mols_t.num_graphs, device, training
-        )
-        return dict(
-            properties=properties,
-            cfg_drop_mask=cfg_drop_mask,
-            target_n_atoms=target_n_atoms,
-            natoms_drop_mask=natoms_drop_mask,
-        )
-
-    def should_use_property_cfg(self, properties) -> bool:
-        return (
-            self.cfg_guidance_scale > 0.0
-            and properties is not None
-            and self._has_property_conditioning
-        )
-
-    def should_use_natoms_cfg(self, target_n_atoms) -> bool:
-        return (
-            self.natoms_cfg_guidance_scale > 0.0
-            and target_n_atoms is not None
-            and self._has_natoms_cfg
-        )
+    def _uncond_cfg_inputs(self) -> dict:
+        """Return a cfg_inputs dict with every signal set to None."""
+        return {
+            "properties": None,
+            "property_drop_mask": None,
+            "target_n_atoms": None,
+            "natoms_drop_mask": None,
+            "target_mw": None,
+            "mw_drop_mask": None,
+        }
 
     def guided_predict(
         self,
@@ -166,42 +202,52 @@ class CFGAdapter:
         mol_t,
         t: torch.Tensor,
         prev_preds,
-        properties: torch.Tensor | None,
-        target_n_atoms: torch.Tensor | None,
+        cfg_inputs: dict,
     ) -> dict:
-        """Run the full CFG inference: unconditional pass + optional guided passes.
+        """Run CFG inference: unconditional + per-signal guided passes."""
+        uncond = self._uncond_cfg_inputs()
 
-        Returns the (possibly guided) prediction dict.
-        """
         preds = model(
-            mol_t,
-            t.view(-1, 1),
+            mol_t, t.view(-1, 1),
             prev_outs=prev_preds,
-            properties=None,
-            target_n_atoms=None,
+            cfg_inputs=uncond,
         )
 
+        target_n_atoms = cfg_inputs.get("target_n_atoms")
+        target_mw = cfg_inputs.get("target_mw")
+        properties = cfg_inputs.get("properties")
+
         if self.should_use_natoms_cfg(target_n_atoms):
-            preds_cond_natoms = model(
-                mol_t,
-                t.view(-1, 1),
+            cond = {**uncond, "target_n_atoms": target_n_atoms}
+            preds_cond = model(
+                mol_t, t.view(-1, 1),
                 prev_outs=prev_preds,
-                properties=None,
-                target_n_atoms=target_n_atoms,
+                cfg_inputs=cond,
             )
             preds = self.apply_cfg(
-                preds_cond_natoms, preds, self.natoms_cfg_guidance_scale
+                preds_cond, preds, self.natoms_cfg_guidance_scale,
+            )
+
+        if self.should_use_mw_cfg(target_mw):
+            cond = {**uncond, "target_mw": target_mw}
+            preds_cond = model(
+                mol_t, t.view(-1, 1),
+                prev_outs=prev_preds,
+                cfg_inputs=cond,
+            )
+            preds = self.apply_cfg(
+                preds_cond, preds, self.mw_cfg_guidance_scale,
             )
 
         if self.should_use_property_cfg(properties):
             preds_cond = model(
-                mol_t,
-                t.view(-1, 1),
+                mol_t, t.view(-1, 1),
                 prev_outs=prev_preds,
-                properties=properties,
-                target_n_atoms=target_n_atoms,
+                cfg_inputs=cfg_inputs,
             )
-            preds = self.apply_cfg(preds_cond, preds, self.cfg_guidance_scale)
+            preds = self.apply_cfg(
+                preds_cond, preds, self.cfg_guidance_scale,
+            )
 
         return preds
 

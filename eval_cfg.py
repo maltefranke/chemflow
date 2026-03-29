@@ -1,22 +1,25 @@
-"""Evaluate classifier-free guidance steering for n_atoms conditioning.
+"""Evaluate classifier-free guidance steering for n_atoms and MW conditioning.
 
-Sweeps over target atom counts and guidance scales, generating molecules
-for each combination and reporting how accurately the model hits the
-requested size.
+Sweeps over target atom counts / molecular weights and guidance scales,
+generating molecules for each combination and reporting how accurately
+the model hits the requested target.
 
 Usage:
     python eval_cfg.py
 """
 
 import hydra
+import matplotlib.pyplot as plt
 import omegaconf
 import torch
 from copy import deepcopy
+import math
+import contextlib
 import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
 from rdkit import RDLogger
 
-from chemflow.utils import init_uniform_prior
+from chemflow.utils.utils import init_uniform_prior
 
 
 OmegaConf.register_new_resolver("oc.eval", eval)
@@ -28,22 +31,140 @@ torch.set_float32_matmul_precision("medium")
 RDLogger.DisableLog("rdApp.*")
 pl.seed_everything(42)
 
-# TARGET_N_ATOMS = [10, 18, 28]
-# GUIDANCE_SCALES = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 7.0]
-TARGET_N_ATOMS = [10]
-GUIDANCE_SCALES = [7.0, 9.0, 11.0, 15.0, 20.0]
+TARGET_N_ATOMS = [10, 18, 28]
+GUIDANCE_SCALES = [1.0, 5.0, 10.0]
+
+TARGET_MWS = [100.0, 110.0, 125.0]
+MW_GUIDANCE_SCALES = [0.5, 1.0, 5.0]
+
+PLOT_N_MOLS = 500
+PREDICT_BATCH_SIZE = 128
+
+
+# ---------------------------------------------------------------------------
+#  Helpers
+# ---------------------------------------------------------------------------
+
+
+def _infer_mol_n_atoms(mol) -> int | None:
+    """Infer atom count from either MoleculeData or batched molecule objects."""
+    if mol is None:
+        return None
+
+    num_nodes = getattr(mol, "num_nodes", None)
+    if num_nodes is not None:
+        try:
+            return int(num_nodes)
+        except Exception:
+            pass
+
+    atom_tokens = getattr(mol, "a", None)
+    if atom_tokens is not None:
+        try:
+            return int(atom_tokens.shape[0])
+        except Exception:
+            pass
+
+    batch = getattr(mol, "batch", None)
+    batch_size = getattr(mol, "batch_size", None)
+    if batch is not None and batch_size is not None:
+        batch_n_atoms = torch.bincount(batch, minlength=batch_size).to(dtype=torch.long)
+        if batch_n_atoms.numel() == 1:
+            return int(batch_n_atoms.item())
+
+    return None
+
+
+def _infer_mol_mw(mol, atom_tokens: list[str]) -> float | None:
+    """Infer molecular weight from a single molecule."""
+    if mol is None or atom_tokens is None:
+        return None
+    from chemflow.model.embedding import compute_molecular_weight
+
+    a = getattr(mol, "a", None)
+    if a is None:
+        return None
+    mw = compute_molecular_weight(a, atom_tokens)
+    return float(mw.item())
+
+
+def _collect_n_atoms_from_predict_output(pred) -> list[int]:
+    """Collect per-molecule atom counts from predict_step outputs."""
+    all_n_atoms: list[int] = []
+
+    if pred is None:
+        return all_n_atoms
+
+    if isinstance(pred, dict):
+        molecules = []
+        for key in ("valid_mols", "invalid_mols"):
+            values = pred.get(key, [])
+            if values:
+                molecules.extend(values)
+
+        for mol in molecules:
+            mol_final = mol[-1] if isinstance(mol, list) and len(mol) > 0 else mol
+            n_atoms = _infer_mol_n_atoms(mol_final)
+            if n_atoms is not None:
+                all_n_atoms.append(n_atoms)
+        return all_n_atoms
+
+    batch = getattr(pred, "batch", None)
+    batch_size = getattr(pred, "batch_size", None)
+    if batch is not None and batch_size is not None:
+        batch_n_atoms = torch.bincount(batch, minlength=batch_size).to(dtype=torch.long)
+        all_n_atoms.extend(batch_n_atoms.cpu().tolist())
+        return all_n_atoms
+
+    n_atoms = _infer_mol_n_atoms(pred)
+    if n_atoms is not None:
+        all_n_atoms.append(n_atoms)
+
+    return all_n_atoms
+
+
+def _collect_mw_from_predict_output(
+    pred,
+    atom_tokens: list[str],
+) -> list[float]:
+    """Collect per-molecule MW from predict_step outputs."""
+    all_mw: list[float] = []
+    if pred is None:
+        return all_mw
+
+    if isinstance(pred, dict):
+        molecules = []
+        for key in ("valid_mols", "invalid_mols"):
+            values = pred.get(key, [])
+            if values:
+                molecules.extend(values)
+
+        for mol in molecules:
+            mol_final = mol[-1] if isinstance(mol, list) and len(mol) > 0 else mol
+            mw = _infer_mol_mw(mol_final, atom_tokens)
+            if mw is not None:
+                all_mw.append(mw)
+        return all_mw
+
+    mw = _infer_mol_mw(pred, atom_tokens)
+    if mw is not None:
+        all_mw.append(mw)
+    return all_mw
+
+
+# ---------------------------------------------------------------------------
+#  Summarisation
+# ---------------------------------------------------------------------------
 
 
 def summarize_natoms_steering(predictions, target_n_atoms: int) -> dict:
     all_n_atoms: list[int] = []
 
     for pred in predictions:
-        if pred is None:
-            continue
-        batch_n_atoms = torch.bincount(pred.batch, minlength=pred.batch_size).to(
-            dtype=torch.long
-        )
-        all_n_atoms.extend(batch_n_atoms.cpu().tolist())
+        all_n_atoms.extend(_collect_n_atoms_from_predict_output(pred))
+
+    if len(all_n_atoms) > PLOT_N_MOLS:
+        all_n_atoms = all_n_atoms[:PLOT_N_MOLS]
 
     if not all_n_atoms:
         return {"target_n_atoms": target_n_atoms, "n_molecules": 0}
@@ -66,10 +187,351 @@ def summarize_natoms_steering(predictions, target_n_atoms: int) -> dict:
     }
 
 
+def summarize_mw_steering(
+    predictions,
+    target_mw: float,
+    atom_tokens: list[str],
+) -> dict:
+    all_mw: list[float] = []
+
+    for pred in predictions:
+        all_mw.extend(_collect_mw_from_predict_output(pred, atom_tokens))
+
+    if len(all_mw) > PLOT_N_MOLS:
+        all_mw = all_mw[:PLOT_N_MOLS]
+
+    if not all_mw:
+        return {"target_mw": target_mw, "n_molecules": 0}
+
+    vals = torch.tensor(all_mw, dtype=torch.float)
+    within_10 = ((vals - target_mw).abs() <= 10.0).float().mean().item()
+    within_25 = ((vals - target_mw).abs() <= 25.0).float().mean().item()
+
+    return {
+        "target_mw": target_mw,
+        "mean_mw": vals.mean().item(),
+        "std_mw": vals.std().item(),
+        "median_mw": vals.median().item(),
+        "within_10_rate": within_10,
+        "within_25_rate": within_25,
+        "n_molecules": len(all_mw),
+        "all_mw": [round(v, 2) for v in all_mw],
+    }
+
+
+# ---------------------------------------------------------------------------
+#  Plotting
+# ---------------------------------------------------------------------------
+
+
+def plot_natoms_distributions_grid(
+    all_results: dict[tuple[float, int], dict],
+    natoms_distributions: torch.Tensor,
+    output_path: str = "cfg_steering_distributions.png",
+):
+    """Save a grid of n_atoms histograms (rows=targets, cols=scales)."""
+    if not all_results:
+        print("No results to plot.")
+        return
+
+    guidance_scales = sorted({key[0] for key in all_results})
+    target_n_atoms = sorted({key[1] for key in all_results})
+
+    n_rows = len(target_n_atoms)
+    n_cols = len(guidance_scales)
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(3.2 * max(1, n_cols), 2.6 * max(1, n_rows)),
+        squeeze=False,
+    )
+
+    for row_idx, target in enumerate(target_n_atoms):
+        for col_idx, scale in enumerate(guidance_scales):
+            ax = axes[row_idx][col_idx]
+            result = all_results.get((scale, target), {})
+            values = result.get("all_n_atoms", [])
+
+            if values:
+                x_min = int(min(values))
+                x_max = int(max(values))
+                bins = list(range(x_min, x_max + 2))
+                ax.hist(
+                    values,
+                    bins=bins,
+                    align="left",
+                    rwidth=0.85,
+                    color="#4C72B0",
+                    alpha=0.85,
+                    edgecolor="black",
+                    linewidth=0.5,
+                )
+                ax.set_xlim(x_min - 0.5, x_max + 0.5)
+            else:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "no data",
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                    fontsize=9,
+                    color="gray",
+                )
+
+            ax.axvline(
+                target,
+                color="#D62728",
+                linestyle="--",
+                linewidth=1.3,
+                label="target",
+            )
+
+            if row_idx == 0:
+                ax.set_title(f"scale={scale}", fontsize=10)
+            if col_idx == 0:
+                ax.set_ylabel(
+                    f"target={target}\ncount",
+                    fontsize=9,
+                )
+            if row_idx == n_rows - 1:
+                ax.set_xlabel("generated n_atoms", fontsize=9)
+
+            ax.set_xlim(0, natoms_distributions.numel())
+            ax.tick_params(labelsize=8)
+
+    fig.suptitle(
+        "Generated n_atoms distributions",
+        fontsize=12,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(output_path, dpi=220)
+    plt.close(fig)
+    print(f"Distribution figure saved to {output_path}")
+
+
+def plot_mw_distributions_grid(
+    all_results: dict[tuple[float, float], dict],
+    output_path: str = "cfg_mw_steering_distributions.png",
+):
+    """Save a grid of MW histograms (rows=targets, cols=scales)."""
+    if not all_results:
+        print("No MW results to plot.")
+        return
+
+    guidance_scales = sorted({key[0] for key in all_results})
+    target_mws = sorted({key[1] for key in all_results})
+
+    n_rows = len(target_mws)
+    n_cols = len(guidance_scales)
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(3.2 * max(1, n_cols), 2.6 * max(1, n_rows)),
+        squeeze=False,
+    )
+
+    for row_idx, target in enumerate(target_mws):
+        for col_idx, scale in enumerate(guidance_scales):
+            ax = axes[row_idx][col_idx]
+            result = all_results.get((scale, target), {})
+            values = result.get("all_mw", [])
+
+            if values:
+                ax.hist(
+                    values,
+                    bins=30,
+                    color="#4C72B0",
+                    alpha=0.85,
+                    edgecolor="black",
+                    linewidth=0.5,
+                )
+            else:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "no data",
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                    fontsize=9,
+                    color="gray",
+                )
+
+            ax.axvline(
+                target,
+                color="#D62728",
+                linestyle="--",
+                linewidth=1.3,
+                label="target",
+            )
+
+            if row_idx == 0:
+                ax.set_title(f"scale={scale}", fontsize=10)
+            if col_idx == 0:
+                ax.set_ylabel(
+                    f"target={target:.0f}\ncount",
+                    fontsize=9,
+                )
+            if row_idx == n_rows - 1:
+                ax.set_xlabel("generated MW (Da)", fontsize=9)
+
+            ax.tick_params(labelsize=8)
+
+    fig.suptitle(
+        "Generated MW distributions",
+        fontsize=12,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(output_path, dpi=220)
+    plt.close(fig)
+    print(f"MW distribution figure saved to {output_path}")
+
+
+# ---------------------------------------------------------------------------
+#  Diagnostics
+# ---------------------------------------------------------------------------
+
+
+def _print_cfg_diagnostics(module, state_dict, test_dl, device):
+    """Print CFG diagnostic info for the loaded model."""
+    print("\n--- CFG Diagnostic ---")
+    print(f"  n_atoms_strategy: {module.n_atoms_strategy}")
+    print(f"  use_ema_for_eval: {module.use_ema_for_eval}")
+
+    adapter = module.cfg_adapter
+    has_natoms = adapter._has_natoms_cfg
+    has_mw = adapter._has_mw_cfg
+    has_props = adapter._has_property_conditioning
+    print(f"  _has_property_conditioning: {has_props}")
+    print(f"  _has_natoms_cfg:            {has_natoms}")
+    print(f"  _has_mw_cfg:                {has_mw}")
+    print(f"  natoms_cfg_guidance_scale:   {adapter.natoms_cfg_guidance_scale}")
+    print(f"  mw_cfg_guidance_scale:       {adapter.mw_cfg_guidance_scale}")
+
+    eval_model = module._get_model()
+    cfg_emb = getattr(
+        eval_model.embedding_backbone,
+        "cfg_embedding",
+        None,
+    )
+    if cfg_emb is not None:
+        n_params = sum(p.numel() for p in cfg_emb.parameters())
+        print(f"  cfg_embedding total params:  {n_params}")
+        """if hasattr(cfg_emb, "_natoms_null"):
+            print(
+                f"  _natoms_null norm:           "
+                f"{cfg_emb._natoms_null.norm().item():.4f}"
+            )"""
+        if hasattr(cfg_emb, "_mw_null"):
+            print(
+                f"  _mw_null norm:               {cfg_emb._mw_null.norm().item():.4f}"
+            )
+
+        ckpt_cfg_keys = [
+            k for k in state_dict if "model_ema" in k and "cfg_embedding" in k
+        ]
+        print(f"  checkpoint EMA cfg_embedding keys ({len(ckpt_cfg_keys)}):")
+        for k in ckpt_cfg_keys[:8]:
+            print(f"    {k}: {state_dict[k].shape}")
+    else:
+        print("  WARNING: cfg_embedding is None!")
+
+    if not has_natoms:
+        print("  Skipping forward-pass diagnostic (no natoms).")
+        print("--- End Diagnostic ---\n")
+        return
+
+    test_batch = next(iter(test_dl))
+    mol_t, mol_1 = test_batch
+    mol_t = mol_t.to(device)
+    mol_1 = mol_1.to(device)
+    eval_model = module._get_model()
+    eval_model.set_inference()
+
+    with torch.no_grad():
+        bs = mol_t.batch_size
+        t_diag = torch.zeros(bs, device=device)
+        preds_uncond = eval_model(
+            mol_t,
+            t_diag.view(-1, 1),
+            cfg_inputs={},
+        )
+        target_10 = torch.full(
+            (bs,),
+            10,
+            dtype=torch.long,
+            device=device,
+        )
+        preds_cond_10 = eval_model(
+            mol_t,
+            t_diag.view(-1, 1),
+            cfg_inputs={"target_n_atoms": target_10},
+        )
+        target_28 = torch.full(
+            (bs,),
+            28,
+            dtype=torch.long,
+            device=device,
+        )
+        preds_cond_28 = eval_model(
+            mol_t,
+            t_diag.view(-1, 1),
+            cfg_inputs={"target_n_atoms": target_28},
+        )
+
+    print("\n  Comparing uncond vs cond(10) vs cond(28):")
+    for key in [
+        "do_ins_head",
+        "do_del_head",
+        "ins_rate_head",
+        "atom_type_head",
+        "pos_head",
+    ]:
+        u = preds_uncond[key]
+        c10 = preds_cond_10[key]
+        c28 = preds_cond_28[key]
+        d10 = (c10 - u).abs().mean().item()
+        d28 = (c28 - u).abs().mean().item()
+        d_1028 = (c28 - c10).abs().mean().item()
+        print(
+            f"    {key:20s}  "
+            f"|u-c10|={d10:.6f}  "
+            f"|u-c28|={d28:.6f}  "
+            f"|c10-c28|={d_1028:.6f}"
+        )
+
+    adapter.natoms_cfg_guidance_scale = 5.0
+    print(
+        f"\n  should_use_natoms_cfg(t=10, s=5.0): "
+        f"{adapter.should_use_natoms_cfg(target_10)}"
+    )
+    adapter.natoms_cfg_guidance_scale = 0.0
+    print(
+        f"  should_use_natoms_cfg(t=10, s=0.0): "
+        f"{adapter.should_use_natoms_cfg(target_10)}"
+    )
+    print("--- End Diagnostic ---\n")
+
+
+# ---------------------------------------------------------------------------
+#  Main
+# ---------------------------------------------------------------------------
+
+
 def eval_cfg(cfg: DictConfig):
     OmegaConf.set_struct(cfg, False)
 
-    # ── data setup (mirrors run.py) ──────────────────────────────────
+    with contextlib.suppress(Exception):
+        cfg.data.datamodule.batch_size.test = PREDICT_BATCH_SIZE
+    n_predict_batches = math.ceil(PLOT_N_MOLS / PREDICT_BATCH_SIZE)
+
+    # Fix prior atom count to the median so every molecule starts
+    # at the same size — removes a confounding variable from the
+    # guidance evaluation.
+    cfg.data.n_atoms_strategy = "median"
+
+    # ── data setup (mirrors run.py) ──
     preprocessing = hydra.utils.instantiate(cfg.data.preprocessing)
     vocab = preprocessing.vocab
     distributions = preprocessing.distributions
@@ -87,7 +549,13 @@ def eval_cfg(cfg: DictConfig):
     )
     datamodule.setup()
 
-    # ── model setup ──────────────────────────────────────────────────
+    n_dist = distributions.n_atoms_distribution
+    median_n = int(
+        (torch.cumsum(n_dist, 0) >= 0.5).nonzero(as_tuple=True)[0][0].item()
+    )
+    print(f"Prior n_atoms fixed to median = {median_n}")
+
+    # ── model setup ──
     module = hydra.utils.instantiate(
         cfg.model.module,
         _recursive_=False,
@@ -95,12 +563,13 @@ def eval_cfg(cfg: DictConfig):
         loss_weight_distributions=loss_weight_distributions,
     )
 
-    ckpt_path = "/cluster/project/krause/frankem/chemflow/outputs/2026-03-01/23-38-13/logs/chemflow/qrk9nog4/checkpoints/epoch=1379-step=31240.ckpt"
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    ckpt_path = "/capstor/store/cscs/swissai/a131/frankem/chemflow/logs/wandb/mw_cfg/chemflow/fujlz0gr/checkpoints/epoch=449-step=8550.ckpt"
+    ckpt = torch.load(
+        ckpt_path,
+        map_location="cpu",
+        weights_only=False,
+    )
 
-    # Checkpoints saved from a torch.compile()-d model have keys prefixed
-    # with "_orig_mod." (e.g. "model._orig_mod.backbone...").  Strip this
-    # so the weights load into the uncompiled module.
     state_dict = ckpt["state_dict"]
     state_dict = {k.replace("._orig_mod", ""): v for k, v in state_dict.items()}
     module.load_state_dict(state_dict)
@@ -109,143 +578,141 @@ def eval_cfg(cfg: DictConfig):
     test_dl = (
         test_dataloaders[0] if isinstance(test_dataloaders, list) else test_dataloaders
     )
+    trainer_kwargs = dict(cfg.trainer.trainer)
+    trainer_kwargs.setdefault(
+        "limit_predict_batches",
+        n_predict_batches,
+    )
     trainer = pl.Trainer(
         logger=False,
         callbacks=[],
         enable_checkpointing=False,
-        **cfg.trainer.trainer,
+        **trainer_kwargs,
     )
 
-    # ── diagnostic: verify CFG is actually modifying predictions ─────
+    # ── diagnostics ──
     module.eval()
     device = next(module.parameters()).device
-    print("\n--- CFG Diagnostic ---")
-    print(f"  n_atoms_strategy: {module.n_atoms_strategy}")
-    print(f"  use_ema_for_eval: {module.use_ema_for_eval}")
-    has_natoms = module.cfg_adapter._has_natoms_cfg
-    print(f"  _has_natoms_cfg:  {has_natoms}")
-    print(
-        f"  cfg_adapter.model is module.model: "
-        f"{module.cfg_adapter.model is module.model}"
-    )
-    print(
-        f"  cfg_adapter.natoms_cfg_guidance_scale: "
-        f"{module.cfg_adapter.natoms_cfg_guidance_scale}"
-    )
+    _print_cfg_diagnostics(module, state_dict, test_dl, device)
 
-    eval_model = module._get_model()
-    natoms_emb = eval_model.embedding_backbone.natoms_cfg_embedding
-    if natoms_emb is not None:
-        n_params = sum(p.numel() for p in natoms_emb.parameters())
-        null_norm = natoms_emb.null_embedding.norm().item()
-        print(
-            f"  natoms_cfg_embedding params: {n_params}  null_emb norm: {null_norm:.4f}"
+    adapter = module.cfg_adapter
+    atom_tokens = list(vocab.atom_tokens)
+    module.predict_return_traj = True
+
+    # ── sweep n_atoms guidance ──
+    if adapter._has_natoms_cfg:
+        all_natoms_results: dict[tuple[float, int], dict] = {}
+        original_mw_scale = adapter.mw_cfg_guidance_scale
+        adapter.mw_cfg_guidance_scale = 0.0
+
+        for scale in GUIDANCE_SCALES:
+            adapter.natoms_cfg_guidance_scale = scale
+            print(f"\n{'=' * 60}")
+            print(f"n_atoms guidance scale = {scale}")
+            print(f"{'=' * 60}")
+
+            for n_atoms in TARGET_N_ATOMS:
+                pl.seed_everything(42)
+                print(
+                    f"  target_n_atoms={n_atoms} ... ",
+                    end="",
+                    flush=True,
+                )
+                module.predict_target_n_atoms_override = n_atoms
+                module.predict_target_mw_override = None
+                predictions = trainer.predict(
+                    module,
+                    dataloaders=test_dl,
+                )
+                result = summarize_natoms_steering(
+                    predictions,
+                    target_n_atoms=n_atoms,
+                )
+                result["guidance_scale"] = scale
+                all_natoms_results[(scale, n_atoms)] = result
+
+                if result["n_molecules"] == 0:
+                    print("no molecules (n=0)")
+                else:
+                    print(
+                        f"mean={result['mean_n_atoms']:.2f}  "
+                        f"std={result['std_n_atoms']:.2f}  "
+                        f"exact={result['exact_match_rate']:.1%}  "
+                        f"±1={result['within_1_rate']:.1%}  "
+                        f"±2={result['within_2_rate']:.1%}  "
+                        f"(n={result['n_molecules']})"
+                    )
+
+        adapter.mw_cfg_guidance_scale = original_mw_scale
+        torch.save(
+            all_natoms_results,
+            "cfg_natoms_steering_results.pt",
         )
-
-        ckpt_ema_natoms = [
-            k for k in state_dict if "model_ema" in k and "natoms_cfg" in k
-        ]
-        print(f"  checkpoint EMA natoms keys ({len(ckpt_ema_natoms)}):")
-        for k in ckpt_ema_natoms[:5]:
-            print(f"    {k}: {state_dict[k].shape}")
+        print("\nResults saved to cfg_natoms_steering_results.pt")
+        plot_natoms_distributions_grid(
+            all_natoms_results,
+            natoms_distributions=distributions.n_atoms_distribution,
+            output_path="cfg_natoms_steering_distributions.png",
+        )
     else:
-        print("  WARNING: natoms_cfg_embedding is None!")
+        print("Skipping n_atoms sweep (natoms_encoder disabled)")
 
-    test_batch = next(iter(test_dl))
-    mol_t, mol_1 = test_batch
-    mol_t = mol_t.to(device)
-    mol_1 = mol_1.to(device)
-    eval_model = module._get_model()
-    eval_model.set_inference()
+    # ── sweep MW guidance ──
+    if adapter._has_mw_cfg:
+        all_mw_results: dict[tuple[float, float], dict] = {}
+        original_natoms_scale = adapter.natoms_cfg_guidance_scale
+        adapter.natoms_cfg_guidance_scale = 0.0
 
-    with torch.no_grad():
-        t_diag = torch.zeros(mol_t.batch_size, device=device)
-        preds_uncond = eval_model(
-            mol_t,
-            t_diag.view(-1, 1),
-            properties=None,
-            target_n_atoms=None,
+        for scale in MW_GUIDANCE_SCALES:
+            adapter.mw_cfg_guidance_scale = scale
+            print(f"\n{'=' * 60}")
+            print(f"MW guidance scale = {scale}")
+            print(f"{'=' * 60}")
+
+            for mw in TARGET_MWS:
+                pl.seed_everything(42)
+                print(
+                    f"  target_mw={mw:.0f} Da ... ",
+                    end="",
+                    flush=True,
+                )
+                module.predict_target_n_atoms_override = None
+                module.predict_target_mw_override = mw
+                predictions = trainer.predict(
+                    module,
+                    dataloaders=test_dl,
+                )
+                result = summarize_mw_steering(
+                    predictions,
+                    target_mw=mw,
+                    atom_tokens=atom_tokens,
+                )
+                result["guidance_scale"] = scale
+                all_mw_results[(scale, mw)] = result
+
+                if result["n_molecules"] == 0:
+                    print("no molecules (n=0)")
+                else:
+                    print(
+                        f"mean={result['mean_mw']:.1f}  "
+                        f"std={result['std_mw']:.1f}  "
+                        f"±10={result['within_10_rate']:.1%}  "
+                        f"±25={result['within_25_rate']:.1%}  "
+                        f"(n={result['n_molecules']})"
+                    )
+
+        adapter.natoms_cfg_guidance_scale = original_natoms_scale
+        torch.save(
+            all_mw_results,
+            "cfg_mw_steering_results.pt",
         )
-        target_10 = torch.full((mol_t.batch_size,), 10, dtype=torch.long, device=device)
-        preds_cond_10 = eval_model(
-            mol_t,
-            t_diag.view(-1, 1),
-            properties=None,
-            target_n_atoms=target_10,
+        print("\nResults saved to cfg_mw_steering_results.pt")
+        plot_mw_distributions_grid(
+            all_mw_results,
+            output_path="cfg_mw_steering_distributions.png",
         )
-        target_28 = torch.full((mol_t.batch_size,), 28, dtype=torch.long, device=device)
-        preds_cond_28 = eval_model(
-            mol_t,
-            t_diag.view(-1, 1),
-            properties=None,
-            target_n_atoms=target_28,
-        )
-
-    print(f"\n  Comparing uncond vs cond(10) vs cond(28) predictions:")
-    for key in [
-        "do_ins_head",
-        "do_del_head",
-        "ins_rate_head",
-        "atom_type_head",
-        "pos_head",
-    ]:
-        u = preds_uncond[key]
-        c10 = preds_cond_10[key]
-        c28 = preds_cond_28[key]
-        diff_10 = (c10 - u).abs().mean().item()
-        diff_28 = (c28 - u).abs().mean().item()
-        diff_10_28 = (c28 - c10).abs().mean().item()
-        print(
-            f"    {key:20s}  |uncond-cond10|={diff_10:.6f}  "
-            f"|uncond-cond28|={diff_28:.6f}  "
-            f"|cond10-cond28|={diff_10_28:.6f}"
-        )
-
-    module.cfg_adapter.natoms_cfg_guidance_scale = 5.0
-    print(
-        f"\n  should_use_natoms_cfg(target_10) with scale=5.0: "
-        f"{module.cfg_adapter.should_use_natoms_cfg(target_10)}"
-    )
-    module.cfg_adapter.natoms_cfg_guidance_scale = 0.0
-    print(
-        f"  should_use_natoms_cfg(target_10) with scale=0.0: "
-        f"{module.cfg_adapter.should_use_natoms_cfg(target_10)}"
-    )
-    print("--- End Diagnostic ---\n")
-
-    # ── sweep over guidance scales x target n_atoms ──────────────────
-    all_results: dict[tuple[float, int], dict] = {}
-    module.predict_return_traj = False
-
-    for scale in GUIDANCE_SCALES:
-        module.cfg_adapter.natoms_cfg_guidance_scale = scale
-        print(f"\n{'=' * 60}")
-        print(f"Guidance scale = {scale}")
-        print(f"{'=' * 60}")
-
-        for n_atoms in TARGET_N_ATOMS:
-            pl.seed_everything(42)
-            print(f"  target_n_atoms={n_atoms} ... ", end="", flush=True)
-            module.predict_target_n_atoms_override = n_atoms
-            predictions = trainer.predict(
-                module,
-                dataloaders=test_dl,
-            )
-            result = summarize_natoms_steering(predictions, target_n_atoms=n_atoms)
-            result["guidance_scale"] = scale
-            all_results[(scale, n_atoms)] = result
-
-            print(
-                f"mean={result['mean_n_atoms']:.2f}  "
-                f"std={result['std_n_atoms']:.2f}  "
-                f"exact={result['exact_match_rate']:.1%}  "
-                f"±1={result['within_1_rate']:.1%}  "
-                f"±2={result['within_2_rate']:.1%}  "
-                f"(n={result['n_molecules']})"
-            )
-
-    torch.save(all_results, "cfg_steering_results.pt")
-    print(f"\nResults saved to cfg_steering_results.pt")
+    else:
+        print("Skipping MW sweep (mw_encoder disabled)")
 
 
 @hydra.main(

@@ -310,14 +310,13 @@ class DiTEmbedding(nn.Module):
     """Embedding module for DiT.
 
     Produces atom embeddings, edge embeddings, and a *graph-level*
-    conditioning vector (time + node count + optional properties +
-    optional target n_atoms for CFG).
+    conditioning vector (time + node count + optional CFG signals).
 
     Unlike ``EmbeddingBackbone`` in model.py which concatenates all
     conditioning into the node features, this module returns conditioning
     as a separate tensor so DiTBackbone can feed it through adaLN.
 
-    Exposes ``property_embedding`` and ``natoms_cfg_embedding`` for
+    Exposes ``cfg_embedding`` (a :class:`UnifiedCFGEmbedding`) for
     classifier-free guidance compatibility with the lightning module.
     """
 
@@ -327,9 +326,8 @@ class DiTEmbedding(nn.Module):
         edge_type_embedding_args: DictConfig,
         time_embedding_args: DictConfig,
         node_count_embedding_args: DictConfig,
-        property_embedding_args: DictConfig | None = None,
         bond_degree_embedding_args: DictConfig | None = None,
-        natoms_cfg_embedding_args: DictConfig | None = None,
+        cfg_embedding_args: DictConfig | None = None,
     ):
         super().__init__()
         self.atom_type_embedding = hydra.utils.instantiate(atom_type_embedding_args)
@@ -337,21 +335,15 @@ class DiTEmbedding(nn.Module):
         self.time_embedding = hydra.utils.instantiate(time_embedding_args)
         self.node_count_embedding = hydra.utils.instantiate(node_count_embedding_args)
 
-        self.property_embedding = None
-        if property_embedding_args is not None:
-            self.property_embedding = hydra.utils.instantiate(property_embedding_args)
-
         self.bond_degree_embedding = None
         if bond_degree_embedding_args is not None:
             self.bond_degree_embedding = hydra.utils.instantiate(
                 bond_degree_embedding_args
             )
 
-        self.natoms_cfg_embedding = None
-        if natoms_cfg_embedding_args is not None:
-            self.natoms_cfg_embedding = hydra.utils.instantiate(
-                natoms_cfg_embedding_args
-            )
+        self.cfg_embedding = None
+        if cfg_embedding_args is not None:
+            self.cfg_embedding = hydra.utils.instantiate(cfg_embedding_args)
 
     def forward(
         self,
@@ -360,10 +352,7 @@ class DiTEmbedding(nn.Module):
         edge_index: torch.Tensor,
         t: torch.Tensor,
         batch: torch.Tensor,
-        properties: torch.Tensor | None = None,
-        property_drop_mask: torch.Tensor | None = None,
-        target_n_atoms: torch.Tensor | None = None,
-        natoms_drop_mask: torch.Tensor | None = None,
+        cfg_inputs: dict | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -386,17 +375,12 @@ class DiTEmbedding(nn.Module):
 
         cond_parts = [t_embed, n_embed]
 
-        if self.property_embedding is not None:
-            prop_embed = self.property_embedding(
-                properties, property_drop_mask, batch_size=num_graphs
+        if self.cfg_embedding is not None:
+            cfg_embed = self.cfg_embedding(
+                cfg_inputs if cfg_inputs is not None else {},
+                batch_size=num_graphs,
             )
-            cond_parts.append(prop_embed)
-
-        if self.natoms_cfg_embedding is not None:
-            natoms_embed = self.natoms_cfg_embedding(
-                target_n_atoms, natoms_drop_mask, batch_size=num_graphs
-            )
-            cond_parts.append(natoms_embed)
+            cond_parts.append(cfg_embed)
 
         cond = torch.cat(cond_parts, dim=-1)
 
@@ -425,9 +409,8 @@ class DiTBackboneWithHeads(nn.Module):
         heads_args: DictConfig,
         ins_gmm_head_args: DictConfig,
         ins_edge_head_args: DictConfig,
-        property_embedding_args: DictConfig | None = None,
         bond_degree_embedding_args: DictConfig | None = None,
-        natoms_cfg_embedding_args: DictConfig | None = None,
+        cfg_embedding_args: DictConfig | None = None,
     ):
         super().__init__()
 
@@ -436,9 +419,8 @@ class DiTBackboneWithHeads(nn.Module):
             edge_type_embedding_args=edge_type_embedding_args,
             time_embedding_args=time_embedding_args,
             node_count_embedding_args=node_count_embedding_args,
-            property_embedding_args=property_embedding_args,
             bond_degree_embedding_args=bond_degree_embedding_args,
-            natoms_cfg_embedding_args=natoms_cfg_embedding_args,
+            cfg_embedding_args=cfg_embedding_args,
         )
 
         self.backbone = hydra.utils.instantiate(backbone_model_args)
@@ -508,24 +490,14 @@ class DiTBackboneWithHeads(nn.Module):
         t: torch.Tensor,
         prev_outs=None,
         is_random_self_conditioning: bool = False,
-        properties: torch.Tensor | None = None,
-        property_drop_mask: torch.Tensor | None = None,
-        target_n_atoms: torch.Tensor | None = None,
-        natoms_drop_mask: torch.Tensor | None = None,
+        cfg_inputs: dict | None = None,
     ) -> dict[str, Any]:
         """Forward pass through Embedding -> DiT Backbone -> Heads."""
         x, a, _c, e, edge_index, batch = mols_t.unpack()
 
         a_embed, e_embed, cond = self.embedding_backbone(
-            a,
-            e,
-            edge_index,
-            t,
-            batch,
-            properties=properties,
-            property_drop_mask=property_drop_mask,
-            target_n_atoms=target_n_atoms,
-            natoms_drop_mask=natoms_drop_mask,
+            a, e, edge_index, t, batch,
+            cfg_inputs=cfg_inputs,
         )
 
         edge_index_tuple = (edge_index[0], edge_index[1])

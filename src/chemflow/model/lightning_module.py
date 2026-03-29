@@ -66,7 +66,6 @@ class LightningModuleRates(pl.LightningModule):
         "ins": ["do_ins", "ins_rate", "ins_gmm", "ins_e", "ins_e_ii"],
         "x": ["x"],
         "c": ["c"],
-        "budget": ["global_ins_budget", "global_del_budget"],
     }
 
     def __init__(
@@ -97,6 +96,9 @@ class LightningModuleRates(pl.LightningModule):
         # Classifier-free guidance parameters (target n_atoms conditioning)
         natoms_cfg_dropout_prob: float = 0.15,
         natoms_cfg_guidance_scale: float = 2.5,
+        # Classifier-free guidance parameters (target molecular weight conditioning)
+        mw_cfg_dropout_prob: float = 0.15,
+        mw_cfg_guidance_scale: float = 0.0,
         use_time_weights: bool = False,
     ):
         super().__init__()
@@ -149,8 +151,6 @@ class LightningModuleRates(pl.LightningModule):
                     "ins_e_ii": 1.0,
                     "x": 1.0,
                     "c": 1.0,
-                    "global_ins_budget": 1.0,
-                    "global_del_budget": 1.0,
                 }
             )
 
@@ -242,6 +242,13 @@ class LightningModuleRates(pl.LightningModule):
             cfg_guidance_scale=cfg_guidance_scale,
             natoms_cfg_dropout_prob=natoms_cfg_dropout_prob,
             natoms_cfg_guidance_scale=natoms_cfg_guidance_scale,
+            mw_cfg_dropout_prob=mw_cfg_dropout_prob,
+            mw_cfg_guidance_scale=mw_cfg_guidance_scale,
+            atom_tokens=(
+                list(self.vocab.atom_tokens)
+                if self.vocab and self.vocab.atom_tokens
+                else None
+            ),
         )
 
         # Exponential moving average of model parameters for stable inference
@@ -265,9 +272,6 @@ class LightningModuleRates(pl.LightningModule):
                 "ins": lambda t: self.integrator.ins_schedule.rate(t).clamp(max=100.0),
                 "del": lambda t: self.integrator.del_schedule.rate(t).clamp(max=100.0),
                 "sub": lambda t: self.integrator.sub_schedule.rate(t).clamp(max=100.0),
-                "budget": lambda t: self.integrator.ins_schedule.rate(t).clamp(
-                    max=100.0
-                ),
             }
         else:
             time_weights = {}
@@ -331,8 +335,8 @@ class LightningModuleRates(pl.LightningModule):
         "l_do_sub_a", "l_sub_a_class", "l_do_sub_e", "l_sub_e_class",
         # deletion and insertion losses
         "l_do_del", "l_do_ins", "l_ins_rate", "l_ins_gmm", "l_ins_e", "l_ins_e_ii",
-        # move, charge and budget losses
-        "l_x", "l_c", "l_global_ins_budget", "l_global_del_budget",
+        # move, charge losses
+        "l_x", "l_c",
         # EMA counts for balancing BCE pos_weight in do_action_loss.
         "ema_n_ins", "ema_n_del",
     })
@@ -534,34 +538,6 @@ class LightningModuleRates(pl.LightningModule):
 
         return self._reduce_loss(class_loss, reduction), batch_has_modified
 
-    def global_budget_loss(
-        self, graph_rate_pred, target_budget, reduction: str = "mean"
-    ):
-        """
-        Calculate global budget loss from graph-level expected action counts.
-
-        Uses Poisson NLL between predicted expected counts (sum of node-wise rates)
-        and the target number of remaining actions per graph.
-
-        Args:
-            graph_rate_pred: Shape (num_graphs,) expected count per graph.
-            target_budget: Shape (num_graphs,) target count per graph.
-
-        Returns:
-            loss: Scalar Poisson NLL loss averaged over graphs.
-        """
-        eps = 1e-8
-        graph_rate_pred = graph_rate_pred.float().clamp(min=eps)
-        target_budget = target_budget.float()
-        loss = F.poisson_nll_loss(
-            graph_rate_pred,
-            target_budget,
-            log_input=False,
-            reduction=reduction,
-            full=True,
-        )
-        return loss
-
     def shared_step(self, batch, batch_idx):
         self.model.set_training()
         # Define the training step logic here
@@ -583,10 +559,7 @@ class LightningModuleRates(pl.LightningModule):
             mols_t,
             t.view(-1, 1),
             is_random_self_conditioning=is_random_self_conditioning,
-            properties=cfg_inputs["properties"],
-            property_drop_mask=cfg_inputs["cfg_drop_mask"],
-            target_n_atoms=cfg_inputs["target_n_atoms"],
-            natoms_drop_mask=cfg_inputs["natoms_drop_mask"],
+            cfg_inputs=cfg_inputs,
         )
 
         a_pred = preds["atom_type_head"]
@@ -901,50 +874,6 @@ class LightningModuleRates(pl.LightningModule):
         if not x_batch_mask.any():
             x_loss = 0.0 * sum(p.sum() for p in self.model.pos_head.parameters())
 
-        # 4.5 Compute global budget losses from node-wise rates.
-        # Target: n_ins_missing and n_del_missing computed during interpolation.
-        global_ins_budget_loss = torch.tensor(0.0, device=self.device)
-        global_del_budget_loss = torch.tensor(0.0, device=self.device)
-
-        if self.n_atoms_strategy != "fixed":
-            ins_budget_target = mols_t.n_ins_missing
-            del_budget_target = mols_t.n_del_missing
-
-            # Insertion node-wise rates: directly use the predicted rates.
-            ins_rate_node = ins_rate_pred.view(-1, 1)
-            p_ins = torch.sigmoid(do_ins_head.view(-1, 1))
-            ins_node_expected = ins_rate_node * p_ins
-
-            ins_graph_expected = unsorted_segment_sum(
-                ins_node_expected,
-                mols_t.batch,
-                mols_t.num_graphs,
-            ).view(-1)
-
-            # Deletion node-wise rate: one deletion max per node -> Bernoulli expectation.
-            del_node_expected = torch.sigmoid(do_del_head.view(-1))
-            del_graph_expected = unsorted_segment_sum(
-                del_node_expected.view(-1, 1),
-                mols_t.batch,
-                mols_t.num_graphs,
-            ).view(-1)
-
-            global_ins_budget_loss = self.global_budget_loss(
-                ins_graph_expected,
-                ins_budget_target,
-                reduction="none",
-            )
-            global_del_budget_loss = self.global_budget_loss(
-                del_graph_expected,
-                del_budget_target,
-                reduction="none",
-            )
-
-        else:
-            # Keep graph connectivity when the global budget terms are disabled.
-            global_ins_budget_loss = 0.0 * (do_ins_head.sum() + ins_rate_pred.sum())
-            global_del_budget_loss = 0.0 * do_del_head.sum()
-
         loss_masks = {
             "x": x_batch_mask,
             "c": c_batch_mask,
@@ -971,8 +900,6 @@ class LightningModuleRates(pl.LightningModule):
                 "ins_e_ii": ins_loss_e_ii,
                 "x": x_loss,
                 "c": c_loss,
-                "global_ins_budget": global_ins_budget_loss,
-                "global_del_budget": global_del_budget_loss,
             },
             t=t,
             masks=loss_masks,
@@ -992,16 +919,6 @@ class LightningModuleRates(pl.LightningModule):
                 "ema_do_sub_e_neg": self.ema_do_sub_e_neg,
             }
         )
-
-        if self.n_atoms_strategy != "fixed":
-            self.loss_accumulator.add_stats(
-                {
-                    "ins_budget_pred_mean": ins_graph_expected.mean(),
-                    "del_budget_pred_mean": del_graph_expected.mean(),
-                    "ins_budget_target_mean": ins_budget_target.float().mean(),
-                    "del_budget_target_mean": del_budget_target.float().mean(),
-                }
-            )
 
         loss = self.safe_loss(self.loss_accumulator.total_loss())
         self.log_dict(self.loss_accumulator.log_dict(), prog_bar=False, logger=True)
@@ -1078,11 +995,13 @@ class LightningModuleRates(pl.LightningModule):
     def predict_step(self, batch, batch_idx):
         return_traj = bool(getattr(self, "predict_return_traj", True))
         target_override = getattr(self, "predict_target_n_atoms_override", None)
+        target_mw_override = getattr(self, "predict_target_mw_override", None)
         gen_mols = self.sample(
             batch,
             batch_idx,
             return_traj=return_traj,
             target_n_atoms_override=target_override,
+            target_mw_override=target_mw_override,
         )
 
         # do quick validity check of the generated molecules
@@ -1117,12 +1036,60 @@ class LightningModuleRates(pl.LightningModule):
             "invalid_mols_rdkit": invalid_mols_rdkit,
         }
 
+    def _build_inference_cfg_inputs(
+        self, mol_t, mol_1, batch_size,
+        target_n_atoms_override=None,
+        target_mw_override=None,
+    ) -> dict:
+        """Build the cfg_inputs dict for inference."""
+        properties = self.cfg_adapter.extract_properties(mol_t)
+
+        if target_n_atoms_override is not None:
+            if isinstance(target_n_atoms_override, int):
+                target_n_atoms = torch.full(
+                    (batch_size,),
+                    target_n_atoms_override,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+            else:
+                target_n_atoms = target_n_atoms_override.to(
+                    self.device,
+                )
+        else:
+            target_n_atoms = self.cfg_adapter.extract_target_n_atoms(
+                mol_1,
+            )
+
+        if target_mw_override is not None:
+            if isinstance(target_mw_override, (int, float)):
+                target_mw = torch.full(
+                    (batch_size,),
+                    float(target_mw_override),
+                    dtype=torch.float,
+                    device=self.device,
+                )
+            else:
+                target_mw = target_mw_override.to(self.device)
+        else:
+            target_mw = self.cfg_adapter.extract_target_mw(mol_1)
+
+        return {
+            "properties": properties,
+            "property_drop_mask": None,
+            "target_n_atoms": target_n_atoms,
+            "natoms_drop_mask": None,
+            "target_mw": target_mw,
+            "mw_drop_mask": None,
+        }
+
     def sample(
         self,
         batch,
         batch_idx,
         return_traj: bool = False,
         target_n_atoms_override: torch.Tensor | int | None = None,
+        target_mw_override: torch.Tensor | float | None = None,
     ):
         """
         Inference step for flow matching.
@@ -1133,6 +1100,8 @@ class LightningModuleRates(pl.LightningModule):
             return_traj: If True, return trajectory for each molecule. If False, return final state only.
             target_n_atoms_override: If provided, overrides the target n_atoms extracted from data.
                 Shape (batch_size,) with integer atom counts.
+            target_mw_override: If provided, overrides the target molecular weight.
+                Shape (batch_size,) with MW in Daltons, or a scalar float.
 
         Returns:
             If return_traj is False: MoleculeBatch - final sampled molecules
@@ -1163,19 +1132,10 @@ class LightningModuleRates(pl.LightningModule):
         # previous outputs for self-conditioning. none at the beginning
         preds = None
 
-        properties = self.cfg_adapter.extract_properties(mol_t)
-        if target_n_atoms_override is not None:
-            if isinstance(target_n_atoms_override, int):
-                target_n_atoms = torch.full(
-                    (batch_size,),
-                    target_n_atoms_override,
-                    dtype=torch.long,
-                    device=self.device,
-                )
-            else:
-                target_n_atoms = target_n_atoms_override.to(self.device)
-        else:
-            target_n_atoms = self.cfg_adapter.extract_target_n_atoms(mol_1)
+        cfg_inputs = self._build_inference_cfg_inputs(
+            mol_t, mol_1, batch_size,
+            target_n_atoms_override, target_mw_override,
+        )
 
         # Integration loop: integrate from t=0 to t=1
         for step_size in step_sizes:
@@ -1184,12 +1144,7 @@ class LightningModuleRates(pl.LightningModule):
             prev_preds = preds
 
             preds = self.cfg_adapter.guided_predict(
-                model,
-                mol_t,
-                t,
-                prev_preds,
-                properties,
-                target_n_atoms,
+                model, mol_t, t, prev_preds, cfg_inputs,
             )
 
             # Extract predictions
@@ -1261,7 +1216,7 @@ class LightningModuleRates(pl.LightningModule):
             ins_edge_head = getattr(model, "ins_edge_head", None)
 
             # Integrate one step (edge prediction happens inside if head is provided)
-            # Note: do_ins is computed inside integrate_step_gnn from num_ins_pred or global_ins_budget
+            # Note: do_ins is computed inside integrate_step_gnn from num_ins_pred
             mol_t = self.integrator.integrate_step_gnn(
                 mol_t=mol_t.clone(),
                 mol_1_pred=mol_1_pred.clone(),
