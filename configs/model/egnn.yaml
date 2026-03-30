@@ -45,10 +45,6 @@ module:
   # tokens and atom_type_distribution will be passed from preprocessing in run.py
   gmm_params: ${model.gmm_params}
   n_atoms_strategy: ${data.n_atoms_strategy}
-  type_loss_token_weights: training
-  cat_weighting:
-    _target_: DictConfig
-    weight_alpha: 0.4
   ins_noise_scale: ${data.ins_noise_scale}
   edit_loss_ema_decay: 0.99
   edit_loss_ema_eps: 1.0e-8
@@ -57,13 +53,14 @@ module:
   use_time_weights: false
   time_dist: ${if:${eq:${model.sample_time_strategy}, log}, ${model.beta_sched}, ${model.linear_sched}}
 
-  # Classifier-free guidance
-  cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.property_dropout_prob}, 0.0}
-  cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.property_guidance_scale}, 0.0}
-  natoms_cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.natoms_dropout_prob}, 0.0}
-  natoms_cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.natoms_guidance_scale}, 0.0}
-  mw_cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.mw_dropout_prob}, 0.0}
-  mw_cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.mw_guidance_scale}, 0.0}
+  cfg_adapter:
+    _target_: chemflow.model.cfg.CFGAdapter
+    cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.property_dropout_prob}, 0.0}
+    cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.property_guidance_scale}, 0.0}
+    natoms_cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.natoms_dropout_prob}, 0.0}
+    natoms_cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.natoms_guidance_scale}, 0.0}
+    mw_cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.mw_dropout_prob}, 0.0}
+    mw_cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.mw_guidance_scale}, 0.0}
 
   integrator: ${model.integrator}
 
@@ -156,6 +153,10 @@ node_count_embedding:
   _target_: chemflow.model.embedding.CountEmbedding
   embedding_dim: 64
   out_dim: 128
+
+token_weighting:
+  type_loss_token_weights: training
+  weight_alpha: 0.4
 
 # ── Unified classifier-free guidance ──
 do_cfg: true

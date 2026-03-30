@@ -46,13 +46,7 @@ module:
   # tokens and atom_type_distribution will be passed from preprocessing in run.py
   gmm_params: ${model.gmm_params}
   n_atoms_strategy: ${data.n_atoms_strategy}
-  type_loss_token_weights: uniform
-  cat_weighting:
-    _target_: DictConfig
-    weight_alpha: 1.0
   ins_noise_scale: ${data.ins_noise_scale}
-  edit_loss_ema_decay: 0.95
-  edit_loss_ema_eps: 1.0e-8
   ema_decay: 0.999
   ema_decay_scheduler:
     _target_: chemflow.utils.lr_schedulers.EMADecayScheduler
@@ -66,13 +60,14 @@ module:
   use_time_weights: false
   time_dist: ${if:${eq:${model.sample_time_strategy}, log}, ${model.beta_sched}, ${model.linear_sched}}
 
-  # Classifier-free guidance
-  cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.property_dropout_prob}, 0.0}
-  cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.property_guidance_scale}, 0.0}
-  natoms_cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.natoms_dropout_prob}, 0.0}
-  natoms_cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.natoms_guidance_scale}, 0.0}
-  mw_cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.mw_dropout_prob}, 0.0}
-  mw_cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.mw_guidance_scale}, 0.0}
+  cfg_adapter:
+    _target_: chemflow.model.cfg.CFGAdapter
+    cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.property_dropout_prob}, 0.0}
+    cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.property_guidance_scale}, 0.0}
+    natoms_cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.natoms_dropout_prob}, 0.0}
+    natoms_cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.natoms_guidance_scale}, 0.0}
+    mw_cfg_dropout_prob: ${if:${model.do_cfg}, ${model.cfg.mw_dropout_prob}, 0.0}
+    mw_cfg_guidance_scale: ${if:${model.do_cfg}, ${model.cfg.mw_guidance_scale}, 0.0}
 
   integrator: ${model.integrator}
 
@@ -87,7 +82,6 @@ module:
     l_do_sub_e: 1.0
     l_sub_e_class: 1.0
     l_do_del: 1.0
-    l_do_ins: 1.0
     l_ins_rate: 1.0
     l_ins_gmm: 1.0
     l_ins_e: 1.0
@@ -172,6 +166,10 @@ node_count_embedding:
   embedding_dim: 64
   out_dim: 128
 
+token_weighting:
+  type_loss_token_weights: uniform
+  weight_alpha: 1.0
+
 # ── Unified classifier-free guidance ──
 do_cfg: false
 
@@ -250,11 +248,6 @@ heads:
         hidden_dim: 128
 
       ins_rate_head:
-        input_dim: ${model.backbone.d_model}
-        output_dim: 1
-        hidden_dim: 128
-
-      do_ins_head:
         input_dim: ${model.backbone.d_model}
         output_dim: 1
         hidden_dim: 128

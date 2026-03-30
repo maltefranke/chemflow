@@ -11,6 +11,7 @@ from rdkit import RDLogger
 from pytorch_lightning.strategies import DDPStrategy
 
 from chemflow.utils.utils import build_callbacks, init_uniform_prior
+from chemflow.dataset.vocab import setup_token_weights
 from chemflow.model.lightning_module import LightningModuleRates
 from rdkit import Chem
 
@@ -67,6 +68,15 @@ def run(cfg: DictConfig):
     # Call setup to create datasets with tokens and distributions
     datamodule.setup()
 
+    # Compute token weights for loss weighting (using training-frequency distributions)
+    tw = cfg.model.token_weighting
+    atom_type_weights, edge_token_weights, charge_token_weights = setup_token_weights(
+        vocab=vocab,
+        distributions=loss_weight_distributions,
+        weight_alpha=tw.weight_alpha,
+        type_loss_token_weights=tw.type_loss_token_weights,
+    )
+
     # Instantiate module
     hydra.utils.log.info(f"Instantiating <{cfg.model.module._target_}>")
     module: pl.LightningModule = hydra.utils.instantiate(
@@ -74,6 +84,9 @@ def run(cfg: DictConfig):
         _recursive_=False,
         distributions=token_prior_distribution,
         loss_weight_distributions=loss_weight_distributions,
+        atom_type_weights=atom_type_weights,
+        edge_token_weights=edge_token_weights,
+        charge_token_weights=charge_token_weights,
     )
 
     # module.compile()
@@ -93,11 +106,7 @@ def run(cfg: DictConfig):
     )
 
     ckpt_path = None
-    # ckpt_path = (
-    #     "/cluster/project/krause/frankem/chemflow/outputs/epoch=1999-step=32000.ckpt"
-    # )
-
-    # module = module.__class__.load_from_checkpoint(ckpt_path)
+    # ckpt_path = "/capstor/store/cscs/swissai/a131/frankem/chemflow/logs/wandb/uniform_w/chemflow/8owhjxf9/checkpoints/epoch=499-step=9500.ckpt"
 
     # Train the model
     trainer.fit(

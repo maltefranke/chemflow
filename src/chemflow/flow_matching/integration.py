@@ -176,7 +176,6 @@ class RateIntegrator:
         do_sub_a_probs: torch.Tensor,
         do_sub_e_probs: torch.Tensor,
         do_del_probs: torch.Tensor,
-        do_ins_probs: torch.Tensor,
         num_ins_pred: torch.Tensor,
         ins_gmm_preds: torch.Tensor,
         t: torch.Tensor,
@@ -197,8 +196,7 @@ class RateIntegrator:
             do_sub_a_probs: Shape (N,) - probabilities for atom type substitution decisions (scalar per node)
             do_sub_e_probs: Shape (E,) - probabilities for edge type substitution decisions (scalar per edge)
             do_del_probs: Shape (N,) - probabilities for deletion decisions (scalar per node)
-            do_ins_probs: Shape (N,) - probabilities for insertion decisions (scalar per node)
-            num_ins_pred: Shape (N,) - predicted number of insertions per node (used to compute insertion probability)
+            num_ins_pred: Shape (N,) - predicted insertion count per node (Poisson rate, includes 0-count nodes)
             ins_gmm_preds: Dict with GMM parameters (mu, sigma, pi, a_probs, c_probs) for each node
             t: Shape (num_graphs,) - current time for each graph in the batch
             dt: Time step size
@@ -250,34 +248,13 @@ class RateIntegrator:
         x_t = x_t + velocity * dt
 
         """INSERTION"""
-        # 1. Handle insertions using local Poisson
+        # Single Poisson over all nodes (including zero-count nodes).
+        # No binary gate: num_ins_pred is the Poisson rate for every node.
         num_graphs = t.shape[0]
 
-        # Per-node Poisson sampling
-        # Sample whether to insert with probability h * lambda_ins
-        p_ins = do_ins_probs
-        p_ins = p_ins.view(-1)
-
-        ins_strategy = "poisson"
-        if ins_strategy == "gate":
-            ins_gate = torch.rand_like(p_ins) < p_ins
-
-            # for insertion, we will then sample from the poisson distribution
-            expected_num_ins = (num_ins_pred + noise_weight_node) * ins_rate_node * dt
-
-            # NOTE in OneFlow, instead of sampling Poisson, they sample Bernoulli
-            ins_sampled = torch.rand_like(expected_num_ins) < expected_num_ins
-
-            do_ins = ins_gate & ins_sampled
-
-        else:
-            expected_num_ins = (
-                p_ins * (num_ins_pred + noise_weight_node) * ins_rate_node * dt
-            )
-            # NOTE in OneFlow, instead of sampling Poisson, they sample Bernoulli
-            ins_sampled = torch.rand_like(expected_num_ins) < expected_num_ins
-
-            do_ins = ins_sampled
+        expected_num_ins = (num_ins_pred + noise_weight_node) * ins_rate_node * dt
+        # NOTE in OneFlow, instead of sampling Poisson, they sample Bernoulli
+        do_ins = torch.rand_like(expected_num_ins) < expected_num_ins
 
         # Fail-safe: ensure that the number of atoms per graph won't be greater than the max number of atoms
         if do_ins.any():

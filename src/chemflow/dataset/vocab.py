@@ -3,6 +3,8 @@ from typing import Any
 
 import torch
 
+from chemflow.utils.utils import compute_token_weights
+
 
 @dataclass
 class Vocab:
@@ -36,3 +38,38 @@ class Distributions:
             n_atoms_distribution=torch.tensor(self.n_atoms_distribution),
             coordinate_std=torch.tensor(self.coordinate_std),
         )
+
+
+def setup_token_weights(
+    vocab: Vocab,
+    distributions: Distributions,
+    weight_alpha: float,
+    type_loss_token_weights: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute atom, edge, and charge token weights from training distributions.
+
+    Returns:
+        (atom_type_weights, edge_token_weights, charge_token_weights)
+    """
+    atom_type_weights = compute_token_weights(
+        token_list=vocab.atom_tokens,
+        distribution=distributions.atom_type_distribution,
+        special_token_names=[],
+        weight_alpha=weight_alpha,
+        type_loss_token_weights=type_loss_token_weights,
+    )
+    edge_token_weights = compute_token_weights(
+        token_list=vocab.edge_tokens,
+        distribution=distributions.edge_type_distribution,
+        special_token_names=["<NO_BOND>"],
+        weight_alpha=weight_alpha,
+        type_loss_token_weights=type_loss_token_weights,
+    )
+    charge_token_weights = compute_token_weights(
+        token_list=vocab.charge_tokens,
+        distribution=distributions.charge_type_distribution,
+        special_token_names=[],
+        weight_alpha=weight_alpha,
+        type_loss_token_weights=type_loss_token_weights,
+    )
+    return atom_type_weights, edge_token_weights, charge_token_weights
