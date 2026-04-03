@@ -133,6 +133,156 @@ def distance_and_class_based_assignment(
     return row_ind, col_ind
 
 
+def substituent_constrained_assignment(
+    x0,
+    x1,
+    a0,
+    a1,
+    scaffold_pairs: list[tuple[int, int]],
+    src_subs: dict[int, list[int]],
+    tgt_subs: dict[int, list[int]],
+    c_move=1.0,
+    c_sub=10.0,
+    c_ins=5.0,
+    c_del=10.0,
+):
+    """Run per-scaffold-position OT on substituent groups with fixed scaffold pairs.
+
+    For each scaffold atom pair, runs independent partial OT on the corresponding
+    substituent groups. Non-scaffold atoms not in any substituent group are
+    processed as an unconstrained partial OT fallback.
+
+    Args:
+        x0, x1: positions
+        a0, a1: atom types
+        scaffold_pairs: fixed backbone correspondences
+        src_subs: dict[scaffold_atom_idx -> list of substituent atom indices] for source
+        tgt_subs: dict[scaffold_atom_idx -> list of substituent atom indices] for target
+        c_move, c_sub, c_ins, c_del: OT cost weights
+    """
+    N = x0.shape[0]
+    M = x1.shape[0]
+
+    # Keep only valid, one-to-one scaffold pairs
+    valid_pairs = []
+    used_src = set()
+    used_tgt = set()
+    for i_s, i_t in scaffold_pairs:
+        if not (0 <= i_s < N and 0 <= i_t < M):
+            continue
+        if i_s in used_src or i_t in used_tgt:
+            continue
+        valid_pairs.append((i_s, i_t))
+        used_src.add(i_s)
+        used_tgt.add(i_t)
+
+    global_pairs: list[tuple[int, int]] = []
+
+    # Phase 1: Fix scaffold real-real pairs
+    for i_s, i_t in valid_pairs:
+        global_pairs.append((i_s, i_t))
+
+    # Phase 2: Pair corresponding scaffold dummies with each other
+    for i_s, i_t in valid_pairs:
+        global_pairs.append((N + i_t, M + i_s))
+
+    # Phase 3: Per-position OT on substituent groups
+    for i_s, i_t in valid_pairs:
+        sub0 = [a for a in src_subs.get(i_s, []) if a not in used_src]
+        sub1 = [b for b in tgt_subs.get(i_t, []) if b not in used_tgt]
+        used_src.update(sub0)
+        used_tgt.update(sub1)
+
+        n_u, m_u = len(sub0), len(sub1)
+
+        if n_u == 0 and m_u == 0:
+            continue
+        elif n_u == 0:
+            # All tgt substituents are insertions
+            global_pairs.extend((N + j, j) for j in sub1)
+        elif m_u == 0:
+            # All src substituents are deletions
+            global_pairs.extend((i, M + i) for i in sub0)
+        else:
+            # Run independent partial OT on this substituent group
+            row_u, col_u = distance_and_class_based_assignment(
+                x0[np.array(sub0)],
+                x1[np.array(sub1)],
+                a0[np.array(sub0)],
+                a1[np.array(sub1)],
+                c_move=c_move,
+                c_sub=c_sub,
+                c_ins=c_ins,
+                c_del=c_del,
+            )
+
+            for r_loc, c_loc in zip(row_u.tolist(), col_u.tolist(), strict=True):
+                # Map reduced augmented indices to full augmented indices
+                if r_loc < n_u:
+                    r_glob = sub0[r_loc]
+                else:
+                    r_glob = N + sub1[r_loc - n_u]
+
+                if c_loc < m_u:
+                    c_glob = sub1[c_loc]
+                else:
+                    c_glob = M + sub0[c_loc - m_u]
+
+                global_pairs.append((r_glob, c_glob))
+
+    # Phase 4: Handle atoms not in any substituent (unowned atoms)
+    unowned_src = [i for i in range(N) if i not in used_src]
+    unowned_tgt = [j for j in range(M) if j not in used_tgt]
+    n_u = len(unowned_src)
+    m_u = len(unowned_tgt)
+
+    if n_u > 0 and m_u > 0:
+        row_u, col_u = distance_and_class_based_assignment(
+            x0[np.array(unowned_src)],
+            x1[np.array(unowned_tgt)],
+            a0[np.array(unowned_src)],
+            a1[np.array(unowned_tgt)],
+            c_move=c_move,
+            c_sub=c_sub,
+            c_ins=c_ins,
+            c_del=c_del,
+        )
+
+        for r_loc, c_loc in zip(row_u.tolist(), col_u.tolist(), strict=True):
+            if r_loc < n_u:
+                r_glob = unowned_src[r_loc]
+            else:
+                r_glob = N + unowned_tgt[r_loc - n_u]
+
+            if c_loc < m_u:
+                c_glob = unowned_tgt[c_loc]
+            else:
+                c_glob = M + unowned_src[c_loc - m_u]
+
+            global_pairs.append((r_glob, c_glob))
+    elif n_u == 0 and m_u > 0:
+        # Only insertions remain
+        global_pairs.extend((N + j, j) for j in unowned_tgt)
+    elif n_u > 0 and m_u == 0:
+        # Only deletions remain
+        global_pairs.extend((i, M + i) for i in unowned_src)
+
+    if len(global_pairs) != N + M:
+        raise ValueError(
+            "Substituent-constrained assignment did not produce a complete matching "
+            f"(got {len(global_pairs)}, expected {N + M})."
+        )
+
+    row_ind = np.array([p[0] for p in global_pairs], dtype=int)
+    col_ind = np.array([p[1] for p in global_pairs], dtype=int)
+
+    # Safety checks: augmented assignment must be a permutation on both sides
+    if len(np.unique(row_ind)) != (N + M) or len(np.unique(col_ind)) != (N + M):
+        raise ValueError("Substituent-constrained assignment produced duplicate indices.")
+
+    return row_ind, col_ind
+
+
 def mcs_constrained_assignment(
     x0,
     x1,
@@ -299,6 +449,82 @@ def mcs_based_assignment_single(
 
     row_ind, col_ind = mcs_constrained_assignment(
         x0, x1, a0, a1, mcs_pairs, c_move, c_sub, c_ins, c_del
+    )
+
+    sample.pad(num_auxiliary=M).permute_nodes(row_ind)
+    target.pad(num_auxiliary=N).permute_nodes(col_ind)
+
+    sample_is_aux = sample.is_auxiliary.squeeze()
+    target_is_aux = target.is_auxiliary.squeeze()
+    valid_mask = ~(sample_is_aux & target_is_aux)
+
+    if optimal_transport == "equivariant":
+        match_mask = (~sample_is_aux) & (~target_is_aux)
+        if match_mask.sum() > 0:
+            R, t = rigid_alignment(sample.x[match_mask], target.x[match_mask])
+            sample.x = sample.x @ R.T + t
+
+    sample = filter_nodes(sample, valid_mask)
+    target = filter_nodes(target, valid_mask)
+
+    return sample, target
+
+
+def substituent_based_assignment_single(
+    sample_mol: MoleculeData,
+    target_mol: MoleculeData,
+    fixed_pairs: list[tuple[int, int]],
+    src_subs: dict[int, list[int]],
+    tgt_subs: dict[int, list[int]],
+    c_move: float = 1.0,
+    c_sub: float = 10.0,
+    c_ins: float = 5.0,
+    c_del: float = 10.0,
+    optimal_transport: str = "equivariant",
+) -> tuple[AugmentedMoleculeData, AugmentedMoleculeData]:
+    """Substituent-based partial optimal transport alignment.
+
+    Fixes scaffold atom pairs, then runs independent partial OT on each
+    scaffold position's substituent group. This constrains decorations
+    so atoms from one scaffold position can only match against decorations
+    from the corresponding paired position.
+
+    Args:
+        sample_mol: Prior sample molecule.
+        target_mol: Target molecule from the dataset.
+        fixed_pairs: Scaffold atom correspondences (source_idx, target_idx).
+        src_subs: dict mapping scaffold atom index to list of substituent atom indices
+                 (source molecule).
+        tgt_subs: dict mapping scaffold atom index to list of substituent atom indices
+                 (target molecule).
+        c_move, c_sub, c_ins, c_del: OT cost weights.
+        optimal_transport: Alignment strategy ("equivariant" or other).
+
+    Returns:
+        Aligned (sample, target) as AugmentedMoleculeData with auxiliary
+        flags and filtered auxiliary-auxiliary pairs.
+    """
+    sample = AugmentedMoleculeData.from_molecule(sample_mol)
+    target = AugmentedMoleculeData.from_molecule(target_mol)
+
+    N, M = sample.x.shape[0], target.x.shape[0]
+    x0 = sample.x.detach().cpu().numpy()
+    x1 = target.x.detach().cpu().numpy()
+    a0 = sample.a.detach().cpu().numpy()
+    a1 = target.a.detach().cpu().numpy()
+
+    # Kabsch pre-alignment using scaffold anchor points
+    if len(fixed_pairs) >= 3:
+        mcs_s_idxs = [p[0] for p in fixed_pairs]
+        mcs_t_idxs = [p[1] for p in fixed_pairs]
+        pts_s = torch.tensor(x0[mcs_s_idxs], dtype=torch.float32)
+        pts_t = torch.tensor(x1[mcs_t_idxs], dtype=torch.float32)
+        R, t = rigid_alignment(pts_s, pts_t)
+        x0 = (torch.tensor(x0, dtype=torch.float32) @ R.T + t).numpy()
+        sample.x = torch.tensor(x0, dtype=sample.x.dtype)
+
+    row_ind, col_ind = substituent_constrained_assignment(
+        x0, x1, a0, a1, fixed_pairs, src_subs, tgt_subs, c_move, c_sub, c_ins, c_del
     )
 
     sample.pad(num_auxiliary=M).permute_nodes(row_ind)

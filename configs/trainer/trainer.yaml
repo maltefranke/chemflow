@@ -4,7 +4,7 @@ trainer:
   devices: auto 
   accelerator: auto
   #precision: 32
-  strategy: ddp
+  strategy: auto
   precision: "bf16-mixed"
   max_epochs: 2000
   accumulate_grad_batches: 1 # Makes effective batch size = N * batch_size

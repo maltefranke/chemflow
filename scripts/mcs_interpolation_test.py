@@ -1,129 +1,110 @@
-"""Standalone test for MCS-guided smooth interpolation between two molecules.
+import os
+import random
+from pathlib import Path
 
-Creates MoleculeData directly from SMILES (no Hydra / dataset dependency),
-runs the MCS-based assignment, and builds a smooth trajectory.
-"""
-
+import hydra
+import omegaconf
+import pytorch_lightning as pl
 import torch
+from omegaconf import DictConfig, OmegaConf
 from rdkit import Chem
-from rdkit.Chem import AllChem
 from torch_geometric.utils import to_dense_adj
 
-from chemflow.dataset.data_utils import get_mcs_atom_mapping
+from chemflow.dataset.data_utils import select_scaffold_pairs_by_neighbor_count
 from chemflow.dataset.molecule_data import (
     AugmentedMoleculeData,
     MoleculeData,
     filter_nodes,
 )
-from chemflow.dataset.vocab import Distributions, Vocab
-from chemflow.flow_matching.assignment import mcs_based_assignment_single
+from chemflow.flow_matching.assignment import (
+    mcs_based_assignment_single,
+    substituent_based_assignment_single,
+)
 from chemflow.flow_matching.interpolation import Interpolator
 from chemflow.flow_matching.schedules import SmoothstepSchedule
-from chemflow.utils.utils import build_fully_connected_edge_index
+from chemflow.utils.utils import init_uniform_prior
+
+# resolvers for more complex config expressions
+OmegaConf.register_new_resolver("oc.eval", eval)
+OmegaConf.register_new_resolver("len", lambda x: len(x))
+OmegaConf.register_new_resolver("if", lambda cond, t, f: t if cond else f)
+OmegaConf.register_new_resolver("eq", lambda x, y: x == y)
 
 torch.set_float32_matmul_precision("medium")
-torch.manual_seed(42)
+
+pl.seed_everything(42)
 
 
-# ---------------------------------------------------------------------------
-# Molecule construction helpers
-# ---------------------------------------------------------------------------
+def compute_scaffold_pairs(
+    src_matches: list,
+    tgt_matches: list,
+    src_dec: torch.Tensor,
+    tgt_dec: torch.Tensor,
+) -> list:
+    """Pick the scaffold automorphism pair by decoration-count L1 score.
 
-BOND_TYPE_TO_TOKEN = {1.0: "1", 2.0: "2", 3.0: "3", 1.5: "4"}
-
-
-def smiles_to_molecule_data(smiles: str, vocab: Vocab) -> MoleculeData:
-    """Build a MoleculeData from a SMILES string.
-
-    Atom ordering matches ``Chem.AddHs(Chem.MolFromSmiles(smiles))`` so that
-    MCS atom indices are directly usable.
+    Returns a list of (src_atom_idx, tgt_atom_idx) pairs, or [] if no matches.
     """
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        raise ValueError(f"Invalid SMILES: {smiles}")
-    mol = Chem.AddHs(mol)
-    AllChem.EmbedMolecule(mol, randomSeed=42)
-    AllChem.MMFFOptimizeMolecule(mol)
-
-    conf = mol.GetConformer()
-    positions = torch.tensor(
-        [list(conf.GetAtomPosition(i)) for i in range(mol.GetNumAtoms())],
-        dtype=torch.float32,
+    return select_scaffold_pairs_by_neighbor_count(
+        src_dec, src_matches, tgt_dec, tgt_matches
     )
-    positions = positions - positions.mean(dim=0)
-
-    atom_types = torch.tensor(
-        [vocab.atom_tokens.index(a.GetSymbol()) for a in mol.GetAtoms()],
-        dtype=torch.long,
-    )
-
-    charges = torch.tensor(
-        [vocab.charge_tokens.index(str(a.GetFormalCharge())) for a in mol.GetAtoms()],
-        dtype=torch.long,
-    )
-
-    n_atoms = mol.GetNumAtoms()
-    edge_index = build_fully_connected_edge_index(n_atoms)
-
-    edge_types = []
-    for k in range(edge_index.shape[1]):
-        src, dst = edge_index[0, k].item(), edge_index[1, k].item()
-        bond = mol.GetBondBetweenAtoms(src, dst)
-        if bond is None:
-            edge_types.append(vocab.edge_tokens.index("<NO_BOND>"))
-        else:
-            bt = bond.GetBondTypeAsDouble()
-            token = BOND_TYPE_TO_TOKEN.get(bt, "<NO_BOND>")
-            edge_types.append(vocab.edge_tokens.index(token))
-    edge_types = torch.tensor(edge_types, dtype=torch.long)
-
-    return MoleculeData(
-        x=positions, a=atom_types, e=edge_types, c=charges, edge_index=edge_index
-    )
-
-
-# ---------------------------------------------------------------------------
-# Smooth-trajectory helpers (mirrors scripts/interpolation_test.py)
-# ---------------------------------------------------------------------------
 
 
 def pre_sample_events_mcs(
     interpolator: Interpolator,
     sample_mol: MoleculeData,
     target_mol: MoleculeData,
-    smiles_sample: str,
-    smiles_target: str,
+    scaffold_pairs: list,
     device: str,
+    scaffold_substituents: tuple | None = None,
 ):
-    """Pre-sample all stochastic events using MCS-based OT alignment."""
-    sample, target = mcs_based_assignment_single(
-        sample_mol,
-        target_mol,
-        smiles_sample,
-        smiles_target,
-        c_move=interpolator.c_move,
-        c_sub=interpolator.c_sub,
-        c_ins=interpolator.c_ins,
-        c_del=interpolator.c_del,
-        optimal_transport=interpolator.optimal_transport,
-    )
+    """Pre-sample all stochastic events using scaffold-based OT alignment."""
+    if scaffold_substituents is not None and scaffold_pairs:
+        src_subs, tgt_subs = scaffold_substituents
+        sample, target = substituent_based_assignment_single(
+            sample_mol,
+            target_mol,
+            fixed_pairs=scaffold_pairs,
+            src_subs=src_subs,
+            tgt_subs=tgt_subs,
+            c_move=interpolator.c_move,
+            c_sub=interpolator.c_sub,
+            c_ins=interpolator.c_ins,
+            c_del=interpolator.c_del,
+            optimal_transport=interpolator.optimal_transport,
+        )
+    else:
+        sample, target = mcs_based_assignment_single(
+            sample_mol,
+            target_mol,
+            fixed_pairs=scaffold_pairs if scaffold_pairs else None,
+            c_move=interpolator.c_move,
+            c_sub=interpolator.c_sub,
+            c_ins=interpolator.c_ins,
+            c_del=interpolator.c_del,
+            optimal_transport=interpolator.optimal_transport,
+        )
 
     N = sample.x.shape[0]
 
-    is_sub = ((~sample.is_auxiliary) & (~target.is_auxiliary)).squeeze()
-    is_del = ((~sample.is_auxiliary) & (target.is_auxiliary)).squeeze()
-    is_ins = ((sample.is_auxiliary) & (~target.is_auxiliary)).squeeze()
+    is_sub = ((~sample.is_auxiliary) & (~target.is_auxiliary)).squeeze()  # Real → Real
+    is_del = ((~sample.is_auxiliary) & (target.is_auxiliary)).squeeze()  # Real → Dummy
+    is_ins = ((sample.is_auxiliary) & (~target.is_auxiliary)).squeeze()  # Dummy → Real
 
+    # ---- node-level event times (uniform draws, fixed for the whole trajectory) ----
     tau_del = torch.rand(N, device=device)
     tau_ins = torch.rand(N, device=device)
 
+    # ---- discrete substitution thresholds (one per node / per edge) ----
     rand_disc_a = torch.rand(N, device=device)
     rand_disc_c = torch.rand(N, device=device)
 
+    # Upper-triangular edge pairs (dense edge representation used throughout)
     triu_rows, triu_cols = torch.triu_indices(N, N, offset=1, device=device)
     n_triu = triu_rows.shape[0]
     rand_disc_e = torch.rand(n_triu, device=device)
 
+    # ---- insertion node noise / identity, sampled once ----
     ins_indices = torch.where(is_ins)[0]
     n_ins = ins_indices.shape[0]
 
@@ -138,6 +119,7 @@ def pre_sample_events_mcs(
         a_ins_rand = torch.empty((0,), dtype=sample.a.dtype, device=device)
         c_ins_rand = torch.empty((0,), dtype=sample.c.dtype, device=device)
 
+    # ---- random edge types for edges incident to any insertion node, sampled once ----
     ins_edge_potential_mask = is_ins[triu_rows] | is_ins[triu_cols]
     n_ins_edges = ins_edge_potential_mask.sum().item()
     if n_ins_edges > 0:
@@ -171,7 +153,10 @@ def pre_sample_events_mcs(
 def compute_state_at_t(
     interpolator: Interpolator, events: dict, t_scalar: float
 ) -> AugmentedMoleculeData:
-    """Deterministically compute the interpolated state at time *t*."""
+    """
+    Deterministically compute the interpolated state at a given time t using
+    the pre-sampled events dict returned by pre_sample_events_mcs.
+    """
     sample = events["sample"].clone()
     target = events["target"].clone()
 
@@ -186,20 +171,24 @@ def compute_state_at_t(
     triu_rows = events["triu_rows"]
     triu_cols = events["triu_cols"]
 
+    # Schedule values at the current time
     t_del = interpolator.del_schedule.kappa_t(t_i)
     t_ins = interpolator.ins_schedule.kappa_t(t_i)
     t_kappa = interpolator.sub_schedule.kappa_t(t_i)
     t_kappa_e = interpolator.sub_e_schedule.kappa_t(t_i)
 
+    # ---- Node existence masks (deterministic, based on pre-sampled tau) ----
     mask_keep_del = is_del & (t_del < events["tau_del"])
     mask_keep_ins = is_ins & (t_ins > events["tau_ins"])
     mask_exists = is_sub | mask_keep_del | mask_keep_ins
 
+    # ---- A. Deletions: freeze target coordinates/types at source ----
     if mask_keep_del.any():
         target.x[mask_keep_del] = sample.x[mask_keep_del]
         target.a[mask_keep_del] = sample.a[mask_keep_del]
         target.c[mask_keep_del] = sample.c[mask_keep_del]
 
+    # ---- B. Insertions: jump to target with pre-sampled noise/types ----
     if mask_keep_ins.any():
         local_ins_mask = mask_keep_ins[ins_indices]
         sample.x[mask_keep_ins] = (
@@ -208,6 +197,7 @@ def compute_state_at_t(
         sample.a[mask_keep_ins] = events["a_ins_rand"][local_ins_mask]
         sample.c[mask_keep_ins] = events["c_ins_rand"][local_ins_mask]
 
+    # ---- C. Edge handling (dense upper-triangular representation) ----
     def _extract_triu_feats(data_obj):
         attr = data_obj.e
         if attr is None or attr.numel() == 0:
@@ -237,6 +227,7 @@ def compute_state_at_t(
             dtype=e0_triu.dtype
         )
 
+    # ---- D. Discrete substitution with pre-sampled thresholds ----
     mask_a_keep = events["rand_disc_a"] > t_kappa
     a_t = target.a.clone()
     a_t[mask_a_keep] = sample.a[mask_a_keep]
@@ -249,6 +240,7 @@ def compute_state_at_t(
     e_t = e1_triu.clone()
     e_t[mask_e_keep] = e0_triu[mask_e_keep]
 
+    # ---- E. Continuous interpolation of coordinates ----
     x_t = sample.x * (1 - t_i) + target.x * t_i
 
     triu_edge_index = torch.stack([triu_rows, triu_cols], dim=0)
@@ -261,14 +253,18 @@ def compute_state_at_t(
         is_auxiliary=sample.is_auxiliary | target.is_auxiliary,
     )
 
+    # ---- F. Symmetrise edges ----
     full_idx, full_attrs = interpolator.edge_aligner.symmetrize_edges(
         interp_state.edge_index, [interp_state.e]
     )
     interp_state.edge_index = full_idx
     interp_state.e = full_attrs[0]
 
+    # ---- G. Filter to existing nodes only ----
     interp_state = filter_nodes(interp_state, mask_exists.squeeze())
+    interp_state.scaffold_mask = is_sub[mask_exists.squeeze()]
 
+    # ---- H. Centre coordinates ----
     x_mean = interp_state.x.mean(dim=0)
     interp_state.x = interp_state.x - x_mean
 
@@ -279,14 +275,15 @@ def smooth_trajectory_mcs(
     interpolator: Interpolator,
     sample_mol: MoleculeData,
     target_mol: MoleculeData,
-    smiles_sample: str,
-    smiles_target: str,
+    scaffold_pairs: list,
     time_points: torch.Tensor,
     device: str,
+    scaffold_substituents: tuple | None = None,
 ):
-    """Build a smooth interpolation trajectory using MCS-based assignment."""
+    """Build a smooth interpolation trajectory using scaffold-based assignment."""
     events = pre_sample_events_mcs(
-        interpolator, sample_mol, target_mol, smiles_sample, smiles_target, device
+        interpolator, sample_mol, target_mol, scaffold_pairs, device,
+        scaffold_substituents=scaffold_substituents,
     )
     trajectory = []
     for t in time_points:
@@ -295,76 +292,150 @@ def smooth_trajectory_mcs(
     return trajectory
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def run(cfg: DictConfig):
+    OmegaConf.set_struct(cfg, False)
+    os.environ.setdefault("PROJECT_ROOT", str(Path(__file__).parent.parent))
 
+    hydra.utils.log.info("Instantiating preprocessing...")
+    preprocessing = hydra.utils.instantiate(cfg.data.preprocessing)
 
-def main():
-    vocab = Vocab(
-        atom_tokens=["C", "F", "H", "N", "O"],
-        edge_tokens=["<NO_BOND>", "1", "2", "3", "4"],
-        charge_tokens=["-1", "0", "1"],
+    vocab = preprocessing.vocab
+    distributions = preprocessing.distributions
+    token_prior_distribution = init_uniform_prior(distributions)
+
+    cfg.data.vocab = vocab
+
+    hydra.utils.log.info(
+        f"Preprocessing complete.\n"
+        f"Found {len(vocab.atom_tokens)} atom tokens: {vocab.atom_tokens}\n"
+        f"Found {len(vocab.edge_tokens)} edge tokens: {vocab.edge_tokens}\n"
+        f"Found {len(vocab.charge_tokens)} charge tokens: {vocab.charge_tokens}"
     )
+    hydra.utils.log.info("Distributions computed from training dataset.")
 
-    n_atom = len(vocab.atom_tokens)
-    n_edge = len(vocab.edge_tokens)
-    n_charge = len(vocab.charge_tokens)
-    distributions = Distributions(
-        atom_type_distribution=torch.ones(n_atom) / n_atom,
-        edge_type_distribution=torch.ones(n_edge) / n_edge,
-        charge_type_distribution=torch.ones(n_charge) / n_charge,
-        n_atoms_distribution=torch.ones(30) / 30,
-        coordinate_std=torch.tensor(1.0),
+    hydra.utils.log.info(f"Instantiating <{cfg.data.datamodule._target_}>")
+    datamodule: pl.LightningDataModule = hydra.utils.instantiate(
+        cfg.data.datamodule,
+        _recursive_=False,
+        vocab=vocab,
+        distributions=token_prior_distribution,
     )
+    datamodule.setup()
 
-    smi1 = "CCCC1=NN(C)C2=C1NC(=NC2=O)C3=C(OCC)C=CC(=C3)C(=O)N4CCN(C)CC4"
-    smi2 = "CCCC1=NC(=C2N1N=C(NC2=O)C3=C(OCC)C=CC(=C3)C(=O)N4CCN(CC)CC4)C"
+    val_dataset = datamodule.val_dataloader()[0].dataset
 
-    mol1 = smiles_to_molecule_data(smi1, vocab)
-    mol2 = smiles_to_molecule_data(smi2, vocab)
-
-    print(f"Molecule 1 ({smi1}): {mol1.x.shape[0]} atoms")
-    print(f"Molecule 2 ({smi2}): {mol2.x.shape[0]} atoms")
-
-    mcs = get_mcs_atom_mapping(smi1, smi2)
-    print(f"MCS matched pairs: {len(mcs)}")
-    for i_s, i_t in mcs:
-        sym_s = Chem.AddHs(Chem.MolFromSmiles(smi1)).GetAtomWithIdx(i_s).GetSymbol()
-        sym_t = Chem.AddHs(Chem.MolFromSmiles(smi2)).GetAtomWithIdx(i_t).GetSymbol()
-        print(f"  sample atom {i_s} ({sym_s}) <-> target atom {i_t} ({sym_t})")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     interpolator = Interpolator(
         vocab=vocab,
-        distributions=distributions,
+        distributions=token_prior_distribution,
         ins_noise_scale=0.25,
         ins_schedule=SmoothstepSchedule(shift=0.65),
         del_schedule=SmoothstepSchedule(shift=0.65),
         sub_schedule=SmoothstepSchedule(shift=1.5),
         sub_e_schedule=SmoothstepSchedule(shift=1.5),
-        c_del=0.01,
-        c_ins=0.01,
-        c_sub=0.01,
-        c_move=10.0,
+        c_del=0.0,
+        c_ins=1e8,
+        c_sub=0.0,
+        c_move=1.0, # originally; #1e10 to effectively disable moves
     )
 
-    device = "cpu"
+    integrator = hydra.utils.instantiate(
+        cfg.model.integrator,
+        vocab=vocab,
+        distributions=token_prior_distribution,
+    )
+
     num_steps = 100
-    time_points = torch.linspace(0, 1, num_steps + 1, device=device)
+    if integrator.time_strategy == "linear":
+        time_points = torch.linspace(0, 1, num_steps + 1, device=device)
+    elif integrator.time_strategy == "log":
+        start_log = torch.log10(torch.tensor(0.01, device=device))
+        end_log = torch.log10(torch.tensor(1.0, device=device))
+        time_points = 1 - torch.logspace(
+            start_log, end_log, num_steps + 1, device=device
+        )
+        time_points = torch.flip(time_points, dims=[0])
+    else:
+        raise ValueError(f"Invalid time strategy: {integrator.time_strategy}")
 
-    print("\nRunning MCS-based smooth interpolation...")
-    trajectory = smooth_trajectory_mcs(
-        interpolator, mol1, mol2, smi1, smi2, time_points, device
+    base_dataset = val_dataset.base_dataset
+    assignment_method = cfg.data.datamodule.wrapper.get(
+        "assignment_method", "mcs_constrained"
     )
+    hydra.utils.log.info(f"Using assignment method: {assignment_method}")
 
-    print(f"Generated {len(trajectory)} frames")
-    print(f"  t=0.0 : {trajectory[0].x.shape[0]} atoms")
-    print(f"  t=0.5 : {trajectory[len(trajectory) // 2].x.shape[0]} atoms")
-    print(f"  t=1.0 : {trajectory[-1].x.shape[0]} atoms")
+    results = []
+    targets_single = []
 
-    torch.save([trajectory], "mcs_results.pt")
-    torch.save([mol2], "mcs_ground_truth.pt")
-    print("\nSaved mcs_results.pt and mcs_ground_truth.pt")
+    for i in range(32):
+        base_idx = val_dataset._filtered_indices[i]
+        gid = int(val_dataset._mol_to_group[base_idx])
+        candidates = [j for j in val_dataset._groups[gid] if j != base_idx]
+        source_idx = random.choice(candidates)
+
+        target = base_dataset[base_idx]
+        smiles_target = base_dataset.get(base_idx).smiles
+        source = base_dataset[source_idx]
+        smiles_source = base_dataset.get(source_idx).smiles
+
+        src_matches = val_dataset._scaffold_atom_indices[source_idx]
+        tgt_matches = val_dataset._scaffold_atom_indices[base_idx]
+        print(f"Source scaffold matches: {src_matches}")
+        print(f"Target scaffold matches: {tgt_matches}")
+        hydra.utils.log.info(
+            f"Found {src_matches} scaffold matches for source and {tgt_matches} for target."
+        )
+        scaffold_pairs = compute_scaffold_pairs(
+            src_matches, tgt_matches,
+            src_dec=val_dataset._scaffold_decoration_counts[source_idx],
+            tgt_dec=val_dataset._scaffold_decoration_counts[base_idx],
+        )
+
+        if assignment_method == "substituent" and scaffold_pairs:
+            scaffold_substituents = (
+                val_dataset._scaffold_substituents[source_idx],
+                val_dataset._scaffold_substituents[base_idx],
+            )
+        else:
+            scaffold_substituents = None
+
+        src_mol = Chem.MolFromSmiles(smiles_source)
+        tgt_mol = Chem.MolFromSmiles(smiles_target)
+        for atom in src_mol.GetAtoms():
+            print(atom.GetIdx(), atom.GetSymbol())
+        for atom in tgt_mol.GetAtoms():
+            print(atom.GetIdx(), atom.GetSymbol())
+        hydra.utils.log.info(
+            f"Processing pair {i}: {smiles_source} → {smiles_target}\n"
+            f"  scaffold_pairs ({len(scaffold_pairs)}): {scaffold_pairs}\n"
+            f"  source (CDK): {Chem.MolToSmiles(src_mol)}\n"
+            f"  target (CDK): {Chem.MolToSmiles(tgt_mol)}"
+        )
+
+        trajectory = smooth_trajectory_mcs(
+            interpolator,
+            source.to(device),
+            target.to(device),
+            scaffold_pairs,
+            time_points,
+            device,
+            scaffold_substituents=scaffold_substituents,
+        )
+        results.append(trajectory)
+        targets_single.append(target)
+
+    torch.save(results, "results.pt")
+    torch.save(targets_single, "ground_truth.pt")
+
+
+@hydra.main(
+    config_path="../configs",
+    config_name="default",
+    version_base="1.1",
+)
+def main(cfg: omegaconf.DictConfig):
+    run(cfg)
 
 
 if __name__ == "__main__":

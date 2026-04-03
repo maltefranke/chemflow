@@ -6,8 +6,12 @@ import numpy as np
 import hydra
 from torch.utils.data import Dataset
 
-from chemflow.flow_matching.sampling import sample_prior_graph
+from chemflow.dataset.data_utils import (
+    compute_scaffold_decoration_counts,
+    select_scaffold_pairs_by_neighbor_count,
+)
 from chemflow.dataset.molecule_data import MoleculeBatch
+from chemflow.flow_matching.sampling import sample_prior_graph
 
 
 class FlowMatchingDatasetWrapper(Dataset):
@@ -112,10 +116,12 @@ class FlowMatchingDatasetWrapperScaffoldDecoration(FlowMatchingDatasetWrapper):
         time_dist=None,
         stage="train",
         scaffold_groups_dir=None,
+        assignment_method: str = "mcs_constrained",
     ):
         super().__init__(
             base_dataset, distributions, interpolator, n_atoms_strategy, time_dist, stage
         )
+        self._assignment_method = assignment_method
 
         path = os.path.join(scaffold_groups_dir, f"scaffold_groups_{stage}.pt")
 
@@ -136,9 +142,26 @@ class FlowMatchingDatasetWrapperScaffoldDecoration(FlowMatchingDatasetWrapper):
             scaffold_groups["scaffold_atom_indices"] = compute_scaffold_atom_indices(base_dataset)
             torch.save(scaffold_groups, path)
 
+        if "scaffold_decoration_counts" not in scaffold_groups:
+            scaffold_groups["scaffold_decoration_counts"] = (
+                compute_scaffold_decoration_counts(
+                    base_dataset, scaffold_groups["scaffold_atom_indices"]
+                )
+            )
+            torch.save(scaffold_groups, path)
+
+        if "scaffold_substituents" not in scaffold_groups:
+            from chemflow.dataset.data_utils import compute_scaffold_substituents
+            scaffold_groups["scaffold_substituents"] = compute_scaffold_substituents(
+                base_dataset, scaffold_groups["scaffold_atom_indices"]
+            )
+            torch.save(scaffold_groups, path)
+
         mol_to_group = scaffold_groups["mol_to_group"]          # torch.Tensor[N]
         groups = scaffold_groups["groups"]                      # list[list[int]]
         self._scaffold_atom_indices = scaffold_groups["scaffold_atom_indices"]  # list[tuple[int,...]]
+        self._scaffold_decoration_counts = scaffold_groups["scaffold_decoration_counts"]
+        self._scaffold_substituents = scaffold_groups["scaffold_substituents"]
 
         # Keep only molecules in a group with ≥2 members (need ≥1 other source)
         self._filtered_indices = [
@@ -179,25 +202,26 @@ class FlowMatchingDatasetWrapperScaffoldDecoration(FlowMatchingDatasetWrapper):
             tgt_matches = self._scaffold_atom_indices[base_idx]    # list[tuple]
 
             if src_matches and tgt_matches:
-                # Pick the (src_match, tgt_match) pair with lowest sum-of-squared
-                # distances between scaffold atom coords (center first to remove
-                # translation bias). Fully vectorized over all automorphisms.
-                src_x = source.x - source.x.mean(dim=0)
-                tgt_x = target.x - target.x.mean(dim=0)
-                src_idx_t = torch.tensor([list(sm) for sm in src_matches])  # (n_src, K)
-                tgt_idx_t = torch.tensor([list(tm) for tm in tgt_matches])  # (n_tgt, K)
-                sc = src_x[src_idx_t]   # (n_src, K, 3)
-                tc = tgt_x[tgt_idx_t]   # (n_tgt, K, 3)
-                dists = ((sc[:, None] - tc[None]) ** 2).sum(dim=(-1, -2))  # (n_src, n_tgt)
-                best = dists.argmin()
-                best_src = src_matches[best // len(tgt_matches)]
-                best_tgt = tgt_matches[best  % len(tgt_matches)]
-                scaffold_pairs = list(zip(best_src, best_tgt))
+                src_dec = self._scaffold_decoration_counts[source_idx]
+                tgt_dec = self._scaffold_decoration_counts[base_idx]
+                scaffold_pairs = select_scaffold_pairs_by_neighbor_count(
+                    src_dec, src_matches, tgt_dec, tgt_matches
+                )
             else:
                 scaffold_pairs = []
 
+            # Extract substituents if using substituent-based assignment
+            if self._assignment_method == "substituent" and scaffold_pairs and self._scaffold_substituents is not None:
+                src_subs = self._scaffold_substituents[source_idx]
+                tgt_subs = self._scaffold_substituents[base_idx]
+                scaffold_substituents = (src_subs, tgt_subs)
+            else:
+                scaffold_substituents = None
+
             mol_t, mol_1, ins_targets = self.interpolator.interpolate_single(
-                source, target, t.item(), scaffold_pairs=scaffold_pairs
+                source, target, t.item(),
+                scaffold_pairs=scaffold_pairs,
+                scaffold_substituents=scaffold_substituents,
             )
 
             if hasattr(target, "y") and target.y is not None:

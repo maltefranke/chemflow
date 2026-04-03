@@ -253,6 +253,7 @@ class Interpolator:
         target_mol: MoleculeData,
         t_scalar: float,
         scaffold_pairs: list[tuple[int, int]] | None = None,
+        scaffold_substituents: tuple[dict, dict] | None = None,
     ):
         """Per-sample interpolation (OT alignment + interpolation + rates).
 
@@ -275,7 +276,38 @@ class Interpolator:
         t_i = torch.tensor(t_scalar, device=device)
 
         # ===== 1. OT Alignment =====
-        if scaffold_pairs:
+        if scaffold_pairs and scaffold_substituents is not None:
+            src_subs, tgt_subs = scaffold_substituents
+            if src_subs is not None and tgt_subs is not None:
+                from chemflow.flow_matching.assignment import (
+                    substituent_based_assignment_single,
+                )
+                sample, target = substituent_based_assignment_single(
+                    sample_mol,
+                    target_mol,
+                    fixed_pairs=scaffold_pairs,
+                    src_subs=src_subs,
+                    tgt_subs=tgt_subs,
+                    c_move=self.c_move,
+                    c_sub=self.c_sub,
+                    c_ins=self.c_ins,
+                    c_del=self.c_del,
+                    optimal_transport=self.optimal_transport,
+                )
+            else:
+                # Fallback: substituent data missing for this molecule pair
+                from chemflow.flow_matching.assignment import mcs_based_assignment_single
+                sample, target = mcs_based_assignment_single(
+                    sample_mol,
+                    target_mol,
+                    fixed_pairs=scaffold_pairs,
+                    c_move=self.c_move,
+                    c_sub=self.c_sub,
+                    c_ins=self.c_ins,
+                    c_del=self.c_del,
+                    optimal_transport=self.optimal_transport,
+                )
+        elif scaffold_pairs:
             from chemflow.flow_matching.assignment import mcs_based_assignment_single
             sample, target = mcs_based_assignment_single(
                 sample_mol,
