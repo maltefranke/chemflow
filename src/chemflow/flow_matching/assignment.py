@@ -521,7 +521,7 @@ def substituent_based_assignment_single(
         pts_t = torch.tensor(x1[mcs_t_idxs], dtype=torch.float32)
         R, t = rigid_alignment(pts_s, pts_t)
         x0 = (torch.tensor(x0, dtype=torch.float32) @ R.T + t).numpy()
-        sample.x = torch.tensor(x0, dtype=sample.x.dtype)
+        sample.x = torch.tensor(x0, dtype=sample.x.dtype, device=sample.x.device)
 
     row_ind, col_ind = substituent_constrained_assignment(
         x0, x1, a0, a1, fixed_pairs, src_subs, tgt_subs, c_move, c_sub, c_ins, c_del
