@@ -402,7 +402,6 @@ def select_scaffold_pairs_by_neighbor_count(
     tgt_sig_mat = tgt_dec[tgt_idx_t]   # (n_tgt, K)
     # scores[i, j] = L1 distance between sig vectors for match pair (i, j)
     scores = (src_sig_mat[:, None, :] - tgt_sig_mat[None, :, :]).abs().sum(dim=-1)
-    print("Score matrix:\n", scores)
     best = scores.argmin()
     best_src = src_matches[best // len(tgt_matches)]
     best_tgt = tgt_matches[best  % len(tgt_matches)]
