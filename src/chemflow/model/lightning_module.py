@@ -931,6 +931,8 @@ class LightningModuleRates(pl.LightningModule):
 
         _ = mol_t.remove_com()
 
+        scaffold_mask = getattr(mol_t, 'scaffold_mask', None)
+
         # Start at t=0
         t = torch.zeros(batch_size, device=self.device)
         step_sizes = self.integrator.get_time_steps()
@@ -954,6 +956,9 @@ class LightningModuleRates(pl.LightningModule):
             batch_id = mol_t.batch
 
             prev_preds = preds
+
+            if scaffold_mask is not None:
+                mol_t.scaffold_mask = scaffold_mask
 
             preds = self.cfg_adapter.guided_predict(
                 model,
@@ -1023,11 +1028,22 @@ class LightningModuleRates(pl.LightningModule):
                 num_ins_pred = torch.zeros_like(num_ins_pred)
                 do_del_probs = torch.zeros_like(do_del_probs)
 
+            # Hard-zero all discrete rates for scaffold atoms so the scaffold
+            # identity is guaranteed to be preserved during inference.
+            # Positions are left free so the model can learn geometric relaxation.
+            if scaffold_mask is not None:
+                smask = scaffold_mask.bool()
+                do_del_probs[smask] = 0.0
+                do_sub_a_probs[smask] = 0.0
+                num_ins_pred[smask] = 0.0
+                sc_edge_mask = smask[mol_t.edge_index[0]] & smask[mol_t.edge_index[1]]
+                do_sub_e_probs[sc_edge_mask] = 0.0
+
             # Get insertion edge head if available
             ins_edge_head = getattr(model, "ins_edge_head", None)
 
             # Integrate one step (edge prediction happens inside if head is provided)
-            mol_t = self.integrator.integrate_step_gnn(
+            mol_t, keep_mask, n_insertions = self.integrator.integrate_step_gnn(
                 mol_t=mol_t.clone(),
                 mol_1_pred=mol_1_pred.clone(),
                 do_sub_a_probs=do_sub_a_probs,
@@ -1040,6 +1056,15 @@ class LightningModuleRates(pl.LightningModule):
                 h_latent=preds.get("h_latent"),
                 ins_edge_head=ins_edge_head,
             )
+
+            if scaffold_mask is not None:
+                if keep_mask is not None:
+                    scaffold_mask = scaffold_mask[keep_mask]
+                if n_insertions > 0:
+                    scaffold_mask = torch.cat([
+                        scaffold_mask,
+                        torch.zeros(n_insertions, dtype=torch.long, device=scaffold_mask.device),
+                    ])
 
             # remove mean from xt for each batch
             _ = mol_t.remove_com()

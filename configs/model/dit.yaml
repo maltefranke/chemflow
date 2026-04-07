@@ -112,6 +112,8 @@ module:
     time_embedding_args: ${model.time_embedding}
     node_count_embedding_args: ${model.node_count_embedding}
     bond_degree_embedding_args: ${model.bond_degree_embedding}
+    scaffold_mask_embedding_args: ${model.scaffold_mask_embedding}
+    edge_scaffold_embedding_args: ${model.edge_scaffold_embedding}
 
     backbone_model_args: ${model.backbone}
 
@@ -132,6 +134,19 @@ module:
         out_dim: 64
         dropout: 0.05
         trainable: false
+
+scaffold_mask_embedding:
+  _target_: chemflow.model.embedding.Embedding
+  num_embeddings: 2
+  embedding_dim: 32
+  out_dim: 64
+
+edge_scaffold_embedding:
+  _target_: chemflow.model.embedding.Embedding
+  num_embeddings: 3       # 0=dec-dec, 1=scaffold-dec, 2=scaffold-scaffold
+  embedding_dim: 32
+  out_dim: 64
+edge_scaffold_embed_dim: 64
 
 atom_type_embedding:
   _target_: chemflow.model.embedding.Embedding
@@ -198,14 +213,14 @@ bond_degree_embed_dim: 128
 backbone:
   _target_: chemflow.model.backbones.dit.DiTBackbone
   _recursive_: false
-  d_input: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.bond_degree_embed_dim}"}
+  d_input: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.bond_degree_embed_dim} + ${model.scaffold_mask_embedding.out_dim}"}
   d_cond: ${oc.eval:"${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.cfg_embed_dim}"}
   d_model: 512
   out_node_nf: 256
   num_layers: 8
   nhead: 16
   mlp_ratio: 4.0
-  in_edge_nf: ${model.edge_type_embedding.out_dim}
+  in_edge_nf: ${oc.eval:"${model.edge_type_embedding.out_dim} + ${model.edge_scaffold_embed_dim}"}
   rbf_embedding_args:
     _target_: chemflow.model.embedding.RBFEmbedding
     num_rbf: 128

@@ -348,6 +348,9 @@ class RateIntegrator:
             batch=batch_id,
         )
 
+        keep_mask_out = None
+        n_insertions_out = 0
+
         if self.n_atoms_strategy != "fixed":
             # Build index mapping: original_idx -> post_deletion_idx (or -1 if deleted)
             N_original = mol.num_nodes
@@ -374,6 +377,8 @@ class RateIntegrator:
                 len(kept_indices), device=self.device
             )
 
+            keep_mask_out = keep_mask
+
             # 3. Remove the deleted nodes
             if do_del.any():
                 mol = filter_nodes(mol, keep_mask)
@@ -383,6 +388,7 @@ class RateIntegrator:
             # The spawn node provides GMM parameters for the new atom's position,
             # but the spawn node itself doesn't need to exist after deletion.
             do_ins_valid = do_ins
+            n_insertions_out = int(do_ins_valid.sum().item())
             if do_ins_valid.any():
                 ins_gmm_dict = {
                     "mu": ins_gmm_preds["mu"][do_ins_valid],
@@ -601,4 +607,4 @@ class RateIntegrator:
                     # Fall back to random edge sampling
                     mol = join_molecules_with_atoms(mol, new_atoms, edge_dist)
 
-        return mol
+        return mol, keep_mask_out, n_insertions_out

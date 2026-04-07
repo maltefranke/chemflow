@@ -132,6 +132,12 @@ module:
         dropout: 0.05
         trainable: false
 
+scaffold_mask_embedding:
+  _target_: chemflow.model.embedding.Embedding
+  num_embeddings: 2
+  embedding_dim: 64
+  out_dim: 128
+
 atom_type_embedding:
   _target_: chemflow.model.embedding.Embedding
   num_embeddings: ${len:${data.vocab.atom_tokens}}
@@ -196,8 +202,9 @@ embedding_backbone:
   time_embedding_args: ${model.time_embedding}
   node_count_embedding_args: ${model.node_count_embedding}
   cfg_embedding_args: ${model.cfg_embedding}
-  h0_input_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.cfg_embed_dim}"}
-  h0_projection_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.cfg_embed_dim}"}
+  scaffold_mask_embedding_args: ${model.scaffold_mask_embedding}
+  h0_input_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.cfg_embed_dim} + ${model.scaffold_mask_embedding.out_dim}"}
+  h0_projection_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.cfg_embed_dim} + ${model.scaffold_mask_embedding.out_dim}"}
   e_input_dim: ${model.edge_type_embedding.out_dim}
   e_projection_dim: ${model.edge_type_embedding.out_dim}
 

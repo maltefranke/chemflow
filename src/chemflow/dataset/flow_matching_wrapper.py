@@ -327,10 +327,22 @@ class FlowMatchingDatasetWrapperScaffoldDecoration(FlowMatchingDatasetWrapper):
                 scaffold_substituents=scaffold_substituents,
             )
 
+            n_scaffold = len(scaffold_pairs) if scaffold_pairs else 0
+            scaffold_mask = torch.zeros(mol_t.num_nodes, dtype=torch.long)
+            scaffold_mask[:n_scaffold] = 1
+            mol_t.scaffold_mask = scaffold_mask
+
             if hasattr(target, "y") and target.y is not None:
                 mol_t.y = target.y
 
             return mol_t, mol_1, ins_targets, t
+
+        src_matches = self._scaffold_atom_indices[source_idx]
+        if src_matches:
+            scaffold_indices = list(src_matches[0])
+            scaffold_mask = torch.zeros(source.num_nodes, dtype=torch.long)
+            scaffold_mask[scaffold_indices] = 1
+            source.scaffold_mask = scaffold_mask
 
         return source, target
 

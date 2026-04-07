@@ -35,6 +35,8 @@ class EmbeddingBackbone(nn.Module):
         node_count_embedding_args: DictConfig,
         bond_degree_embedding_args: Optional[DictConfig] = None,
         cfg_embedding_args: Optional[DictConfig] = None,
+        scaffold_mask_embedding_args: Optional[DictConfig] = None,
+        edge_scaffold_embedding_args: Optional[DictConfig] = None,
         *,
         h0_input_dim: int,
         h0_projection_dim: int,
@@ -53,6 +55,18 @@ class EmbeddingBackbone(nn.Module):
                 bond_degree_embedding_args
             )
 
+        self.scaffold_mask_embedding = None
+        if scaffold_mask_embedding_args is not None:
+            self.scaffold_mask_embedding = hydra.utils.instantiate(
+                scaffold_mask_embedding_args
+            )
+
+        self.edge_scaffold_embedding = None
+        if edge_scaffold_embedding_args is not None:
+            self.edge_scaffold_embedding = hydra.utils.instantiate(
+                edge_scaffold_embedding_args
+            )
+
         self.cfg_embedding = None
         if cfg_embedding_args is not None:
             self.cfg_embedding = hydra.utils.instantiate(cfg_embedding_args)
@@ -67,6 +81,7 @@ class EmbeddingBackbone(nn.Module):
         edge_index: torch.Tensor,
         t: torch.Tensor,
         batch: torch.Tensor,
+        scaffold_mask: Optional[torch.Tensor] = None,
         cfg_inputs: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         N_nodes = torch.bincount(batch)
@@ -90,11 +105,25 @@ class EmbeddingBackbone(nn.Module):
             struct_embed = self.bond_degree_embedding(e, edge_index[0], a.shape[0])
             embeddings_to_concat.append(struct_embed)
 
+        if self.scaffold_mask_embedding is not None:
+            if scaffold_mask is None:
+                scaffold_mask = torch.zeros(a.shape[0], dtype=torch.long, device=a.device)
+            scaffold_embed = self.scaffold_mask_embedding(scaffold_mask)
+            embeddings_to_concat.append(scaffold_embed)
+
         h_0 = torch.cat(embeddings_to_concat, dim=-1)
         h_0 = self.h0_projection(h_0)
 
         # Process edge embeddings
         e_embed = self.edge_type_embedding(e)
+
+        if self.edge_scaffold_embedding is not None:
+            if scaffold_mask is None:
+                edge_scaffold_type = torch.zeros(e.shape[0], dtype=torch.long, device=e.device)
+            else:
+                edge_scaffold_type = scaffold_mask[edge_index[0]] + scaffold_mask[edge_index[1]]
+            e_embed = torch.cat([e_embed, self.edge_scaffold_embedding(edge_scaffold_type)], dim=-1)
+
         e_embed = self.e_projection(e_embed)
 
         # Ensure edge_index is formatted correctly (tuple for some backbones, tensor for others)
@@ -200,10 +229,12 @@ class BackboneWithHeads(nn.Module):
     ) -> Dict[str, Any]:
         """Forward pass through Embedding -> Backbone -> Heads."""
         x, a, c, e, edge_index, batch = mols_t.unpack()
+        scaffold_mask = getattr(mols_t, 'scaffold_mask', None)
 
         # 1. Embedding Pass
         h_0, edge_index_tuple, e_embed = self.embedding_backbone(
             a, e, edge_index, t, batch,
+            scaffold_mask=scaffold_mask,
             cfg_inputs=cfg_inputs,
         )
 

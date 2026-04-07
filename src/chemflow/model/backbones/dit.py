@@ -328,6 +328,8 @@ class DiTEmbedding(nn.Module):
         node_count_embedding_args: DictConfig,
         bond_degree_embedding_args: DictConfig | None = None,
         cfg_embedding_args: DictConfig | None = None,
+        scaffold_mask_embedding_args: DictConfig | None = None,
+        edge_scaffold_embedding_args: DictConfig | None = None,
     ):
         super().__init__()
         self.atom_type_embedding = hydra.utils.instantiate(atom_type_embedding_args)
@@ -345,6 +347,18 @@ class DiTEmbedding(nn.Module):
         if cfg_embedding_args is not None:
             self.cfg_embedding = hydra.utils.instantiate(cfg_embedding_args)
 
+        self.scaffold_mask_embedding = None
+        if scaffold_mask_embedding_args is not None:
+            self.scaffold_mask_embedding = hydra.utils.instantiate(
+                scaffold_mask_embedding_args
+            )
+
+        self.edge_scaffold_embedding = None
+        if edge_scaffold_embedding_args is not None:
+            self.edge_scaffold_embedding = hydra.utils.instantiate(
+                edge_scaffold_embedding_args
+            )
+
     def forward(
         self,
         a: torch.Tensor,
@@ -352,6 +366,7 @@ class DiTEmbedding(nn.Module):
         edge_index: torch.Tensor,
         t: torch.Tensor,
         batch: torch.Tensor,
+        scaffold_mask: torch.Tensor | None = None,
         cfg_inputs: dict | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -366,9 +381,22 @@ class DiTEmbedding(nn.Module):
         a_embed = self.atom_type_embedding(a)
         e_embed = self.edge_type_embedding(e)
 
+        if self.edge_scaffold_embedding is not None:
+            if scaffold_mask is None:
+                edge_scaffold_type = torch.zeros(e.shape[0], dtype=torch.long, device=e.device)
+            else:
+                edge_scaffold_type = scaffold_mask[edge_index[0]] + scaffold_mask[edge_index[1]]
+            e_embed = torch.cat([e_embed, self.edge_scaffold_embedding(edge_scaffold_type)], dim=-1)
+
         if self.bond_degree_embedding is not None:
             struct_embed = self.bond_degree_embedding(e, edge_index[0], a.shape[0])
             a_embed = torch.cat([a_embed, struct_embed], dim=-1)
+
+        if self.scaffold_mask_embedding is not None:
+            if scaffold_mask is None:
+                scaffold_mask = torch.zeros(a.shape[0], dtype=torch.long, device=a.device)
+            scaffold_embed = self.scaffold_mask_embedding(scaffold_mask)
+            a_embed = torch.cat([a_embed, scaffold_embed], dim=-1)
 
         t_embed = self.time_embedding(t)
         n_embed = self.node_count_embedding(N_nodes)
@@ -411,6 +439,8 @@ class DiTBackboneWithHeads(nn.Module):
         ins_edge_head_args: DictConfig,
         bond_degree_embedding_args: DictConfig | None = None,
         cfg_embedding_args: DictConfig | None = None,
+        scaffold_mask_embedding_args: DictConfig | None = None,
+        edge_scaffold_embedding_args: DictConfig | None = None,
     ):
         super().__init__()
 
@@ -421,6 +451,8 @@ class DiTBackboneWithHeads(nn.Module):
             node_count_embedding_args=node_count_embedding_args,
             bond_degree_embedding_args=bond_degree_embedding_args,
             cfg_embedding_args=cfg_embedding_args,
+            scaffold_mask_embedding_args=scaffold_mask_embedding_args,
+            edge_scaffold_embedding_args=edge_scaffold_embedding_args,
         )
 
         self.backbone = hydra.utils.instantiate(backbone_model_args)
@@ -494,9 +526,11 @@ class DiTBackboneWithHeads(nn.Module):
     ) -> dict[str, Any]:
         """Forward pass through Embedding -> DiT Backbone -> Heads."""
         x, a, _c, e, edge_index, batch = mols_t.unpack()
+        scaffold_mask = getattr(mols_t, 'scaffold_mask', None)
 
         a_embed, e_embed, cond = self.embedding_backbone(
             a, e, edge_index, t, batch,
+            scaffold_mask=scaffold_mask,
             cfg_inputs=cfg_inputs,
         )
 
