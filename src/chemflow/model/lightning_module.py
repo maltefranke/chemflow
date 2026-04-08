@@ -400,6 +400,7 @@ class LightningModuleRates(pl.LightningModule):
             is_random_self_conditioning=is_random_self_conditioning,
             cfg_inputs=cfg_inputs,
         )
+        self.model.apply_activations(preds)
 
         a_pred = preds["atom_type_head"]
         x_pred = preds["pos_head"]
@@ -935,8 +936,9 @@ class LightningModuleRates(pl.LightningModule):
         t = torch.zeros(batch_size, device=self.device)
         step_sizes = self.integrator.get_time_steps()
 
-        # Trajectory storage
-        mol_traj = [mol_t.clone()]
+        # Trajectory storage (only used when return_traj=True)
+        mol_traj = [mol_t.clone()] if return_traj else None
+        mol_last = None
 
         # previous outputs for self-conditioning. none at the beginning
         preds = None
@@ -1052,8 +1054,11 @@ class LightningModuleRates(pl.LightningModule):
             mol_t_cloned = mol_t.clone()
             mol_t_cloned.x = mol_t_cloned.x * self.distributions.coordinate_std
 
-            # Save  state to trajectory
-            mol_traj.append(mol_t_cloned)
+            # Save state to trajectory or just keep the last frame
+            if return_traj:
+                mol_traj.append(mol_t_cloned)
+            else:
+                mol_last = mol_t_cloned
 
         if return_traj:
             # rectify the trajectory such that we get a traj for each molecule
@@ -1068,7 +1073,7 @@ class LightningModuleRates(pl.LightningModule):
             return traj_per_mol
 
         else:
-            return mol_traj[-1].clone()
+            return mol_last.clone()
 
     def configure_optimizers(self):
         # Collect all parameters for the optimizer

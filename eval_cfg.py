@@ -20,6 +20,7 @@ from omegaconf import DictConfig, OmegaConf
 from rdkit import RDLogger
 
 from chemflow.utils.utils import init_uniform_prior
+from chemflow.dataset.vocab import setup_token_weights
 
 
 OmegaConf.register_new_resolver("oc.eval", eval)
@@ -35,7 +36,7 @@ TARGET_N_ATOMS = [10, 18, 28]
 GUIDANCE_SCALES = [1.0, 5.0, 10.0]
 
 TARGET_MWS = [100.0, 110.0, 125.0]
-MW_GUIDANCE_SCALES = [0.5, 1.0, 5.0]
+MW_GUIDANCE_SCALES = [0.75, 0.9, 1.1, 1.25]
 
 PLOT_N_MOLS = 500
 PREDICT_BATCH_SIZE = 128
@@ -79,7 +80,7 @@ def _infer_mol_mw(mol, atom_tokens: list[str]) -> float | None:
     """Infer molecular weight from a single molecule."""
     if mol is None or atom_tokens is None:
         return None
-    from chemflow.model.embedding import compute_molecular_weight
+    from chemflow.model.cfg import compute_molecular_weight
 
     a = getattr(mol, "a", None)
     if a is None:
@@ -550,10 +551,17 @@ def eval_cfg(cfg: DictConfig):
     datamodule.setup()
 
     n_dist = distributions.n_atoms_distribution
-    median_n = int(
-        (torch.cumsum(n_dist, 0) >= 0.5).nonzero(as_tuple=True)[0][0].item()
-    )
+    median_n = int((torch.cumsum(n_dist, 0) >= 0.5).nonzero(as_tuple=True)[0][0].item())
     print(f"Prior n_atoms fixed to median = {median_n}")
+
+    # ── token weights (mirrors run.py) ──
+    tw = cfg.model.token_weighting
+    atom_type_weights, edge_token_weights, charge_token_weights = setup_token_weights(
+        vocab=vocab,
+        distributions=loss_weight_distributions,
+        weight_alpha=tw.weight_alpha,
+        type_loss_token_weights=tw.type_loss_token_weights,
+    )
 
     # ── model setup ──
     module = hydra.utils.instantiate(
@@ -561,9 +569,12 @@ def eval_cfg(cfg: DictConfig):
         _recursive_=False,
         distributions=token_prior_distribution,
         loss_weight_distributions=loss_weight_distributions,
+        atom_type_weights=atom_type_weights,
+        edge_token_weights=edge_token_weights,
+        charge_token_weights=charge_token_weights,
     )
 
-    ckpt_path = "/capstor/store/cscs/swissai/a131/frankem/chemflow/logs/wandb/mw_cfg/chemflow/fujlz0gr/checkpoints/epoch=449-step=8550.ckpt"
+    ckpt_path = "/capstor/store/cscs/swissai/a131/frankem/chemflow/logs/wandb/poisson_cfg/chemflow/fy8p6jss/checkpoints/epoch=499-step=9500.ckpt"
     ckpt = torch.load(
         ckpt_path,
         map_location="cpu",

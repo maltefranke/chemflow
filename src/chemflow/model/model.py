@@ -224,9 +224,17 @@ class BackboneWithHeads(nn.Module):
         # Store latent features
         out_dict["h_latent"] = h
 
-        # Enforce positive rates
+        return out_dict
+
+    @staticmethod
+    def apply_activations(out_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply post-head activations (softplus on rate logits).
+
+        Separated from forward() so that CFGAdapter can apply CFG on raw logits
+        first and then activate.  Must be called by callers of forward() before
+        the outputs are consumed.
+        """
         for key in out_dict:
             if "rate" in key:
                 out_dict[key] = F.softplus(out_dict[key])
-
         return out_dict

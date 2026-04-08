@@ -34,6 +34,8 @@ def process_one_conformer(mol: Chem.Mol):
 
     try:
         N = mol.GetNumAtoms()
+        if N >= 72:
+            return None
         conf = mol.GetConformer()
         pos = conf.GetPositions()
         pos = torch.tensor(pos, dtype=torch.float)
@@ -247,6 +249,9 @@ class GEOM(Dataset):
 
     def __getitem__(self, index):
         return mol_from_bytes(self._mol_bytes[index])
+    
+    def get(self, index):
+        return self.__getitem__(index)
 
 
 class FlowMatchingGEOMDataset(GEOM):
@@ -302,3 +307,6 @@ class FlowMatchingGEOMDataset(GEOM):
             x=coord, a=atom_types, e=edge_types, c=charges, edge_index=data.edge_index
         )
         return data
+
+    def get(self, index):
+        return self.__getitem__(index)

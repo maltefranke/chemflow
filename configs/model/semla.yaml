@@ -190,7 +190,7 @@ cfg:
   mw_guidance_scale: 0.0
   # Unified embedding
   embedding:
-    _target_: chemflow.model.embedding.UnifiedCFGEmbedding
+    _target_: chemflow.model.cfg.UnifiedCFGEmbedding
     out_dim: ${model.cfg.embed_dim}
     num_properties: ${model.cfg.num_properties}
     property_hidden_dim: ${model.cfg.property_hidden_dim}
