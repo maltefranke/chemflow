@@ -51,6 +51,7 @@ class RevisedQM9(InMemoryDataset):
             raise ValueError(
                 f"Invalid split '{split}'. Expected one of {tuple(self.split_to_index)}."
             )
+        self._split = split
         super().load(self.processed_paths[self.split_to_index[split]])
 
     def download(self) -> None:
@@ -187,8 +188,23 @@ class RevisedQM9(InMemoryDataset):
         self.save(data_list[n_train : n_train + n_val], self.processed_paths[1])
         self.save(data_list[n_train + n_val :], self.processed_paths[2])
 
+        for split_name, split_data in [
+            ("train", data_list[:n_train]),
+            ("val", data_list[n_train : n_train + n_val]),
+            ("test", data_list[n_train + n_val :]),
+        ]:
+            smiles_path = os.path.join(self.processed_dir, f"{split_name}_smiles.txt")
+            unique_smiles = sorted(set(d.smiles for d in split_data))
+            with open(smiles_path, "w") as f:
+                f.write("\n".join(unique_smiles))
+
         print(f"Errors: {errors}")
         print(f"Skipped: {skipped}")
+
+    def get_all_smiles(self) -> list[str]:
+        smiles_path = os.path.join(self.processed_dir, f"{self._split}_smiles.txt")
+        with open(smiles_path) as f:
+            return f.read().splitlines()
 
 
 class FlowMatchingQM9Dataset(RevisedQM9):

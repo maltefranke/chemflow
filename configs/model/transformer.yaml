@@ -161,7 +161,7 @@ node_count_embedding:
   out_dim: 128
 
 token_weighting:
-  type_loss_token_weights: training
+  type_loss_token_weights: uniform
   weight_alpha: 0.4
 
 # ── Unified classifier-free guidance ──

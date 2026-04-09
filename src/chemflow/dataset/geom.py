@@ -244,12 +244,24 @@ class GEOM(Dataset):
         print(f"Saving processed data to {self.processed_file}...")
         save_dataset_bytes(mol_bytes_list, self.processed_file)
 
+        smiles_path = os.path.join(self.processed_dir, f"{self.split}_smiles.txt")
+        unique_smiles = sorted(set(
+            pickle.loads(b)["smiles"] for b in mol_bytes_list
+        ))
+        with open(smiles_path, "w") as f:
+            f.write("\n".join(unique_smiles))
+
+    def get_all_smiles(self) -> list[str]:
+        smiles_path = os.path.join(self.processed_dir, f"{self.split}_smiles.txt")
+        with open(smiles_path) as f:
+            return f.read().splitlines()
+
     def __len__(self):
         return len(self._mol_bytes)
 
     def __getitem__(self, index):
         return mol_from_bytes(self._mol_bytes[index])
-    
+
     def get(self, index):
         return self.__getitem__(index)
 

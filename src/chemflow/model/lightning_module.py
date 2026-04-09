@@ -78,6 +78,8 @@ class LightningModuleRates(pl.LightningModule):
         charge_token_weights: torch.Tensor,
         cfg_adapter: DictConfig,
         time_dist: DictConfig,
+        metrics: "MetricCollection",
+        stability_metrics: "MetricCollection",
         n_atoms_strategy: str = "fixed",
         ins_noise_scale: float = 0.5,
         use_learnable_loss_weights: bool = False,
@@ -116,15 +118,10 @@ class LightningModuleRates(pl.LightningModule):
         self.register_buffer("edge_token_weights", edge_token_weights)
         self.register_buffer("charge_token_weights", charge_token_weights)
 
-        self.metrics, self.stability_metrics = init_metrics(
-            target_n_atoms_distribution=self.loss_weight_distributions.n_atoms_distribution,
-            atom_type_distribution=self.loss_weight_distributions.atom_type_distribution,
-            edge_type_distribution=self.loss_weight_distributions.edge_type_distribution,
-            atom_tokens=list(self.vocab.atom_tokens),
-            edge_tokens=list(self.vocab.edge_tokens),
-        )
+        self.metrics = metrics
+        self.stability_metrics = stability_metrics
 
-        self.save_hyperparameters(ignore=["ema_decay_scheduler"])
+        self.save_hyperparameters(ignore=["ema_decay_scheduler", "metrics", "stability_metrics"])
         self.model = hydra.utils.instantiate(model)
 
         self.cfg_adapter = hydra.utils.instantiate(
@@ -728,13 +725,13 @@ class LightningModuleRates(pl.LightningModule):
         )
 
         loss = self.safe_loss(self.loss_accumulator.total_loss())
-        self.log_dict(self.loss_accumulator.log_dict(), prog_bar=False, logger=True)
+        self.log_dict(self.loss_accumulator.log_dict(), prog_bar=False, logger=True, sync_dist=True)
 
         return loss
 
     def training_step(self, batch, batch_idx):
         loss = self.shared_step(batch, batch_idx)
-        self.log("loss/train", loss, prog_bar=True, logger=True)
+        self.log("loss/train", loss, prog_bar=True, logger=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -762,7 +759,10 @@ class LightningModuleRates(pl.LightningModule):
         print(eval_metrics)
 
         # Log validation metrics in val/ group
-        val_metrics_dict = {f"val/{key}": value for key, value in eval_metrics.items()}
+        val_metrics_dict = {
+            f"val/{key}": torch.tensor(value, dtype=torch.float32, device=self.device)
+            for key, value in eval_metrics.items()
+        }
         self.log_dict(
             val_metrics_dict,
             on_step=False,
@@ -770,18 +770,21 @@ class LightningModuleRates(pl.LightningModule):
             prog_bar=False,
             logger=True,
             batch_size=len(mols),
+            sync_dist=True,
         )
 
         try:
-            # pb_metrics = calc_posebusters_metrics(rdkit_mols)
-            pb_metrics = False
+            pb_metrics = calc_posebusters_metrics(rdkit_mols)
+            print(pb_metrics)
+            # pb_metrics = False
         except Exception as e:
             print(f"Error calculating PoseBusters metrics: {e}")
             pb_metrics = False
 
         if pb_metrics:
             pb_metrics_dict = {
-                f"posebusters/{key}": value for key, value in pb_metrics.items()
+                f"posebusters/{key}": torch.tensor(value, dtype=torch.float32, device=self.device)
+                for key, value in pb_metrics.items()
             }
             self.log_dict(
                 pb_metrics_dict,
@@ -790,6 +793,7 @@ class LightningModuleRates(pl.LightningModule):
                 prog_bar=False,
                 logger=True,
                 batch_size=len(mols),
+                sync_dist=True,
             )
             eval_metrics.update(pb_metrics)
 

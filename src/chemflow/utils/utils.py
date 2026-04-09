@@ -182,7 +182,7 @@ def compute_token_weights(
     distribution: torch.Tensor,
     special_token_names: list[str],
     weight_alpha: float = 1.0,
-    type_loss_token_weights: str = "training",
+    type_loss_token_weights: str = "uniform",
 ) -> torch.Tensor:
     """
     Compute token weights with special handling for special tokens.
