@@ -41,6 +41,12 @@ class FlowMatchingDatasetWrapper(Dataset):
                 (n_atoms_cumsum >= 0.5).nonzero(as_tuple=True)[0][0].item()
             )
 
+        if self.n_atoms_strategy == "uniform":
+            n_atoms_dist = self.distributions.n_atoms_distribution
+            nonzero_idx = (n_atoms_dist > 0).nonzero(as_tuple=True)[0]
+            self._n_atoms_min = max(int(nonzero_idx[0].item()) - 5, 3)
+            self._n_atoms_max = int(nonzero_idx[-1].item()) + 5
+
 
     def _get_n_atoms(self, target):
         if self.n_atoms_strategy == "fixed":
@@ -50,6 +56,8 @@ class FlowMatchingDatasetWrapper(Dataset):
             return max(3, n)
         elif self.n_atoms_strategy == "median":
             return self._median_n_atoms
+        elif self.n_atoms_strategy == "uniform":
+            return int(torch.randint(self._n_atoms_min, self._n_atoms_max + 1, (1,)).item())
         else:
             return None
 

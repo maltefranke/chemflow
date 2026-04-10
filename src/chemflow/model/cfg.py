@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from rdkit.Chem import GetPeriodicTable
 
-
+from chemflow.dataset.qm9 import QM9_PROPERTY_NAMES
 from chemflow.model.embedding import (
     CountEmbedding,
     SinusoidalEncoding,
@@ -51,6 +51,7 @@ class CFGAdapter:
         mw_cfg_dropout_prob: float = 0.15,
         mw_cfg_guidance_scale: float = 0.0,
         atom_tokens: list[str] | None = None,
+        property_names: list[str] | None = None,
     ):
         self.model = model
         self.cfg_dropout_prob = float(cfg_dropout_prob)
@@ -60,6 +61,17 @@ class CFGAdapter:
         self.mw_cfg_dropout_prob = float(mw_cfg_dropout_prob)
         self.mw_cfg_guidance_scale = float(mw_cfg_guidance_scale)
         self.atom_tokens = atom_tokens
+
+        if property_names is not None:
+            unknown = [n for n in property_names if n not in QM9_PROPERTY_NAMES]
+            if unknown:
+                raise ValueError(
+                    f"Unknown property name(s): {unknown}. "
+                    f"Valid names: {sorted(QM9_PROPERTY_NAMES)}"
+                )
+            self.property_indices: list[int] | None = [QM9_PROPERTY_NAMES[n] for n in property_names]
+        else:
+            self.property_indices = None
 
     @property
     def _cfg_embedding(self):
@@ -84,7 +96,10 @@ class CFGAdapter:
         if not self._has_property_conditioning:
             return None
         if hasattr(mols_t, "y") and mols_t.y is not None:
-            return mols_t.y.float()
+            y = mols_t.y.float()
+            if self.property_indices is not None:
+                y = y[:, self.property_indices]
+            return y
         return None
 
     def extract_target_n_atoms(self, mols) -> torch.Tensor | None:
@@ -319,12 +334,19 @@ def _encode_signal(
     """Shared logic for encoding a single CFG signal with dropout."""
     if value is None:
         return null_emb.unsqueeze(0).expand(batch_size, -1)
+    
     if value.ndim == 1:
         value = value.unsqueeze(-1) if value.dtype.is_floating_point else value
     emb = encoder(value)
+
     if drop_mask is not None:
         null = null_emb.unsqueeze(0).expand_as(emb)
         emb = torch.where(drop_mask.unsqueeze(-1), null, emb)
+    else:
+        # drop_mask is None when dropout_prob=0.  Still route null_emb through
+        # the autograd graph (with zero weight) so DDP does not flag it as an
+        # unused parameter, while leaving the output numerically unchanged.
+        emb = emb + null_emb.sum() * 0
     return emb
 
 

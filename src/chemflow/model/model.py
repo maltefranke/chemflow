@@ -33,7 +33,6 @@ class EmbeddingBackbone(nn.Module):
         edge_type_embedding_args: DictConfig,
         time_embedding_args: DictConfig,
         node_count_embedding_args: DictConfig,
-        bond_degree_embedding_args: Optional[DictConfig] = None,
         cfg_embedding_args: Optional[DictConfig] = None,
         *,
         h0_input_dim: int,
@@ -46,12 +45,6 @@ class EmbeddingBackbone(nn.Module):
         self.edge_type_embedding = hydra.utils.instantiate(edge_type_embedding_args)
         self.time_embedding = hydra.utils.instantiate(time_embedding_args)
         self.node_count_embedding = hydra.utils.instantiate(node_count_embedding_args)
-
-        self.bond_degree_embedding = None
-        if bond_degree_embedding_args is not None:
-            self.bond_degree_embedding = hydra.utils.instantiate(
-                bond_degree_embedding_args
-            )
 
         self.cfg_embedding = None
         if cfg_embedding_args is not None:
@@ -85,10 +78,6 @@ class EmbeddingBackbone(nn.Module):
                 batch_size=num_graphs,
             )
             embeddings_to_concat.append(cfg_embed[batch])
-
-        if self.bond_degree_embedding is not None:
-            struct_embed = self.bond_degree_embedding(e, edge_index[0], a.shape[0])
-            embeddings_to_concat.append(struct_embed)
 
         h_0 = torch.cat(embeddings_to_concat, dim=-1)
         h_0 = self.h0_projection(h_0)

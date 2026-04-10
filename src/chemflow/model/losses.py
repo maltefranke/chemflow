@@ -99,8 +99,6 @@ def typed_gmm_loss(
     # Target: [N, 3] -> [N, 1, 3] to broadcast against dist [N, 1, K]
     log_prob_x = x_dist.log_prob(target_x) / D  # Result: [N, 1, K]
 
-    # handle shrinking variance --> makes it MSE-like loss
-    # log_prob_x = log_prob_x * 2 * (sigma_t.pow(2)).clamp(min=1e-5).reshape(N, 1, 1)
 
     # B. Type Log-Prob
     # TODO maybe we have to implement a weighted log_prob for the types
