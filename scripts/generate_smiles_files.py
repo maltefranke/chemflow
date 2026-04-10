@@ -11,7 +11,10 @@ import os
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
+from rdkit import Chem
 from tqdm import tqdm
+
+from chemflow.utils.rdkit import smiles_from_mol
 
 OmegaConf.register_new_resolver("oc.eval", eval)
 OmegaConf.register_new_resolver("len", lambda x: len(x))
@@ -31,13 +34,16 @@ def generate_qm9(root: str) -> None:
 
     for split in ("train", "val", "test"):
         smiles_path = os.path.join(root, "processed", f"{split}_smiles.txt")
-        if os.path.exists(smiles_path):
-            print(f"Skipping {split}: {smiles_path} already exists")
-            continue
 
         ds = RevisedQM9(root)
         ds.load(split)
-        smiles = [ds.get(i).smiles for i in tqdm(range(len(ds)), desc=split)]
+        raw = [ds.get(i).smiles for i in tqdm(range(len(ds)), desc=split)]
+        smiles = [
+            s for s in (
+                smiles_from_mol(Chem.MolFromSmiles(smi), canonical=True)
+                for smi in raw if smi
+            ) if s is not None
+        ]
         write_smiles_file(smiles, smiles_path)
 
 
@@ -46,12 +52,15 @@ def generate_geom(root: str) -> None:
 
     for split in ("train", "val", "test"):
         smiles_path = os.path.join(root, "processed", f"{split}_smiles.txt")
-        if os.path.exists(smiles_path):
-            print(f"Skipping {split}: {smiles_path} already exists")
-            continue
 
         ds = GEOM(root, split)
-        smiles = [ds.get(i).smiles for i in tqdm(range(len(ds)), desc=split)]
+        raw = [ds.get(i).smiles for i in tqdm(range(len(ds)), desc=split)]
+        smiles = [
+            s for s in (
+                smiles_from_mol(Chem.MolFromSmiles(smi), canonical=True)
+                for smi in raw if smi
+            ) if s is not None
+        ]
         write_smiles_file(smiles, smiles_path)
 
 

@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from chemflow.dataset.molecule_data import MoleculeData
 from chemflow.dataset.vocab import Distributions, Vocab
-from chemflow.utils.rdkit import BOND_IDX_MAP, mol_is_valid, sanitize_mol_correctly
+from chemflow.utils.rdkit import BOND_IDX_MAP, mol_is_valid, sanitize_mol_correctly, smiles_from_mol
 from chemflow.utils.utils import (
     edge_types_to_symmetric,
     token_to_index,
@@ -67,7 +67,7 @@ def process_one_conformer(mol: Chem.Mol):
             edge_index = edge_index[:, perm]
             edge_type = edge_type[perm]
 
-        smiles = Chem.MolToSmiles(mol, isomericSmiles=False)
+        smiles = smiles_from_mol(mol, canonical=True) or ""
 
         data = Data(
             z=z,

@@ -1114,16 +1114,6 @@ class LightningModuleRates(pl.LightningModule):
             "monitor": self.optimizer_config.monitor,
         }
 
-    def on_train_epoch_start(self) -> None:
-        """Push the current epoch into the train dataset wrapper for annealing."""
-        try:
-            dl = self.trainer.train_dataloader
-            ds = getattr(dl, "dataset", None)
-            if ds is not None and hasattr(ds, "set_epoch"):
-                ds.set_epoch(self.current_epoch)
-        except Exception:
-            pass
-
     def on_before_optimizer_step(self, optimizer):
         # Compute the 2-norm for each layer
         # If using mixed precision, the gradients are already unscaled here
