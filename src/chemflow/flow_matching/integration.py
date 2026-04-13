@@ -90,7 +90,9 @@ class RateIntegrator:
         self.edge_aligner = EdgeAligner()
 
         n_atoms_distribution = self.distributions.n_atoms_distribution
-        self.max_atoms = len(n_atoms_distribution) + 1
+        # NOTE true max_atoms would be 2* max(n_atoms_distr) to account for ins / del, 
+        # but we add a buffer instead to be safe and avoid OOM errors
+        self.max_atoms = len(n_atoms_distribution) + 10 # add some buffer
 
         self._cat_atom = torch.distributions.Categorical(
             probs=distributions.atom_type_distribution.to(device)

@@ -13,7 +13,7 @@ move_noise_scale: 0.2
 preprocessing:
   _target_: chemflow.dataset.preprocessing.Preprocessing
   _recursive_: false
-  root: ${data.root_path}/qm9
+  root: ${data.root_path}/geom
   train_dataset: ${data.datamodule.datasets.train}
   atom_tokens_path: ${data.preprocessing.root}/processed/atom_tokens.txt
   edge_tokens_path: ${data.preprocessing.root}/processed/edge_tokens.txt
@@ -50,22 +50,22 @@ datamodule:
 
   datasets:
     train:
-      _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
-      root: ${data.root_path}/qm9
+      _target_: chemflow.dataset.geom.FlowMatchingGEOMDataset
+      root: ${data.root_path}/geom
       vocab: ${data.vocab}
       distributions: None
       rotate: ${model.rotate}
       
     val:
-      - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
-        root: ${data.root_path}/qm9
+      - _target_: chemflow.dataset.geom.FlowMatchingGEOMDataset
+        root: ${data.root_path}/geom
         vocab: ${data.vocab}
         distributions: None
         rotate: ${model.rotate}
 
     test:
-      - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
-        root: ${data.root_path}/qm9
+      - _target_: chemflow.dataset.geom.FlowMatchingGEOMDataset
+        root: ${data.root_path}/geom
         vocab: ${data.vocab}
         distributions: None
         rotate: ${model.rotate}
@@ -79,8 +79,8 @@ datamodule:
     predict: 10
 
   batch_size:
-    train: 304
-    val: 128
+    train: 64
+    val: 64
     test: 32
 
   n_atoms_strategy: ${data.n_atoms_strategy}
