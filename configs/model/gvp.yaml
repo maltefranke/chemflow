@@ -1,0 +1,229 @@
+## GVP backbone model config
+## Based on egnn.yaml, backbone swapped to GVPBB.
+gmm_params:
+    K: 5
+    D: 3
+
+rotate: false
+
+output_dim_typed: ${oc.eval:"${model.gmm_params.K} * (2 + ${model.gmm_params.D} + ${len:${data.vocab.atom_tokens}} + ${len:${data.vocab.charge_tokens}})"}
+output_dim_untyped: ${oc.eval:"${model.gmm_params.K} * (3 +  ${model.gmm_params.D})"}
+
+integrator:
+  _target_: chemflow.flow_matching.integration.RateIntegrator
+  vocab: ${data.vocab}
+  distributions: None
+  gmm_params: ${model.gmm_params}
+  n_atoms_strategy: ${data.n_atoms_strategy}
+  time_strategy: log
+  num_integration_steps: 200
+  ins_noise_scale: ${data.ins_noise_scale}
+  del_schedule: ${data.interpolator.del_schedule}
+  ins_schedule: ${data.interpolator.ins_schedule}
+  sub_schedule: ${data.interpolator.sub_schedule}
+  sub_e_schedule: ${data.interpolator.sub_e_schedule}
+
+
+beta_sched:
+  _target_: torch.distributions.Beta
+  concentration1: 2.0
+  concentration0: 1.0
+
+linear_sched:
+  _target_: torch.distributions.Uniform
+  low: 0.0
+  high: 1.0
+
+sample_time_strategy: linear
+
+module:
+  _target_: chemflow.model.lightning_module.LightningModuleRates
+  gmm_params: ${model.gmm_params}
+  n_atoms_strategy: ${data.n_atoms_strategy}
+  ins_noise_scale: ${data.ins_noise_scale}
+  ema_decay: 0.999
+  use_ema_for_eval: false
+  use_time_weights: false
+  time_dist: ${if:${eq:${model.sample_time_strategy}, log}, ${model.beta_sched}, ${model.linear_sched}}
+
+  cfg_adapter: ${cfg.cfg_adapter}
+
+  integrator: ${model.integrator}
+
+  vocab: ${data.vocab}
+
+  use_learnable_loss_weights: false
+  loss_weights:
+    l_do_sub_a: 1.0
+    l_sub_a_class: 1.0
+    l_do_sub_e: 1.0
+    l_sub_e_class: 1.0
+    l_do_del: 1.0
+    l_do_ins: 1.0
+    l_ins_rate: 1.0
+    l_ins_gmm: 1.0
+    l_ins_e: 1.0
+    l_x: 1.0
+    l_c: 1.0
+
+  optimizer_config:
+    optimizer:
+      _target_: torch.optim.AdamW
+      lr: 1e-4
+      betas: [0.9, 0.999]
+      weight_decay: 1e-12
+      fused: true
+
+    scheduler:
+      _target_: chemflow.utils.lr_schedulers.CosineWarmupLR
+      max_lr: 5e-4
+      min_lr: 2e-4
+      warmup_steps: 1000
+      total_steps: 350000
+
+    interval: step
+    monitor: null
+
+  model:
+    _target_: chemflow.model.model.BackboneWithHeads
+    _recursive_: false
+
+    embedding_backbone_args: ${model.embedding_backbone}
+
+    backbone_model_args: ${model.backbone}
+
+    heads_args: ${model.heads}
+    ins_gmm_head_args: ${model.gmm_head_args}
+
+    ins_edge_head_args:
+      _target_: chemflow.model.heads.InsertionEdgeHead
+      _recursive_: false
+      hidden_dim: ${model.backbone.d_scalar}
+      n_edge_types: ${len:${data.vocab.edge_tokens}}
+      n_atom_types: ${len:${data.vocab.atom_tokens}}
+      n_charge_types: ${len:${data.vocab.charge_tokens}}
+      rbf_embedding_args:
+        _target_: chemflow.model.embedding.RBFEmbedding
+        num_rbf: 128
+        rbf_dmax: 3.5
+        out_dim: 64
+        dropout: 0.0
+        trainable: false
+
+atom_type_embedding:
+  _target_: chemflow.model.embedding.Embedding
+  num_embeddings: ${len:${data.vocab.atom_tokens}}
+  embedding_dim: 64
+  out_dim: 128
+
+edge_type_embedding:
+  _target_: chemflow.model.embedding.Embedding
+  num_embeddings: ${len:${data.vocab.edge_tokens}}
+  embedding_dim: 64
+  out_dim: 128
+
+time_embedding:
+  _target_: chemflow.model.embedding.TimeEmbedding
+  embedding_dim: 64
+  out_dim: 128
+
+node_count_embedding:
+  _target_: chemflow.model.embedding.CountEmbedding
+  embedding_dim: 64
+  out_dim: 128
+
+token_weighting:
+  type_loss_token_weights: uniform
+  weight_alpha: 0.4
+
+embedding_backbone:
+  _target_: chemflow.model.model.EmbeddingBackbone
+  _recursive_: false
+  atom_type_embedding_args: ${model.atom_type_embedding}
+  edge_type_embedding_args: ${model.edge_type_embedding}
+  time_embedding_args: ${model.time_embedding}
+  node_count_embedding_args: ${model.node_count_embedding}
+  cfg_embedding_args: ${cfg.cfg_embedding}
+  h0_input_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${cfg.cfg_embed_dim}"}
+  h0_projection_dim: ${model.backbone.d_scalar}
+  e_input_dim: ${model.edge_type_embedding.out_dim}
+  e_projection_dim: ${model.backbone.d_edge}
+
+backbone:
+  _target_: chemflow.model.backbones.gvp_bb.GVPBB
+  _recursive_: false
+  d_scalar: 256
+  n_vectors: 16
+  d_edge: 128
+  n_layers: 6
+  drop_rate: 0.1
+  rbf_embedding_args:
+    _target_: chemflow.model.embedding.RBFEmbedding
+    num_rbf: 128
+    rbf_dmax: 3.5
+    out_dim: 64
+    dropout: 0.0
+    trainable: false
+
+heads:
+  _target_: chemflow.model.heads.MultiHeadModule
+
+  heads_configs:
+    graph_aggregation: mean
+
+    node_heads:
+      atom_type_head:
+        input_dim: ${model.backbone.d_scalar}
+        output_dim: ${len:${data.vocab.atom_tokens}}
+        hidden_dim: 128
+
+      charge_head:
+        input_dim: ${model.backbone.d_scalar}
+        output_dim: ${len:${data.vocab.charge_tokens}}
+        hidden_dim: 128
+
+      ins_rate_head:
+        input_dim: ${model.backbone.d_scalar}
+        output_dim: 1
+        hidden_dim: 128
+
+      do_ins_head:
+        input_dim: ${model.backbone.d_scalar}
+        output_dim: 1
+        hidden_dim: 128
+
+      do_del_head:
+        input_dim: ${model.backbone.d_scalar}
+        output_dim: 1
+        hidden_dim: 128
+
+      do_sub_a_head:
+        input_dim: ${model.backbone.d_scalar}
+        output_dim: 1
+        hidden_dim: 128
+
+    edge_heads:
+      edge_type_head:
+        input_dim: ${model.backbone.d_edge}
+        output_dim: ${len:${data.vocab.edge_tokens}}
+        hidden_dim: 128
+
+      do_sub_e_head:
+        input_dim: ${model.backbone.d_edge}
+        output_dim: 1
+        hidden_dim: 128
+
+gmm_head_args:
+  _target_: chemflow.model.heads.EquivariantGMMHead
+  _recursive_: false
+  hidden_dim: ${model.backbone.d_scalar}
+  K: ${model.gmm_params.K}
+  N_a: ${len:${data.vocab.atom_tokens}}
+  N_c: ${len:${data.vocab.charge_tokens}}
+  rbf_embedding_args:
+    _target_: chemflow.model.embedding.RBFEmbedding
+    num_rbf: 128
+    rbf_dmax: 3.5
+    out_dim: 64
+    dropout: 0.0
+    trainable: false
