@@ -260,21 +260,22 @@ class RateIntegrator:
 
         # Fail-safe: ensure that the number of atoms per graph won't be greater than the max number of atoms
         if do_ins.any():
-            for g in range(num_graphs):
-                graph_mask = batch_id == g
-                n_atoms_g = x_t[graph_mask].shape[0]
-                n_inserts_g = do_ins[graph_mask].sum().item()
-
-                if n_atoms_g + n_inserts_g > self.max_atoms:
-                    # pick random insertions until n_max_atoms is reached
-                    n_to_remove = n_atoms_g + n_inserts_g - self.max_atoms
-                    removed_indices = torch.where(graph_mask & do_ins)[0]
-                    # random permutation of the indices
+            n_atoms_per_graph = torch.bincount(batch_id, minlength=num_graphs)
+            n_ins_per_graph = torch.bincount(
+                batch_id[do_ins], minlength=num_graphs
+            )
+            overflow = (
+                n_atoms_per_graph + n_ins_per_graph - self.max_atoms
+            ).clamp(min=0)
+            if overflow.any():
+                overflow_graphs = torch.nonzero(overflow, as_tuple=False).flatten().tolist()
+                for g in overflow_graphs:
+                    n_to_remove = int(overflow[g].item())
+                    removed_indices = torch.where((batch_id == g) & do_ins)[0]
                     removed_indices = removed_indices[
-                        torch.randperm(removed_indices.shape[0])
+                        torch.randperm(removed_indices.shape[0], device=do_ins.device)
                     ]
-                    removed_indices = removed_indices[:n_to_remove]
-                    do_ins[removed_indices] = False
+                    do_ins[removed_indices[:n_to_remove]] = False
 
         """NODE DELETION or SUBSTITUTION"""
         # 1. Scale probabilities by time (converting prob -> rate * dt)
@@ -356,17 +357,20 @@ class RateIntegrator:
             keep_mask = ~do_del
 
             # Fail-safe: prevent deletion of entire sample (keep at least 2 nodes per batch_id)
-            num_graphs_safe = batch_id.max().item() + 1
-            for g in range(num_graphs_safe):
-                graph_mask = batch_id == g
-                n_kept = (keep_mask & graph_mask).sum().item()
-                if n_kept < 2:
-                    n_to_restore = 2 - n_kept
-                    deleted_in_graph_idx = torch.where(graph_mask & do_del)[0]
+            n_kept_per_graph = torch.bincount(
+                batch_id[keep_mask], minlength=num_graphs
+            )
+            under = (2 - n_kept_per_graph).clamp(min=0)
+            if under.any():
+                under_graphs = torch.nonzero(under, as_tuple=False).flatten().tolist()
+                for g in under_graphs:
+                    n_to_restore = int(under[g].item())
+                    deleted_in_graph_idx = torch.where(
+                        (batch_id == g) & do_del
+                    )[0]
                     n_restore = min(n_to_restore, deleted_in_graph_idx.shape[0])
                     if n_restore > 0:
-                        restore_indices = deleted_in_graph_idx[:n_restore]
-                        keep_mask[restore_indices] = True
+                        keep_mask[deleted_in_graph_idx[:n_restore]] = True
 
             original_to_postdel = torch.full(
                 (N_original,), -1, dtype=torch.long, device=self.device

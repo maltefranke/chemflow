@@ -89,11 +89,17 @@ class LightningModuleRates(pl.LightningModule):
         use_time_weights: bool = False,
     ):
         super().__init__()
-
+        
+        self.model = hydra.utils.instantiate(model)
+        
+        # vocab and distributions
         self.vocab = vocab
         self.distributions = distributions
         self.loss_weight_distributions = loss_weight_distributions
+
         self.ins_noise_scale = ins_noise_scale
+
+        # setup ema scheduler
         self.ema_decay = float(ema_decay)
         if isinstance(ema_decay_scheduler, DictConfig):
             ema_decay_scheduler = hydra.utils.instantiate(ema_decay_scheduler)
@@ -104,23 +110,19 @@ class LightningModuleRates(pl.LightningModule):
         self.n_atoms_strategy = n_atoms_strategy
         self.time_dist = hydra.utils.instantiate(time_dist)
 
-        loss_weight_values = {k: float(v) for k, v in loss_weights.items()}
-        self.optimizer_config = optimizer_config
-
         self.integrator = hydra.utils.instantiate(
             integrator, distributions=self.distributions
         )
 
+        # weights for class losses
         self.register_buffer("atom_type_weights", atom_type_weights)
         self.register_buffer("edge_token_weights", edge_token_weights)
         self.register_buffer("charge_token_weights", charge_token_weights)
 
+        # metrics tracking for validation
         self.metrics = metrics
         self.stability_metrics = stability_metrics
-
-        self.save_hyperparameters(ignore=["ema_decay_scheduler", "metrics", "stability_metrics"])
-        self.model = hydra.utils.instantiate(model)
-
+        
         self.cfg_adapter = hydra.utils.instantiate(
             cfg_adapter,
             model=self.model,
@@ -133,14 +135,18 @@ class LightningModuleRates(pl.LightningModule):
             p.requires_grad = False
         self.model_ema.eval()
 
+        # handling of edge utilities, especially for upper-triangular handling
         self.edge_aligner = EdgeAligner()
 
+        # set up loss weighting for individual loss components
+        loss_weight_values = {k: float(v) for k, v in loss_weights.items()}
         self.loss_weight_wrapper = UnifiedWeightedLoss(
             manual_weights=loss_weight_values,
             component_keys=list(loss_weight_values.keys()),
             use_learnable=use_learnable_loss_weights,
         )
 
+        # optionally weigh by interpolation time
         if use_time_weights:
             time_weights = {
                 "x": InverseSquaredTimeLossWeighting(clamp_max=100.0),
@@ -152,11 +158,18 @@ class LightningModuleRates(pl.LightningModule):
         else:
             time_weights = {}
 
+        # object to tie loss computation, weighting, and logging together
         self.loss_accumulator = LossAccumulator(
             self.loss_weight_wrapper, self.LOSS_GROUPS, self.device, time_weights
         )
 
+        self.optimizer_config = optimizer_config
+
         self.is_compiled = False
+
+        # lastly, save hyperparameters
+        self.save_hyperparameters(ignore=["ema_decay_scheduler", "metrics", "stability_metrics"])
+
 
     def compile(self):
         """Compile the model using torch.compile."""
@@ -746,9 +759,15 @@ class LightningModuleRates(pl.LightningModule):
         t = torch.zeros(batch_size, device=self.device)
         step_sizes = self.integrator.get_time_steps()
 
-        # Trajectory storage (only used when return_traj=True)
-        mol_traj = [mol_t.clone()] if return_traj else None
-        mol_last = None
+        def _scaled_cpu_snapshot(m):
+            """Scale coords back to data units and move a detached copy to CPU."""
+            snap = m.clone()
+            snap.x = snap.x * self.distributions.coordinate_std
+            return snap.to("cpu")
+
+        # Trajectory storage (only used when return_traj=True).
+        # Frames live on CPU to avoid linear GPU growth over the integration loop.
+        mol_traj = [_scaled_cpu_snapshot(mol_t)] if return_traj else None
 
         # previous outputs for self-conditioning. none at the beginning
         preds = None
@@ -774,6 +793,8 @@ class LightningModuleRates(pl.LightningModule):
                 prev_preds,
                 cfg_inputs,
             )
+            # Release previous step's preds as soon as self-conditioning no longer needs them.
+            del prev_preds
 
             # Extract predictions
             x1_pred = preds["pos_head"]  # (N_total, D)
@@ -807,23 +828,12 @@ class LightningModuleRates(pl.LightningModule):
             gmm_dict_pred = preds["gmm_head"]
 
             # Extract decision heads (scalar logits, will be passed through sigmoid in integration)
-            do_sub_a_logits = preds["do_sub_a_head"]  # Shape (N, 1) or (N,)
-            do_sub_e_logits = preds["do_sub_e_head"]  # Shape (E, 1) or (E,)
-            do_del_logits = preds["do_del_head"]  # Shape (N, 1) or (N,)
-
-            # Reshape logits to 1D
-            do_sub_a_logits = do_sub_a_logits.view(-1)
-            do_sub_e_logits = do_sub_e_logits.view(-1)
-            do_del_logits = do_del_logits.view(-1)
-
-            # Apply sigmoid to convert logits to probabilities
-            do_sub_a_probs = torch.sigmoid(do_sub_a_logits)
-            do_sub_e_probs = torch.sigmoid(do_sub_e_logits)
-            do_del_probs = torch.sigmoid(do_del_logits)
+            do_sub_a_probs = torch.sigmoid(preds["do_sub_a_head"].view(-1))
+            do_sub_e_probs = torch.sigmoid(preds["do_sub_e_head"].view(-1))
+            do_del_probs = torch.sigmoid(preds["do_del_head"].view(-1))
 
             # Extract insertion rate prediction (number of insertions per node)
-            ins_rate_output = preds["ins_rate_head"]
-            num_ins_pred = ins_rate_output.view(-1)  # Shape (N, 1) or (N,)
+            num_ins_pred = preds["ins_rate_head"].view(-1)
 
             # If we fix the number of atoms, we will not use the jump process
             if self.n_atoms_strategy == "fixed":
@@ -832,11 +842,12 @@ class LightningModuleRates(pl.LightningModule):
 
             # Get insertion edge head if available
             ins_edge_head = getattr(model, "ins_edge_head", None)
+            h_latent = preds["h_latent"]
 
             # Integrate one step (edge prediction happens inside if head is provided)
             mol_t = self.integrator.integrate_step_gnn(
                 mol_t=mol_t.clone(),
-                mol_1_pred=mol_1_pred.clone(),
+                mol_1_pred=mol_1_pred,
                 do_sub_a_probs=do_sub_a_probs,
                 do_sub_e_probs=do_sub_e_probs,
                 do_del_probs=do_del_probs,
@@ -844,8 +855,24 @@ class LightningModuleRates(pl.LightningModule):
                 ins_gmm_preds=gmm_dict_pred,
                 t=t,
                 dt=step_size,
-                h_latent=preds.get("h_latent"),
+                h_latent=h_latent,
                 ins_edge_head=ins_edge_head,
+            )
+
+            # Drop per-step intermediates before the next forward pass so the peak
+            # live-tensor count doesn't include two steps' worth of activations.
+            del (
+                mol_1_pred,
+                x1_pred,
+                a_pred,
+                c_pred,
+                e_pred,
+                gmm_dict_pred,
+                do_sub_a_probs,
+                do_sub_e_probs,
+                do_del_probs,
+                num_ins_pred,
+                h_latent,
             )
 
             # remove mean from xt for each batch
@@ -855,15 +882,9 @@ class LightningModuleRates(pl.LightningModule):
             # Number of graphs stays constant (batch_size)
             t = t + step_size
 
-            # correct the coordinates
-            mol_t_cloned = mol_t.clone()
-            mol_t_cloned.x = mol_t_cloned.x * self.distributions.coordinate_std
-
-            # Save state to trajectory or just keep the last frame
+            # Save state to trajectory on CPU; non-traj path only keeps the final frame.
             if return_traj:
-                mol_traj.append(mol_t_cloned)
-            else:
-                mol_last = mol_t_cloned
+                mol_traj.append(_scaled_cpu_snapshot(mol_t))
 
         del preds
 
@@ -880,7 +901,10 @@ class LightningModuleRates(pl.LightningModule):
             return traj_per_mol
 
         else:
-            return mol_last.clone()
+            # Scale coordinates once for the final frame.
+            mol_last = mol_t.clone()
+            mol_last.x = mol_last.x * self.distributions.coordinate_std
+            return mol_last
 
     def configure_optimizers(self):
         # Collect all parameters for the optimizer
