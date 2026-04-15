@@ -24,8 +24,6 @@ integrator:
 
 
 beta_sched:
-  # Beta distribution for time scheduling. 1.0 , 1.0 is equivalent to uniform distribution.
-  # SEMLAFLOW uses 2.0, 1.0
   _target_: torch.distributions.Beta
   concentration1: 2.0
   concentration0: 1.0
@@ -39,7 +37,7 @@ linear_sched:
 sample_time_strategy: linear
 
 module:
-  _target_: chemflow.model.lightning_module_transformer.LightningModuleRatesTransformer
+  _target_: chemflow.model.lightning_module.LightningModuleRates
   # args and kwargs
   # tokens and atom_type_distribution will be passed from preprocessing in run.py
   gmm_params: ${model.gmm_params}
@@ -84,25 +82,13 @@ module:
   # Optimizer configuration
   # AdamW for all parameters.
   optimizer_config:
-    # optimizer:
-    #  _target_: torch.optim.AdamW
-    #  lr: 1e-4
-    #  betas: [0.9, 0.95]
-    #  eps: 1e-8
-    #  weight_decay: 0.0
-
-    # MuonWithAuxAdam config (kept for reference):
-    optimizer:  # no _target_ -> triggers Muon path in configure_optimizers
-      lr: 0.005
-      momentum: 0.95
-      weight_decay: 0.0
-    aux_optimizer:
-      lr: 1e-4
+    optimizer:
+      _target_: torch.optim.AdamW
+      lr: 3e-4
       betas: [0.9, 0.95]
-      eps: 1e-10
+      eps: 1e-8
       weight_decay: 0.0
-    emb_optimizer:
-      lr: 1e-4
+
 
     scheduler:
       _target_: chemflow.utils.lr_schedulers.MultiGroupCosineWarmupLR
@@ -129,7 +115,7 @@ module:
     ins_edge_head_args:
       _target_: chemflow.model.heads.InsertionEdgeHead
       _recursive_: false
-      hidden_dim: ${model.backbone.d_model}
+      hidden_dim: ${model.backbone.d_scalar}
       n_edge_types: ${len:${data.vocab.edge_tokens}}
       n_atom_types: ${len:${data.vocab.atom_tokens}}
       n_charge_types: ${len:${data.vocab.charge_tokens}}
@@ -176,24 +162,25 @@ embedding_backbone:
   node_count_embedding_args: ${model.node_count_embedding}
   cfg_embedding_args: ${cfg.cfg_embedding}
   h0_input_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${cfg.cfg_embed_dim}"}
-  h0_projection_dim: ${model.backbone.d_model}
+  h0_projection_dim: ${model.backbone.d_scalar}
   e_input_dim: ${model.edge_type_embedding.out_dim}
   e_projection_dim: ${model.backbone.d_edge}
 
 backbone:
-  _target_: chemflow.model.backbones.semla_bb.SemlaBB
+  _target_: chemflow.model.backbones.gvp.GVPBB
   _recursive_: false
-  d_model: 384
-  d_message: 128
-  d_message_hidden: 128
+  d_scalar: 256
+  n_vectors: 16
   d_edge: 128
-  n_layers: 12
-  n_attn_heads: 32
-  bond_refine: True
-  self_cond: False
-  coord_norm: "length"
-  n_coord_sets: 64
-  eps: 1e-6
+  n_layers: 6
+  drop_rate: 0.1
+  rbf_embedding_args:
+    _target_: chemflow.model.embedding.RBFEmbedding
+    num_rbf: 128
+    rbf_dmax: 3.5
+    out_dim: 64
+    dropout: 0.0
+    trainable: false
 
 
 heads:
@@ -205,27 +192,27 @@ heads:
 
     node_heads:
       atom_type_head:
-        input_dim: ${model.backbone.d_model}
+        input_dim: ${model.backbone.d_scalar}
         output_dim: ${len:${data.vocab.atom_tokens}}
         hidden_dim: 128
 
       charge_head:
-        input_dim: ${model.backbone.d_model}
+        input_dim: ${model.backbone.d_scalar}
         output_dim: ${len:${data.vocab.charge_tokens}}
         hidden_dim: 128
 
       ins_rate_head:
-        input_dim: ${model.backbone.d_model}
+        input_dim: ${model.backbone.d_scalar}
         output_dim: 1
         hidden_dim: 128
 
       do_del_head:
-        input_dim: ${model.backbone.d_model}
+        input_dim: ${model.backbone.d_scalar}
         output_dim: 1
         hidden_dim: 128
 
       do_sub_a_head:
-        input_dim: ${model.backbone.d_model}
+        input_dim: ${model.backbone.d_scalar}
         output_dim: 1
         hidden_dim: 128
 
@@ -243,7 +230,7 @@ heads:
 gmm_head_args:
   _target_: chemflow.model.heads.EquivariantGMMHead
   _recursive_: false
-  hidden_dim: ${model.backbone.d_model}
+  hidden_dim: ${model.backbone.d_scalar}
   K: ${model.gmm_params.K}
   N_a: ${len:${data.vocab.atom_tokens}}
   N_c: ${len:${data.vocab.charge_tokens}}

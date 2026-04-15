@@ -8,6 +8,8 @@ Usage:
 """
 
 import os
+import pickle
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -22,6 +24,18 @@ OmegaConf.register_new_resolver("if", lambda cond, t, f: t if cond else f)
 OmegaConf.register_new_resolver("eq", lambda x, y: x == y)
 
 
+def _bytes_to_smiles(b: bytes) -> str:
+    """Extract SMILES from serialized molecule bytes without full Data reconstruction."""
+    return pickle.loads(b)["smiles"]
+
+
+def load_smiles_parallel(ds, desc: str) -> list[str]:
+    """Load .smiles from dataset items in parallel (I/O bound)."""
+    with ThreadPoolExecutor() as pool:
+        raw = list(tqdm(pool.map(lambda i: ds.get(i).smiles, range(len(ds))), total=len(ds), desc=desc))
+    return raw
+
+
 def write_smiles_file(smiles: list[str], path: str) -> None:
     unique = sorted(set(smiles))
     with open(path, "w") as f:
@@ -34,10 +48,9 @@ def generate_qm9(root: str) -> None:
 
     for split in ("train", "val", "test"):
         smiles_path = os.path.join(root, "processed", f"{split}_smiles.txt")
-
         ds = RevisedQM9(root)
         ds.load(split)
-        raw = [ds.get(i).smiles for i in tqdm(range(len(ds)), desc=split)]
+        raw = load_smiles_parallel(ds, desc=split)
         smiles = [
             s for s in (
                 smiles_from_mol(Chem.MolFromSmiles(smi), canonical=True)
@@ -52,15 +65,16 @@ def generate_geom(root: str) -> None:
 
     for split in ("train", "val", "test"):
         smiles_path = os.path.join(root, "processed", f"{split}_smiles.txt")
-
         ds = GEOM(root, split)
-        raw = [ds.get(i).smiles for i in tqdm(range(len(ds)), desc=split)]
-        smiles = [
-            s for s in (
-                smiles_from_mol(Chem.MolFromSmiles(smi), canonical=True)
-                for smi in raw if smi
-            ) if s is not None
-        ]
+        # _mol_bytes is already in memory; skip Data reconstruction and decode
+        # only the smiles field. pickle.loads is CPU-bound so use processes.
+        with ProcessPoolExecutor() as pool:
+            raw = list(tqdm(
+                pool.map(_bytes_to_smiles, ds._mol_bytes, chunksize=512),
+                total=len(ds),
+                desc=split,
+            ))
+        smiles = [s for s in raw if s]
         write_smiles_file(smiles, smiles_path)
 
 

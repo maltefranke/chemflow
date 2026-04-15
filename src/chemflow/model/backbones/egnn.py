@@ -1,4 +1,4 @@
-from src.external_code.egnn import EGNN
+from external_code.egnn import EGNN
 from omegaconf import DictConfig
 import torch
 import torch.nn as nn

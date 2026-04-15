@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
 import hydra
-from chemflow.model.losses import typed_gmm_loss
+from chemflow.model.losses import typed_gmm_loss, do_action_loss, rate_loss, class_loss, reduce_loss
 
 from chemflow.utils.utils import EdgeAligner
 from external_code.egnn import unsorted_segment_mean, unsorted_segment_sum
@@ -104,10 +104,7 @@ class LightningModuleRates(pl.LightningModule):
         self.n_atoms_strategy = n_atoms_strategy
         self.time_dist = hydra.utils.instantiate(time_dist)
 
-        # Strip legacy "l_" prefix from config keys (YAML configs still use it)
-        loss_weight_values = {
-            k.removeprefix("l_"): float(v) for k, v in loss_weights.items()
-        }
+        loss_weight_values = {k: float(v) for k, v in loss_weights.items()}
         self.optimizer_config = optimizer_config
 
         self.integrator = hydra.utils.instantiate(
@@ -198,181 +195,9 @@ class LightningModuleRates(pl.LightningModule):
             logger=True,
         )
 
-    def _reduce_loss(self, loss, reduction: str = "mean"):
-        if reduction == "mean":
-            return loss.mean()
-        elif reduction == "sum":
-            return loss.sum()
-        elif reduction == "none":
-            return loss
-        else:
-            raise ValueError(f"Invalid reduction: {reduction}")
-
-    # fmt: off
-    _LEGACY_BUFFER_KEYS = frozenset({
-        # substitution losses
-        "l_do_sub_a", "l_sub_a_class", "l_do_sub_e", "l_sub_e_class",
-        # deletion and insertion losses
-        "l_do_del", "l_do_ins", "l_ins_rate", "l_ins_gmm", "l_ins_e", "l_ins_e_ii",
-        # move, charge losses
-        "l_x", "l_c",
-        # EMA counts for balancing BCE pos_weight in do_action_loss.
-        "ema_n_ins", "ema_n_del",
-    })
-    # fmt: on
-
-    def load_state_dict(self, state_dict, strict=True):
-        """Load state dict with backward compatibility for old checkpoints."""
-        state_dict = {
-            k: v for k, v in state_dict.items() if k not in self._LEGACY_BUFFER_KEYS
-        }
-        has_ema = any(k.startswith("model_ema.") for k in state_dict)
-        load_strict = strict and has_ema
-        super().load_state_dict(state_dict, strict=load_strict)
-        if not has_ema and self.model_ema is not None:
-            self.model_ema.load_state_dict(self.model.state_dict(), strict=True)
-
     def forward(self, x):
         pass
 
-    def safe_loss(self, loss):
-        """Replace NaN or Inf losses with 0.0 to prevent training instability.
-
-        Returns a zero loss that's connected to the computation graph to ensure
-        gradients can be computed for gradient clipping.
-        """
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"Loss is NaN or Inf, skipping")
-            # Create a zero loss connected to model parameters to maintain gradient flow
-            # Use a small epsilon to avoid disconnecting from the graph
-            dummy_param = next(iter(self.model.parameters()))
-            return (
-                torch.tensor(0.0, device=self.device, dtype=dummy_param.dtype)
-                * dummy_param.sum()
-                * 1e-8  # Small multiplier to keep graph connected but effectively zero
-            )
-        return loss
-
-    def do_action_loss(
-        self,
-        do_action_pred,
-        num_actions,
-        batch,
-        num_graphs,
-        reduction: str = "mean",
-    ):
-        """Calculate the do action loss for the given do action predictions.
-        Is used for all actions (substitutions, deletions).
-
-        Args:
-            do_action_pred: The predicted do action values.
-            num_actions: The number of actions for each node.
-            batch: The batch indices for each node.
-            num_graphs: The number of graphs in the batch.
-        """
-        do_action = num_actions > 0.0
-
-        dtype = do_action_pred.dtype
-        pos_weight = torch.tensor(1.0, device=self.device, dtype=dtype)
-
-        # NOTE: we use BCEWithLogitsLoss for scalar logit predictions
-        # do_action_pred is shape (N,) with logits
-        do_action_loss = F.binary_cross_entropy_with_logits(
-            do_action_pred.view(-1),
-            do_action.float().view(-1),
-            pos_weight=pos_weight,
-            reduction="none",
-        )
-        do_action_loss = unsorted_segment_mean(
-            do_action_loss.view(-1, 1), batch, num_graphs
-        )
-
-        return self._reduce_loss(do_action_loss, reduction)
-
-    def rate_loss(
-        self, rate_pred, num_actions, batch, num_graphs, reduction: str = "mean"
-    ):
-        """
-        Calculate the Poisson NLL rate loss for insertion predictions.
-
-        Args:
-            rate_pred: The predicted rate values, shape (N,) or (N, 1).
-            num_actions: The integer number of actions for each node.
-            batch: The batch indices for each node.
-            num_graphs: The number of graphs in the batch.
-        """
-
-        # Apply Poisson NLL to ALL nodes, including those with zero insertions.
-        rate_loss = F.poisson_nll_loss(
-            rate_pred.view(-1),
-            num_actions.view(-1),
-            log_input=False,
-            reduction="none",
-            full=True,
-        )
-
-        # NOTE: first normalize by number of nodes / graphs
-        # Otherwise, nodes with more atoms will have more weight by design
-        rate_loss = unsorted_segment_mean(rate_loss.view(-1, 1), batch, num_graphs)
-
-        # Every graph contributes since we supervise all nodes.
-        batch_has_modified = torch.ones(
-            num_graphs, 1, dtype=torch.bool, device=rate_pred.device
-        )
-
-        return self._reduce_loss(rate_loss, reduction), batch_has_modified
-
-    def class_loss(
-        self,
-        class_pred,
-        class_target,
-        class_weights,
-        do_action_mask,
-        batch,
-        num_graphs,
-        reduction: str = "mean",
-    ):
-        """
-        Calculate the class loss. Is not applied to masked nodes / edges.
-        Concretely:
-            c: class_loss is applied to all non-del nodes.
-            a: class_loss is applied to all non-del & to-be-substituted nodes.
-            e: class_loss is applied to all edges between non-del nodes that need to be substituted.
-            ins_e : class_loss is applied to all edges between ins & non-del nodes.
-            ins_e_ii: class_loss is applied to all edges between ins & ins nodes.
-        """
-        # 1. Safety check for empty actions to prevent NaNs or crashes
-        if not do_action_mask.any():
-            zero_loss = torch.zeros(num_graphs, 1, device=class_pred.device)
-            zero_mask = torch.zeros(
-                num_graphs, dtype=torch.bool, device=class_pred.device
-            )
-            return self._reduce_loss(zero_loss, reduction), zero_mask
-
-        # 2. Compute CE ONLY on the nodes that actually need modification
-        masked_loss = F.cross_entropy(
-            class_pred[do_action_mask],
-            class_target[do_action_mask],
-            weight=class_weights,
-            reduction="none",
-        )
-
-        # 3. Pool the masked losses per graph
-        class_loss = unsorted_segment_mean(
-            masked_loss.view(-1, 1), batch[do_action_mask], num_graphs
-        )
-
-        # 4. Determine which graphs had modifications
-        batch_has_modified = (
-            unsorted_segment_sum(
-                do_action_mask.float().view(-1, 1),
-                batch,
-                num_graphs,
-            )
-            > 0
-        )
-
-        return self._reduce_loss(class_loss, reduction), batch_has_modified
 
     def shared_step(self, batch, batch_idx):
         self.model.set_training()
@@ -397,6 +222,7 @@ class LightningModuleRates(pl.LightningModule):
             is_random_self_conditioning=is_random_self_conditioning,
             cfg_inputs=cfg_inputs,
         )
+        # NOTE: we separate this from the forward pass because CFG acts on the logits before activations.
         self.model.apply_activations(preds)
 
         a_pred = preds["atom_type_head"]
@@ -418,7 +244,7 @@ class LightningModuleRates(pl.LightningModule):
         non_del_mask = ~to_delete_mask
 
         # NOTE take loss on all non-deletion nodes
-        c_loss, c_batch_mask = self.class_loss(
+        c_loss, c_batch_mask = class_loss(
             c_pred,
             mols_1.c,
             self.charge_token_weights,
@@ -432,7 +258,7 @@ class LightningModuleRates(pl.LightningModule):
 
         #### Handle atom type substitutions
         # NOTE take loss on all nodes
-        do_sub_a_loss = self.do_action_loss(
+        do_sub_a_loss = do_action_loss(
             do_sub_a_head,
             mols_t.lambda_a_sub,
             mols_t.batch,
@@ -441,7 +267,7 @@ class LightningModuleRates(pl.LightningModule):
         # NOTE take loss on all non-deletion & to-be-substituted nodes
         # del nodes have lambda_a_sub = 0 anyway, this is just for clarity
         to_sub_mask = (non_del_mask) & (mols_t.lambda_a_sub > 0.0)
-        sub_a_class_loss, sub_a_batch_mask = self.class_loss(
+        sub_a_class_loss, sub_a_batch_mask = class_loss(
             a_pred,
             mols_1.a,
             self.atom_type_weights,
@@ -468,7 +294,7 @@ class LightningModuleRates(pl.LightningModule):
         non_del_edge_mask = ~to_delete_mask[_src_idx] & ~to_delete_mask[_dst_idx]
 
         # NOTE As per EditFlow, only count class loss for edges that need modification
-        do_sub_e_loss = self.do_action_loss(
+        do_sub_e_loss = do_action_loss(
             do_sub_e_head_triu,
             do_sub_e_target_triu,
             e_batch_triu,
@@ -478,7 +304,7 @@ class LightningModuleRates(pl.LightningModule):
 
         # NOTE take loss on all non-deletion & to-be-substituted edges
         to_sub_edge_mask = (non_del_edge_mask) & (do_sub_e_target_triu > 0.0)
-        sub_e_class_loss, sub_e_batch_mask = self.class_loss(
+        sub_e_class_loss, sub_e_batch_mask = class_loss(
             e_pred_triu,
             e_target_triu,
             self.edge_token_weights,
@@ -503,7 +329,7 @@ class LightningModuleRates(pl.LightningModule):
             )
 
             # 2. Handle deletions (no class changes here!)
-            do_del_loss = self.do_action_loss(
+            do_del_loss = do_action_loss(
                 do_del_head,
                 mols_t.lambda_del,
                 mols_t.batch,
@@ -514,7 +340,7 @@ class LightningModuleRates(pl.LightningModule):
             # 3. Handle insertions
             # Poisson NLL over all nodes (including those with zero insertions).
             ins_loss_gmm = torch.tensor(0.0, device=self.device)
-            ins_loss_rate, ins_batch_mask = self.rate_loss(
+            ins_loss_rate, ins_batch_mask = rate_loss(
                 ins_rate_pred,
                 mols_t.n_ins,
                 mols_t.batch,
@@ -562,8 +388,6 @@ class LightningModuleRates(pl.LightningModule):
                     mols_t.num_graphs,
                 )
 
-                ins_loss_gmm = self._reduce_loss(ins_loss_gmm, "none")
-
                 # Compute insertion edge loss if available
                 # Index spaces:
                 # - ins_edge_spawn_idx / ins_edge_existing_idx index current-state nodes in mols_t
@@ -593,7 +417,7 @@ class LightningModuleRates(pl.LightningModule):
                         if ins_edge_logits is not None and ins_edge_logits.numel() > 0:
                             # Reuse the shared class loss helper (same masking +
                             # per-graph averaging) to compute insertion edge loss.
-                            ins_loss_e, ins_e_batch_mask = self.class_loss(
+                            ins_loss_e, ins_e_batch_mask = class_loss(
                                 ins_edge_logits,
                                 ins_targets.ins_edge_types,
                                 self.edge_token_weights,
@@ -609,30 +433,22 @@ class LightningModuleRates(pl.LightningModule):
                 if spawn_src_ii.numel() > 0:
                     ii_non_del = non_del_mask[spawn_src_ii] & non_del_mask[spawn_dst_ii]
                     if ii_non_del.any():
+                        edges_ii_src = ins_targets.ins_to_ins_edge_src_local_idx
+                        edges_ii_dst = ins_targets.ins_to_ins_edge_dst_local_idx
                         ins_ii_logits = self.model.predict_insertion_edges_ins_to_ins(
                             mols_t=mols_t,
                             out_dict=preds,
                             spawn_src_idx=spawn_src_ii,
-                            ins_x_src=ins_targets.x[
-                                ins_targets.ins_to_ins_edge_src_local_idx
-                            ],
-                            ins_a_src=ins_targets.a[
-                                ins_targets.ins_to_ins_edge_src_local_idx
-                            ],
-                            ins_c_src=ins_targets.c[
-                                ins_targets.ins_to_ins_edge_src_local_idx
-                            ],
-                            ins_a_dst=ins_targets.a[
-                                ins_targets.ins_to_ins_edge_dst_local_idx
-                            ],
-                            ins_x_dst=ins_targets.x[
-                                ins_targets.ins_to_ins_edge_dst_local_idx
-                            ],
+                            ins_x_src=ins_targets.x[edges_ii_src],
+                            ins_a_src=ins_targets.a[edges_ii_src],
+                            ins_c_src=ins_targets.c[edges_ii_src],
+                            ins_a_dst=ins_targets.a[edges_ii_dst],
+                            ins_x_dst=ins_targets.x[edges_ii_dst],
                         )
                         if ins_ii_logits is not None and ins_ii_logits.numel() > 0:
                             # Reuse the shared class loss helper (same masking +
                             # per-graph averaging) to compute ins->ins edge loss.
-                            ins_loss_e_ii, ins_e_ii_batch_mask = self.class_loss(
+                            ins_loss_e_ii, ins_e_ii_batch_mask = class_loss(
                                 ins_ii_logits,
                                 ins_targets.ins_to_ins_edge_types,
                                 self.edge_token_weights,
@@ -724,21 +540,25 @@ class LightningModuleRates(pl.LightningModule):
             }
         )
 
-        loss = self.safe_loss(self.loss_accumulator.total_loss())
-        self.log_dict(self.loss_accumulator.log_dict(), prog_bar=False, logger=True, sync_dist=True)
+        loss = self.loss_accumulator.total_loss()
+        self.log_dict(self.loss_accumulator.log_dict(), prog_bar=False, logger=True)
 
         return loss
 
     def training_step(self, batch, batch_idx):
+        self.model_ema.eval()
         loss = self.shared_step(batch, batch_idx)
-        self.log("loss/train", loss, prog_bar=True, logger=True, sync_dist=True)
+        self.log("loss/train", loss.detach(), prog_bar=True, logger=True)
         return loss
 
+
     def validation_step(self, batch, batch_idx):
+        self.model_ema.eval()
         batched_mols = self.sample(batch, batch_idx, return_traj=False)
 
         # List of MoleculeData objects
         mols = batched_mols.to_data_list()
+        del batched_mols
 
         # List of RDKit molecules or None
         rdkit_mols = []
@@ -755,53 +575,39 @@ class LightningModuleRates(pl.LightningModule):
                 print(f"Error converting molecule to RDKit: {e}")
                 rdkit_mols.append(None)
 
+        n_mols = len(mols)
+        del mols
+
+        # eval_metrics contains Python floats (not GPU tensors)
         eval_metrics = calc_metrics_(rdkit_mols, self.metrics)
         print(eval_metrics)
 
-        # Log validation metrics in val/ group
-        val_metrics_dict = {
-            f"val/{key}": torch.tensor(value, dtype=torch.float32, device=self.device)
-            for key, value in eval_metrics.items()
-        }
         self.log_dict(
-            val_metrics_dict,
+            {f"val/{key}": value for key, value in eval_metrics.items()},
             on_step=False,
             on_epoch=True,
             prog_bar=False,
             logger=True,
-            batch_size=len(mols),
-            sync_dist=True,
+            batch_size=n_mols,
         )
 
         try:
-            pb_metrics = calc_posebusters_metrics(rdkit_mols)
-            print(pb_metrics)
-            # pb_metrics = False
+            #pb_metrics = calc_posebusters_metrics(rdkit_mols)
+            #print(pb_metrics)
+            pb_metrics = False
         except Exception as e:
             print(f"Error calculating PoseBusters metrics: {e}")
             pb_metrics = False
 
         if pb_metrics:
-            pb_metrics_dict = {
-                f"posebusters/{key}": torch.tensor(value, dtype=torch.float32, device=self.device)
-                for key, value in pb_metrics.items()
-            }
             self.log_dict(
-                pb_metrics_dict,
+                {f"posebusters/{key}": value for key, value in pb_metrics.items()},
                 on_step=False,
                 on_epoch=True,
                 prog_bar=False,
                 logger=True,
-                batch_size=len(mols),
-                sync_dist=True,
+                batch_size=n_mols,
             )
-            eval_metrics.update(pb_metrics)
-
-        return eval_metrics
-
-    def test_step(self, batch, batch_idx):
-        # Define the test step logic here
-        pass
 
     def predict_step(self, batch, batch_idx):
         return_traj = bool(getattr(self, "predict_return_traj", True))
@@ -1005,13 +811,10 @@ class LightningModuleRates(pl.LightningModule):
             do_sub_e_logits = preds["do_sub_e_head"]  # Shape (E, 1) or (E,)
             do_del_logits = preds["do_del_head"]  # Shape (N, 1) or (N,)
 
-            # Ensure logits are 1D
-            if do_sub_a_logits.ndim > 1:
-                do_sub_a_logits = do_sub_a_logits.squeeze(-1)
-            if do_sub_e_logits.ndim > 1:
-                do_sub_e_logits = do_sub_e_logits.squeeze(-1)
-            if do_del_logits.ndim > 1:
-                do_del_logits = do_del_logits.squeeze(-1)
+            # Reshape logits to 1D
+            do_sub_a_logits = do_sub_a_logits.view(-1)
+            do_sub_e_logits = do_sub_e_logits.view(-1)
+            do_del_logits = do_del_logits.view(-1)
 
             # Apply sigmoid to convert logits to probabilities
             do_sub_a_probs = torch.sigmoid(do_sub_a_logits)
@@ -1020,11 +823,9 @@ class LightningModuleRates(pl.LightningModule):
 
             # Extract insertion rate prediction (number of insertions per node)
             ins_rate_output = preds["ins_rate_head"]
-            num_ins_pred = ins_rate_output  # Shape (N, 1) or (N,)
-            if num_ins_pred.ndim > 1:
-                num_ins_pred = num_ins_pred.squeeze(-1)
+            num_ins_pred = ins_rate_output.view(-1)  # Shape (N, 1) or (N,)
 
-            # if we fix the number of atoms, we will not use the jump process
+            # If we fix the number of atoms, we will not use the jump process
             if self.n_atoms_strategy == "fixed":
                 num_ins_pred = torch.zeros_like(num_ins_pred)
                 do_del_probs = torch.zeros_like(do_del_probs)
@@ -1063,6 +864,8 @@ class LightningModuleRates(pl.LightningModule):
                 mol_traj.append(mol_t_cloned)
             else:
                 mol_last = mol_t_cloned
+
+        del preds
 
         if return_traj:
             # rectify the trajectory such that we get a traj for each molecule
@@ -1130,45 +933,9 @@ class LightningModuleRates(pl.LightningModule):
         using_native_amp=False,
         using_lbfgs=False,
     ):
-        """
-        Override for the optimizer_step hook.
-
-        This function checks for NaN gradients after the backward pass
-        (which is called inside optimizer_closure()) and skips the
-        optimizer step if any are found.
-        """
-
-        # Run the closure.
-        # This function is provided by Lightning and will:
-        # 1. Clear gradients (optimizer.zero_grad())
-        # 2. Compute the loss (call training_step)
-        # 3. Run the backward pass (loss.backward())
         optimizer_closure()
-
-        # --- Your custom logic starts here ---
-
-        # Check if any gradients are NaN
-        found_nan = False
-        for param in self.parameters():
-            if param.grad is not None and torch.isnan(param.grad).any():
-                found_nan = True
-                break
-
-        if found_nan:
-            # Log or print a warning
-            print(
-                f"WARNING: Skipping optimizer step at epoch {epoch}, batch {batch_idx} due to NaN gradients."
-            )
-
-            # We must manually zero the gradients again
-            # because the new gradients from the next batch
-            # will be *added* to the existing NaN gradients.
-            optimizer.zero_grad(set_to_none=True)
-        else:
-            # No NaN gradients found, proceed with the optimizer step
-            optimizer.step()
-            # Update EMA after successful optimizer step
-            self._update_ema()
+        optimizer.step()
+        self._update_ema()
 
 
 if __name__ == "__main__":

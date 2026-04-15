@@ -140,11 +140,11 @@ class LossAccumulator:
 
         # 1. Log individual components
         for key in self._raw_losses.keys():
-            pure_val = self._raw_losses[key]
+            pure_val = self._raw_losses[key].detach()
 
             # Use current_weights here
             weight_k = current_weights.get(key, 1.0)
-            fully_weighted_val = weight_k * self._tw_losses[key]
+            fully_weighted_val = (weight_k * self._tw_losses[key]).detach()
 
             entries[f"loss/{key}"] = pure_val
             entries[f"loss_weighted/{key}"] = fully_weighted_val
@@ -154,9 +154,9 @@ class LossAccumulator:
 
         # 2. Log group sums
         for group, keys in self._groups.items():
-            pure_terms = [self._raw_losses[k] for k in keys if k in self._raw_losses]
+            pure_terms = [self._raw_losses[k].detach() for k in keys if k in self._raw_losses]
             weighted_terms = [
-                current_weights.get(k, 1.0) * self._tw_losses[k]
+                (current_weights.get(k, 1.0) * self._tw_losses[k]).detach()
                 for k in keys
                 if k in self._tw_losses
             ]

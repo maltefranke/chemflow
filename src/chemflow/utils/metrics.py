@@ -709,7 +709,8 @@ def calc_metrics_(
 ):
     metrics.reset()
     metrics.update(rdkit_mols)
-    results = metrics.compute()
+    raw = metrics.compute()
+    results = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in raw.items()}
 
     if mols is not None and target_n_atoms_distribution is not None:
         if device is None:
@@ -722,14 +723,18 @@ def calc_metrics_(
             target_distribution=target_n_atoms_distribution,
             device=device,
         )
-        results = {**results, **atom_count_results}
+        results = {
+            **results,
+            **{k: v.item() if isinstance(v, torch.Tensor) else v for k, v in atom_count_results.items()},
+        }
 
     if stab_metrics is None:
         return results
 
     stab_metrics.reset()
     stab_metrics.update(mol_stabs)
-    stab_results = stab_metrics.compute()
+    stab_raw = stab_metrics.compute()
+    stab_results = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in stab_raw.items()}
 
     results = {**results, **stab_results}
     return results
