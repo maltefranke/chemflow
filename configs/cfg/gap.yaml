@@ -1,0 +1,37 @@
+cfg_adapter:
+    _target_: chemflow.model.cfg.CFGAdapter
+    cfg_dropout_prob: ${cfg.cfg.property_dropout_prob}
+    cfg_guidance_scale: ${cfg.cfg.property_guidance_scale}
+    natoms_cfg_dropout_prob: 0.0
+    natoms_cfg_guidance_scale: 0.0
+    mw_cfg_dropout_prob: 0.0
+    mw_cfg_guidance_scale: 0.0
+    property_names: ${cfg.cfg.property_names}
+
+# ── Classifier-free guidance ──
+do_cfg: true
+
+cfg:
+  embed_dim: 128
+  # Derived automatically from the property list — do not set manually.
+  num_properties: ${len:${cfg.cfg.property_names}}
+  property_hidden_dim: 128
+  # dropout=0: model always sees the conditioning signal; no unconditional branch is learned.
+  property_dropout_prob: 0.0
+  # scale=1: guided output = uncond + 1*(cond - uncond) = cond exactly.
+  # The model always runs the conditional forward; CFG just passes it through.
+  property_guidance_scale: 1.0
+  # Property names resolved via QM9_PROPERTY_NAMES in chemflow/dataset/qm9.py.
+  property_names: [gap]
+  use_natoms: false
+  use_mw: false
+  embedding:
+    _target_: chemflow.model.cfg.UnifiedCFGEmbedding
+    out_dim: ${cfg.cfg.embed_dim}
+    num_properties: ${cfg.cfg.num_properties}
+    property_hidden_dim: ${cfg.cfg.property_hidden_dim}
+    use_natoms: ${cfg.cfg.use_natoms}
+    use_mw: ${cfg.cfg.use_mw}
+
+cfg_embedding: ${cfg.cfg.embedding}
+cfg_embed_dim: ${cfg.cfg.embed_dim}

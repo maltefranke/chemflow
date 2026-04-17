@@ -1,15 +1,88 @@
 """Code adapted from SemlaFlow"""
 
 import os
+import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 
 import torch
-from rdkit import Chem
+import pandas as pd
+from rdkit import Chem, RDLogger
 from torchmetrics import Metric
 from torchmetrics import MetricCollection
 
 from chemflow.utils import rdkit as chemflowRD
 from chemflow.utils.utils import token_to_index
+
+from posebusters import PoseBusters
+
+import faulthandler
+
+faulthandler.enable()
+
+# Silence RDKit warnings here too (in addition to chemflow.utils.rdkit) because
+# this module may be imported first from some code paths.
+RDLogger.DisableLog("rdApp.*")
+
+
+# ---------------------------------------------------------------------------
+# Shared process pool for CPU-heavy RDKit work (optimise_mol / calc_energy).
+#
+# Why this exists:
+#   * MMFF optimisation + energy calc is Python/C serial per-molecule.
+#   * Running it on the main thread inside validation_step starves the
+#     TorchElastic rendezvous keep-alive thread and triggers
+#     RendezvousTimeoutError on long val cycles.
+#   * We use a "spawn" context so the children do not inherit the parent's
+#     CUDA context (fork + CUDA = undefined behavior).
+#   * The pool is lazy so simply importing metrics.py does not pay the
+#     spawn cost; it starts on the first validation step.
+# ---------------------------------------------------------------------------
+
+_RD_POOL: ProcessPoolExecutor | None = None
+_RD_POOL_MAX_WORKERS = int(os.environ.get("CHEMFLOW_RD_POOL_WORKERS", "4"))
+
+
+def _get_rdkit_pool() -> ProcessPoolExecutor:
+    global _RD_POOL
+    if _RD_POOL is None:
+        affinity = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
+        # Leave at least half the cores for DataLoader workers + rendezvous.
+        n = max(1, min(_RD_POOL_MAX_WORKERS, affinity // 2))
+        _RD_POOL = ProcessPoolExecutor(
+            max_workers=n,
+            mp_context=mp.get_context("spawn"),
+        )
+    return _RD_POOL
+
+
+def _pool_map(fn, items: list) -> list:
+    """Run `fn` over `items` in the shared RDKit pool.
+
+    Falls back to a plain list comprehension if the pool cannot be
+    constructed (e.g. spawn is unavailable) so metrics never break
+    training.
+    """
+    if not items:
+        return []
+    try:
+        pool = _get_rdkit_pool()
+        n_workers = pool._max_workers  # type: ignore[attr-defined]
+        chunk = max(1, len(items) // (n_workers * 4))
+        return list(pool.map(fn, items, chunksize=chunk))
+    except Exception:
+        return [fn(x) for x in items]
+
+
+def _rd_optimise_mol(mol):
+    return chemflowRD.optimise_mol(mol)
+
+
+def _rd_calc_energy(mol):
+    return chemflowRD.calc_energy(mol)
+
+
+def _rd_calc_energy_per_atom(mol):
+    return chemflowRD.calc_energy(mol, per_atom=True)
 
 
 _BOND_TYPE_TO_EDGE_TOKEN = {
@@ -70,9 +143,7 @@ def _rdkit_mols_edge_type_indices(
     return torch.tensor(vals, dtype=torch.long, device=device)
 
 
-def _kl_divergence(
-    gen: torch.Tensor, target: torch.Tensor, eps: float
-) -> torch.Tensor:
+def _kl_divergence(gen: torch.Tensor, target: torch.Tensor, eps: float) -> torch.Tensor:
     return torch.sum(
         gen * (torch.log(gen.clamp(min=eps)) - torch.log(target.clamp(min=eps)))
     )
@@ -116,6 +187,7 @@ def atom_count_distribution_metrics(
     target = target / target.sum().clamp(min=eps)
 
     return {"atom_count_dist_kl": _kl_divergence(gen, target, eps)}
+
 
 def calc_atom_stabilities(mol):
     problems = Chem.DetectChemistryProblems(mol)
@@ -233,7 +305,9 @@ class AtomCountDistributionMetric(GenerativeMetric):
         )
         counts_t = counts_t.clamp(min=0, max=self.target_len - 1)
 
-        hist = torch.bincount(counts_t, minlength=self.target_len).to(dtype=torch.float32)
+        hist = torch.bincount(counts_t, minlength=self.target_len).to(
+            dtype=torch.float32
+        )
         self.gen_hist += hist
         self.n_total += float(len(counts))
 
@@ -363,11 +437,7 @@ class Validity(GenerativeMetric):
         self.add_state("total", default=torch.tensor(0), dist_reduce_fx="sum")
 
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
-        is_valid = [
-            chemflowRD.mol_is_valid(mol)
-            for mol in mols
-            if mol is not None
-        ]
+        is_valid = [chemflowRD.mol_is_valid(mol) for mol in mols if mol is not None]
         self.valid += sum(is_valid)
         self.total += len(mols)
 
@@ -384,13 +454,13 @@ class Uniqueness(GenerativeMetric):
         self.valid_smiles = []
 
     def reset(self):
+        # Chain to the base Metric.reset() so that torchmetrics' internal
+        super().reset()
         self.valid_smiles = []
 
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
         smiles = [
-            Chem.MolToSmiles(mol, canonical=True)
-            for mol in mols
-            if mol is not None
+            Chem.MolToSmiles(mol, canonical=True) for mol in mols if mol is not None
         ]
         valid_smiles = [smi for smi in smiles if smi is not None]
         self.valid_smiles.extend(valid_smiles)
@@ -401,23 +471,26 @@ class Uniqueness(GenerativeMetric):
         return uniqueness
 
 
+def _canonical_smiles(smi: str) -> str | None:
+    mol = Chem.MolFromSmiles(smi)
+    if mol is None:
+        return None
+    return Chem.MolToSmiles(mol, canonical=True)
+
+
 class Novelty(GenerativeMetric):
-    def __init__(self, existing_mols: list[Chem.rdchem.Mol], **kwargs):
+    def __init__(self, train_smiles: list[str], **kwargs):
         super().__init__(**kwargs)
 
         n_workers = min(8, len(os.sched_getaffinity(0)))
         executor = ProcessPoolExecutor(max_workers=n_workers)
 
-        futures = [
-            executor.submit(chemflowRD.smiles_from_mol, mol, canonical=True)
-            for mol in existing_mols
-        ]
-        smiles = [future.result() for future in futures]
-        smiles = [smi for smi in smiles if smi is not None]
+        futures = [executor.submit(_canonical_smiles, smi) for smi in train_smiles]
+        canonical = [future.result() for future in futures]
 
         executor.shutdown()
 
-        self.smiles = set(smiles)
+        self.smiles = set(smi for smi in canonical if smi is not None)
 
         self.add_state("novel", default=torch.tensor(0), dist_reduce_fx="sum")
         self.add_state("total", default=torch.tensor(0), dist_reduce_fx="sum")
@@ -450,11 +523,12 @@ class EnergyValidity(GenerativeMetric):
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
         num_mols = len(mols)
 
+        non_none = [m for m in mols if m is not None]
         if self.optimise:
-            mols = [chemflowRD.optimise_mol(mol) for mol in mols if mol is not None]
+            non_none = [m for m in _pool_map(_rd_optimise_mol, non_none) if m is not None]
 
-        energies = [chemflowRD.calc_energy(mol) for mol in mols if mol is not None]
-        valid_energies = [energy for energy in energies if _is_valid_float(energy)]
+        energies = _pool_map(_rd_calc_energy, non_none)
+        valid_energies = [e for e in energies if _is_valid_float(e)]
 
         self.n_valid += len(valid_energies)
         self.total += num_mols
@@ -485,15 +559,13 @@ class AverageEnergy(GenerativeMetric):
         )
 
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
+        non_none = [m for m in mols if m is not None]
         if self.optimise:
-            mols = [chemflowRD.optimise_mol(mol) for mol in mols if mol is not None]
+            non_none = [m for m in _pool_map(_rd_optimise_mol, non_none) if m is not None]
 
-        energies = [
-            chemflowRD.calc_energy(mol, per_atom=self.per_atom)
-            for mol in mols
-            if mol is not None
-        ]
-        valid_energies = [energy for energy in energies if _is_valid_float(energy)]
+        energy_fn = _rd_calc_energy_per_atom if self.per_atom else _rd_calc_energy
+        energies = _pool_map(energy_fn, non_none)
+        valid_energies = [e for e in energies if _is_valid_float(e)]
 
         self.energy += sum(valid_energies)
         self.n_valid_energies += len(valid_energies)
@@ -501,7 +573,9 @@ class AverageEnergy(GenerativeMetric):
     def compute(self) -> torch.Tensor:
         return self.energy / self.n_valid_energies
 
+
 # TODO: Add xTB as level of theory option and add forces as a metric
+
 
 class AverageStrainEnergy(GenerativeMetric):
     """
@@ -530,26 +604,28 @@ class AverageStrainEnergy(GenerativeMetric):
         self.add_state("n_valid", default=torch.tensor(0), dist_reduce_fx="sum")
 
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
-        opt_mols = [
-            (idx, chemflowRD.optimise_mol(mol))
-            for idx, mol in list(enumerate(mols))
-            if mol is not None
-        ]
-        energies = [
-            (idx, chemflowRD.calc_energy(mol, per_atom=self.per_atom))
-            for idx, mol in opt_mols
-            if mol is not None
-        ]
-        valids = [(idx, energy) for idx, energy in energies if energy is not None]
-
-        if len(valids) == 0:
+        indexed = [(idx, m) for idx, m in enumerate(mols) if m is not None]
+        if not indexed:
             return
 
-        valid_indices, valid_energies = tuple(zip(*valids))
-        original_energies = [
-            chemflowRD.calc_energy(mols[idx], per_atom=self.per_atom)
-            for idx in valid_indices
-        ]
+        indices, non_none = zip(*indexed)
+        optimised = _pool_map(_rd_optimise_mol, list(non_none))
+
+        energy_fn = _rd_calc_energy_per_atom if self.per_atom else _rd_calc_energy
+
+        opt_pairs = [(i, m) for i, m in zip(indices, optimised) if m is not None]
+        if not opt_pairs:
+            return
+        opt_indices, opt_mols_list = zip(*opt_pairs)
+        opt_energies = _pool_map(energy_fn, list(opt_mols_list))
+
+        pairs = [(i, e) for i, e in zip(opt_indices, opt_energies) if e is not None]
+        if not pairs:
+            return
+
+        valid_indices, valid_energies = zip(*pairs)
+        original_energies = _pool_map(energy_fn, [mols[i] for i in valid_indices])
+
         energy_diffs = [
             orig - opt for orig, opt in zip(original_energies, valid_energies)
         ]
@@ -578,18 +654,19 @@ class AverageOptRmsd(GenerativeMetric):
         self.add_state("n_valid", default=torch.tensor(0), dist_reduce_fx="sum")
 
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
-        valids = [
-            (idx, chemflowRD.optimise_mol(mol))
-            for idx, mol in list(enumerate(mols))
-            if mol is not None
-        ]
-        valids = [(idx, mol) for idx, mol in valids if mol is not None]
-
-        if len(valids) == 0:
+        indexed = [(idx, m) for idx, m in enumerate(mols) if m is not None]
+        if not indexed:
             return
 
-        valid_indices, opt_mols = tuple(zip(*valids))
-        original_mols = [mols[idx] for idx in valid_indices]
+        indices, non_none = zip(*indexed)
+        optimised = _pool_map(_rd_optimise_mol, list(non_none))
+
+        pairs = [(i, m) for i, m in zip(indices, optimised) if m is not None]
+        if not pairs:
+            return
+
+        valid_indices, opt_mols = zip(*pairs)
+        original_mols = [mols[i] for i in valid_indices]
         rmsds = [
             chemflowRD.conf_distance(mol1, mol2)
             for mol1, mol2 in zip(original_mols, opt_mols)
@@ -603,7 +680,7 @@ class AverageOptRmsd(GenerativeMetric):
 
 
 def init_metrics(
-    train_mols=None,
+    train_smiles: list[str] | None = None,
     target_n_atoms_distribution: torch.Tensor | None = None,
     atom_type_distribution: torch.Tensor | None = None,
     edge_type_distribution: torch.Tensor | None = None,
@@ -614,7 +691,7 @@ def init_metrics(
     metrics = {
         "validity": Validity(),
         "uniqueness": Uniqueness(),
-    #     "novelty": Novelty(train_mols),
+        **({"novelty": Novelty(train_smiles)} if train_smiles is not None else {}),
         "energy-validity": EnergyValidity(),
         "opt-energy-validity": EnergyValidity(optimise=True),
         "energy": AverageEnergy(),
@@ -656,22 +733,40 @@ def calc_posebusters_metrics(
     Uses the "mol" config (standalone molecule checks, no protein context).
     Each check produces a boolean per molecule; we return the mean pass rate.
     """
-    from posebusters import PoseBusters
 
     valid_mols = [mol for mol in rdkit_mols if mol is not None]
     if len(valid_mols) == 0:
         return {}
 
-    buster = PoseBusters(config="mol")
-    df = buster.bust(valid_mols)
+    buster = PoseBusters(config="mol", max_workers=-1)
+
+    df = buster.bust(valid_mols, None, None)
 
     results = {}
     for col in df.columns:
-        series = df[col]
-        if series.dtype == "bool" or series.dtype == "boolean":
-            results[col] = float(series.mean())
+        # Skip string index columns if they are in the dataframe
+        if col in ["file", "molecule"]:
+            continue
+
+        try:
+            # Force the column to numeric (True=1.0, False=0.0, NaN=NaN)
+            # errors='coerce' turns anything it can't convert into a NaN
+            numeric_series = pd.to_numeric(df[col], errors="coerce")
+
+            # If the column isn't entirely NaNs after conversion, get the mean
+            if not numeric_series.isna().all():
+                # Note: Adding the "posebusters/" prefix to match your logs!
+                results[col] = float(numeric_series.mean())
+        except Exception:
+            print(
+                f"Warning: Could not process column '{col}' in PoseBusters results. Skipping this metric."
+            )
+            pass
 
     return results
+
+
+# {'modules': [{'name': 'Loading', 'function': 'loading', 'chosen_binary_test_output': ['mol_pred_loaded'], 'rename_outputs': {'mol_pred_loaded': 'MOL_PRED loaded'}}, {'name': 'Chemistry', 'function': 'rdkit_sanity', 'chosen_binary_test_output': ['passes_rdkit_sanity_checks'], 'rename_outputs': {'passes_rdkit_sanity_checks': 'Sanitization'}}, {'name': 'Chemistry', 'function': 'inchi_convertible', 'chosen_binary_test_output': ['inchi_convertible'], 'rename_outputs': {'inchi_convertible': 'InChI convertible'}}, {'name': 'Chemistry', 'function': 'atoms_connected', 'chosen_binary_test_output': ['all_atoms_connected'], 'rename_outputs': {'all_atoms_connected': 'All atoms connected'}}, {'name': 'Chemistry', 'function': 'check_radicals', 'chosen_binary_test_output': ['no_radicals'], 'rename_outputs': {'no_radicals': 'No radicals'}}, {'name': 'Geometry', 'function': 'distance_geometry', 'parameters': {'bound_matrix_params': {'set15bounds': True, 'scaleVDW': True, 'doTriangleSmoothing': True, 'useMacrocycle14config': False}, 'threshold_bad_bond_length': 0.25, 'threshold_bad_angle': 0.25, 'threshold_clash': 0.3, 'ignore_hydrogens': True, 'sanitize': True}, 'chosen_binary_test_output': ['bond_lengths_within_bounds', 'bond_angles_within_bounds', 'no_internal_clash'], 'rename_outputs': {'bond_lengths_within_bounds': 'Bond lengths', 'bond_angles_within_bounds': 'Bond angles', 'no_internal_clash': 'Internal steric clash'}}, {'name': 'Ring flatness', 'function': 'flatness', 'parameters': {'flat_systems': {'aromatic_5_membered_rings_sp2': '[ar5^2]1[ar5^2][ar5^2][ar5^2][ar5^2]1', 'aromatic_6_membered_rings_sp2': '[ar6^2]1[ar6^2][ar6^2][ar6^2][ar6^2][ar6^2]1'}, 'threshold_flatness': 0.25}, 'chosen_binary_test_output': ['flatness_passes'], 'rename_outputs': {'num_systems_checked': 'number_aromatic_rings_checked', 'num_systems_passed': 'number_aromatic_rings_pass', 'max_distance': 'aromatic_ring_maximum_distance_from_plane', 'flatness_passes': 'Aromatic ring flatness'}}, {'name': 'Ring non-flatness', 'function': 'flatness', 'parameters': {'check_nonflat': True, 'flat_systems': {'non-aromatic_6_membered_rings': '[C,O,S,N;R1]~1[C,O,S,N;R1][C,O,S,N;R1][C,O,S,N;R1][C,O,S,N;R1][C,O,S,N;R1]1', 'non-aromatic_6_membered_rings_db03_0': '[C;R1]~1[C;R1][C,O,S,N;R1]~[C,O,S,N;R1][C;R1][C;R1]1', 'non-aromatic_6_membered_rings_db03_1': '[C;R1]~1[C;R1][C;R1]~[C;R1][C,O,S,N;R1][C;R1]1', 'non-aromatic_6_membered_rings_db02_0': '[C;R1]~1[C;R1][C;R1][C,O,S,N;R1]~[C,O,S,N;R1][C;R1]1', 'non-aromatic_6_membered_rings_db02_1': '[C;R1]~1[C;R1][C,O,S,N;R1][C;R1]~[C;R1][C;R1]1'}, 'threshold_flatness': 0.05}, 'chosen_binary_test_output': ['flatness_passes'], 'rename_outputs': {'num_systems_checked': 'number_non-aromatic_rings_checked', 'num_systems_passed': 'number_non-aromatic_rings_pass', 'max_distance': 'non-aromatic_ring_maximum_distance_from_plane', 'flatness_passes': 'Non-aromatic ring non-flatness'}}, {'name': 'Double bond flatness', 'function': 'flatness', 'parameters': {'flat_systems': {'trigonal_planar_double_bonds': '[C;X3;^2](*)(*)=[C;X3;^2](*)(*)'}, 'threshold_flatness': 0.25}, 'chosen_binary_test_output': ['flatness_passes'], 'rename_outputs': {'num_systems_checked': 'number_double_bonds_checked', 'num_systems_passed': 'number_double_bonds_pass', 'max_distance': 'double_bond_maximum_distance_from_plane', 'flatness_passes': 'Double bond flatness'}}, {'name': 'Energy ratio', 'function': 'energy_ratio', 'parameters': {'threshold_energy_ratio': 100.0, 'ensemble_number_conformations': 50}}, {'name': 'Energy ratio', 'function': 'energy_ratio', 'parameters': {'threshold_energy_ratio': 100.0, 'ensemble_number_conformations': 50}, 'chosen_binary_test_output': ['energy_ratio_passes'], 'rename_outputs': {'energy_ratio_passes': 'Internal energy'}}], 'loading': {'mol_pred': {'cleanup': False, 'sanitize': False, 'add_hs': False, 'assign_stereo': False, 'load_all': True}, 'mol_true': {'cleanup': False, 'sanitize': False, 'add_hs': False, 'assign_stereo': False, 'load_all': True}, 'mol_cond': {'cleanup': False, 'sanitize': False, 'add_hs': False, 'assign_stereo': False, 'proximityBonding': False}}, 'top_n': None, 'max_workers': 0, 'chunk_size': 100}
 
 
 def calc_metrics_(
@@ -685,7 +780,10 @@ def calc_metrics_(
 ):
     metrics.reset()
     metrics.update(rdkit_mols)
-    results = metrics.compute()
+    raw = metrics.compute()
+    results = {
+        k: v.item() if isinstance(v, torch.Tensor) else v for k, v in raw.items()
+    }
 
     if mols is not None and target_n_atoms_distribution is not None:
         if device is None:
@@ -698,14 +796,23 @@ def calc_metrics_(
             target_distribution=target_n_atoms_distribution,
             device=device,
         )
-        results = {**results, **atom_count_results}
+        results = {
+            **results,
+            **{
+                k: v.item() if isinstance(v, torch.Tensor) else v
+                for k, v in atom_count_results.items()
+            },
+        }
 
     if stab_metrics is None:
         return results
 
     stab_metrics.reset()
     stab_metrics.update(mol_stabs)
-    stab_results = stab_metrics.compute()
+    stab_raw = stab_metrics.compute()
+    stab_results = {
+        k: v.item() if isinstance(v, torch.Tensor) else v for k, v in stab_raw.items()
+    }
 
     results = {**results, **stab_results}
     return results

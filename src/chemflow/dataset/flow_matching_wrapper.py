@@ -166,6 +166,8 @@ class FlowMatchingDatasetWrapper(Dataset):
             return self._median_n_atoms
         elif self.n_atoms_strategy == "annealing":
             return self._get_n_atoms_annealed(target)
+        elif self.n_atoms_strategy == "uniform":
+            return int(torch.randint(self._n_atoms_min, self._n_atoms_max + 1, (1,)).item())
         else:
             return None
 
@@ -411,6 +413,26 @@ def train_collate_fn(batch):
             and ins_targets.ins_edge_ins_local_idx.numel() > 0
         ):
             ins_targets.ins_edge_ins_local_idx.add_(ins_offset)
+        if (
+            hasattr(ins_targets, "ins_to_ins_edge_src_local_idx")
+            and ins_targets.ins_to_ins_edge_src_local_idx.numel() > 0
+        ):
+            ins_targets.ins_to_ins_edge_src_local_idx.add_(ins_offset)
+        if (
+            hasattr(ins_targets, "ins_to_ins_edge_dst_local_idx")
+            and ins_targets.ins_to_ins_edge_dst_local_idx.numel() > 0
+        ):
+            ins_targets.ins_to_ins_edge_dst_local_idx.add_(ins_offset)
+        if (
+            hasattr(ins_targets, "ins_to_ins_edge_spawn_src_idx")
+            and ins_targets.ins_to_ins_edge_spawn_src_idx.numel() > 0
+        ):
+            ins_targets.ins_to_ins_edge_spawn_src_idx.add_(offset)
+        if (
+            hasattr(ins_targets, "ins_to_ins_edge_spawn_dst_idx")
+            and ins_targets.ins_to_ins_edge_spawn_dst_idx.numel() > 0
+        ):
+            ins_targets.ins_to_ins_edge_spawn_dst_idx.add_(offset)
         if (
             hasattr(ins_targets, "ins_to_ins_edge_src_local_idx")
             and ins_targets.ins_to_ins_edge_src_local_idx.numel() > 0

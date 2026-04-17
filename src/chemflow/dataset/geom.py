@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from chemflow.dataset.molecule_data import MoleculeData
 from chemflow.dataset.vocab import Distributions, Vocab
-from chemflow.utils.rdkit import BOND_IDX_MAP, mol_is_valid, sanitize_mol_correctly
+from chemflow.utils.rdkit import BOND_IDX_MAP, mol_is_valid, sanitize_mol_correctly, smiles_from_mol
 from chemflow.utils.utils import (
     edge_types_to_symmetric,
     token_to_index,
@@ -34,6 +34,8 @@ def process_one_conformer(mol: Chem.Mol):
 
     try:
         N = mol.GetNumAtoms()
+        if N >= 72:
+            return None
         conf = mol.GetConformer()
         pos = conf.GetPositions()
         pos = torch.tensor(pos, dtype=torch.float)
@@ -65,7 +67,7 @@ def process_one_conformer(mol: Chem.Mol):
             edge_index = edge_index[:, perm]
             edge_type = edge_type[perm]
 
-        smiles = Chem.MolToSmiles(mol, isomericSmiles=False)
+        smiles = smiles_from_mol(mol, canonical=True) or ""
 
         data = Data(
             z=z,
@@ -242,11 +244,26 @@ class GEOM(Dataset):
         print(f"Saving processed data to {self.processed_file}...")
         save_dataset_bytes(mol_bytes_list, self.processed_file)
 
+        smiles_path = os.path.join(self.processed_dir, f"{self.split}_smiles.txt")
+        unique_smiles = sorted(set(
+            pickle.loads(b)["smiles"] for b in mol_bytes_list
+        ))
+        with open(smiles_path, "w") as f:
+            f.write("\n".join(unique_smiles))
+
+    def get_all_smiles(self) -> list[str]:
+        smiles_path = os.path.join(self.processed_dir, f"{self.split}_smiles.txt")
+        with open(smiles_path) as f:
+            return f.read().splitlines()
+
     def __len__(self):
         return len(self._mol_bytes)
 
     def __getitem__(self, index):
         return mol_from_bytes(self._mol_bytes[index])
+
+    def get(self, index):
+        return self.__getitem__(index)
 
 
 class FlowMatchingGEOMDataset(GEOM):
@@ -302,3 +319,6 @@ class FlowMatchingGEOMDataset(GEOM):
             x=coord, a=atom_types, e=edge_types, c=charges, edge_index=data.edge_index
         )
         return data
+
+    def get(self, index):
+        return self.__getitem__(index)

@@ -311,11 +311,13 @@ class DiTEmbedding(nn.Module):
 
     Produces atom embeddings, edge embeddings, and a *graph-level*
     conditioning vector (time + node count + optional CFG signals).
+    conditioning vector (time + node count + optional CFG signals).
 
     Unlike ``EmbeddingBackbone`` in model.py which concatenates all
     conditioning into the node features, this module returns conditioning
     as a separate tensor so DiTBackbone can feed it through adaLN.
 
+    Exposes ``cfg_embedding`` (a :class:`UnifiedCFGEmbedding`) for
     Exposes ``cfg_embedding`` (a :class:`UnifiedCFGEmbedding`) for
     classifier-free guidance compatibility with the lightning module.
     """
@@ -407,7 +409,12 @@ class DiTEmbedding(nn.Module):
             cfg_embed = self.cfg_embedding(
                 cfg_inputs if cfg_inputs is not None else {},
                 batch_size=num_graphs,
+        if self.cfg_embedding is not None:
+            cfg_embed = self.cfg_embedding(
+                cfg_inputs if cfg_inputs is not None else {},
+                batch_size=num_graphs,
             )
+            cond_parts.append(cfg_embed)
             cond_parts.append(cfg_embed)
 
         cond = torch.cat(cond_parts, dim=-1)
@@ -453,6 +460,7 @@ class DiTBackboneWithHeads(nn.Module):
             cfg_embedding_args=cfg_embedding_args,
             scaffold_mask_embedding_args=scaffold_mask_embedding_args,
             edge_scaffold_embedding_args=edge_scaffold_embedding_args,
+            cfg_embedding_args=cfg_embedding_args,
         )
 
         self.backbone = hydra.utils.instantiate(backbone_model_args)

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Dict, Optional
 from omegaconf import DictConfig
-from src.external_code.egnn import unsorted_segment_sum, unsorted_segment_mean
+from external_code.egnn import unsorted_segment_sum, unsorted_segment_mean
 import torch.nn.functional as F
 import hydra
 

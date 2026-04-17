@@ -106,7 +106,7 @@ class GVP(nn.Module):
             self.ws = nn.Linear(self.si, self.so)
         
         self.scalar_act, self.vector_act = activations
-        self.dummy_param = nn.Parameter(torch.empty(0))
+        self.register_buffer('dummy_param', torch.empty(0))
         
     def forward(self, x):
         '''
@@ -151,7 +151,7 @@ class _VDropout(nn.Module):
     def __init__(self, drop_rate):
         super(_VDropout, self).__init__()
         self.drop_rate = drop_rate
-        self.dummy_param = nn.Parameter(torch.empty(0))
+        self.register_buffer('dummy_param', torch.empty(0))
 
     def forward(self, x):
         '''

@@ -147,46 +147,51 @@ class LightningDataModule(pl.LightningDataModule):
         return batch
 
     def train_dataloader(self):
+        nw = self.num_workers.train
         return DataLoader(
             self.train_dataset,
             shuffle=True,
             batch_size=self.batch_size.train,
-            num_workers=self.num_workers.train,
-            persistent_workers=True,
+            num_workers=nw,
+            persistent_workers=nw > 0,
             pin_memory=True,
             drop_last=True,
             collate_fn=train_collate_fn,
             worker_init_fn=worker_init_fn,
-            prefetch_factor=4,
+            prefetch_factor=2 if nw > 0 else None,
         )
 
     def val_dataloader(self):
+        nw = self.num_workers.val
         return [
             DataLoader(
                 dataset,
                 shuffle=False,
                 batch_size=self.batch_size.val,
-                num_workers=self.num_workers.val,
-                persistent_workers=True,
+                num_workers=nw,
+                persistent_workers=nw > 0,
                 pin_memory=True,
                 drop_last=True,
                 collate_fn=eval_collate_fn,
                 worker_init_fn=worker_init_fn,
+                prefetch_factor=2 if nw > 0 else None,
             )
             for dataset in self.val_datasets
         ]
 
     def test_dataloader(self):
+        nw = self.num_workers.test
         return [
             DataLoader(
                 dataset,
                 shuffle=False,
                 batch_size=self.batch_size.test,
-                num_workers=self.num_workers.test,
-                persistent_workers=True,
+                num_workers=nw,
+                persistent_workers=nw > 0,
                 pin_memory=True,
                 collate_fn=eval_collate_fn,
                 worker_init_fn=worker_init_fn,
+                prefetch_factor=2 if nw > 0 else None,
             )
             for dataset in self.test_datasets
         ]

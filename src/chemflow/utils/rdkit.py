@@ -4,11 +4,17 @@ import threading
 from typing import Optional, Union
 
 import numpy as np
-from rdkit import Chem
+from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem
 from scipy.spatial.transform import Rotation
 from rdkit.Chem.Descriptors import NumRadicalElectrons
 from rdkit.Chem.rdDetermineBonds import DetermineBonds
+
+# Silence RDKit's noisy validity/kekulize warnings. These fire once per
+# generated molecule during validation and, on a shared Lustre stdout,
+# can block every Python thread for minutes -- including the TorchElastic
+# rendezvous keep-alive thread, which then times out and kills the job.
+RDLogger.DisableLog("rdApp.*")
 
 ArrT = np.ndarray
 

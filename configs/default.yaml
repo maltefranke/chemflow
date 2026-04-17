@@ -2,6 +2,7 @@ defaults:
   - _self_
   - data: qm9
   - model: semla
+  - cfg: uncond
   - schedule: smoothstep
   - trainer: trainer
   - callbacks: callbacks

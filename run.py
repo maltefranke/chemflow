@@ -12,7 +12,9 @@ from pytorch_lightning.strategies import DDPStrategy
 
 from chemflow.utils.utils import build_callbacks, init_uniform_prior
 from chemflow.dataset.vocab import setup_token_weights
+from chemflow.dataset.vocab import setup_token_weights
 from chemflow.model.lightning_module import LightningModuleRates
+from chemflow.utils.metrics import init_metrics
 from rdkit import Chem
 
 # resolvers for more complex config expressions
@@ -77,6 +79,17 @@ def run(cfg: DictConfig):
         type_loss_token_weights=tw.type_loss_token_weights,
     )
 
+    # Build metrics (including novelty against the training set)
+    train_smiles = datamodule.train_dataset.base_dataset.get_all_smiles()
+    metrics, stability_metrics = init_metrics(
+        train_smiles=train_smiles,
+        target_n_atoms_distribution=loss_weight_distributions.n_atoms_distribution,
+        atom_type_distribution=loss_weight_distributions.atom_type_distribution,
+        edge_type_distribution=loss_weight_distributions.edge_type_distribution,
+        atom_tokens=list(vocab.atom_tokens),
+        edge_tokens=list(vocab.edge_tokens),
+    )
+
     # Instantiate module
     hydra.utils.log.info(f"Instantiating <{cfg.model.module._target_}>")
     module: pl.LightningModule = hydra.utils.instantiate(
@@ -87,6 +100,8 @@ def run(cfg: DictConfig):
         atom_type_weights=atom_type_weights,
         edge_token_weights=edge_token_weights,
         charge_token_weights=charge_token_weights,
+        metrics=metrics,
+        stability_metrics=stability_metrics,
     )
 
     # module.compile()
@@ -115,12 +130,12 @@ def run(cfg: DictConfig):
         ckpt_path=ckpt_path,
     )
 
-    """trainer.validate(
+    trainer.validate(
         module,
         dataloaders=datamodule.val_dataloader(),
         ckpt_path=ckpt_path,
     )
-    exit()"""
+    exit()
 
     predictions = trainer.predict(
         module,

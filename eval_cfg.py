@@ -10,9 +10,12 @@ Usage:
 
 import hydra
 import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
 import omegaconf
 import torch
 from copy import deepcopy
+import math
+import contextlib
 import math
 import contextlib
 import pytorch_lightning as pl
@@ -20,6 +23,7 @@ from omegaconf import DictConfig, OmegaConf
 from rdkit import RDLogger
 
 from chemflow.utils.utils import init_uniform_prior
+from chemflow.dataset.vocab import setup_token_weights
 
 
 OmegaConf.register_new_resolver("oc.eval", eval)
@@ -35,7 +39,11 @@ TARGET_N_ATOMS = [10, 18, 28]
 GUIDANCE_SCALES = [1.0, 5.0, 10.0]
 
 TARGET_MWS = [100.0, 110.0, 125.0]
-MW_GUIDANCE_SCALES = [0.5, 1.0, 5.0]
+MW_GUIDANCE_SCALES = [0.75, 0.9, 1.1, 1.25]
+
+PROPERTY_GUIDANCE_SCALES = [0.0, 0.5, 1.0, 2.0, 5.0]
+PROP_COLLECT_N_BATCHES = 5   # batches used to derive target-value percentiles
+PROP_EVAL_N_BATCHES = 4      # batches per (target_val, scale) cell
 
 PLOT_N_MOLS = 500
 PREDICT_BATCH_SIZE = 128
@@ -79,13 +87,69 @@ def _infer_mol_mw(mol, atom_tokens: list[str]) -> float | None:
     """Infer molecular weight from a single molecule."""
     if mol is None or atom_tokens is None:
         return None
-    from chemflow.model.embedding import compute_molecular_weight
+    from chemflow.model.cfg import compute_molecular_weight
 
     a = getattr(mol, "a", None)
     if a is None:
         return None
     mw = compute_molecular_weight(a, atom_tokens)
     return float(mw.item())
+
+
+def _run_property_guidance_eval(
+    module,
+    test_dl,
+    target_val: float,
+    property_indices: list[int],
+    n_batches: int,
+    device,
+) -> tuple[int, int]:
+    """Custom predict loop that overrides ``mol_t.y`` with a fixed target
+    property value and returns (n_valid, n_total)."""
+    from chemflow.utils import rdkit as chemflowRD
+
+    n_valid_total = 0
+    n_total = 0
+
+    module.eval()
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(test_dl):
+            if batch_idx >= n_batches:
+                break
+            mol_t, mol_1 = batch
+            mol_t = mol_t.to(device)
+            mol_1 = mol_1.to(device)
+
+            # Override the conditioned property columns with the target value.
+            if mol_t.y is not None and mol_t.y.ndim >= 2:
+                new_y = mol_t.y.clone().float()
+                for idx in property_indices:
+                    if idx < new_y.shape[1]:
+                        new_y[:, idx] = target_val
+                mol_t.y = new_y
+
+            gen_mols = module.sample(
+                (mol_t, mol_1),
+                batch_idx,
+                return_traj=True,
+            )
+
+            for traj in gen_mols:
+                mol_final = traj[-1] if isinstance(traj, list) and traj else traj
+                rdkit_mol = mol_final.to_rdkit_mol(
+                    module.vocab.atom_tokens,
+                    module.vocab.edge_tokens,
+                    module.vocab.charge_tokens,
+                )
+                n_total += 1
+                if rdkit_mol is not None:
+                    try:
+                        if chemflowRD.mol_is_valid(rdkit_mol):
+                            n_valid_total += 1
+                    except Exception:
+                        pass
+
+    return n_valid_total, n_total
 
 
 def _collect_n_atoms_from_predict_output(pred) -> list[int]:
@@ -157,10 +221,31 @@ def _collect_mw_from_predict_output(
 # ---------------------------------------------------------------------------
 
 
+def summarize_property_steering(
+    n_valid: int,
+    n_total: int,
+    target_val: float,
+    property_name: str,
+    guidance_scale: float,
+) -> dict:
+    return {
+        "property_name": property_name,
+        "target_value": round(target_val, 6),
+        "guidance_scale": guidance_scale,
+        "validity_rate": n_valid / max(n_total, 1),
+        "n_valid": n_valid,
+        "n_total": n_total,
+    }
+
+
 def summarize_natoms_steering(predictions, target_n_atoms: int) -> dict:
     all_n_atoms: list[int] = []
 
     for pred in predictions:
+        all_n_atoms.extend(_collect_n_atoms_from_predict_output(pred))
+
+    if len(all_n_atoms) > PLOT_N_MOLS:
+        all_n_atoms = all_n_atoms[:PLOT_N_MOLS]
         all_n_atoms.extend(_collect_n_atoms_from_predict_output(pred))
 
     if len(all_n_atoms) > PLOT_N_MOLS:
@@ -388,6 +473,83 @@ def plot_mw_distributions_grid(
     print(f"MW distribution figure saved to {output_path}")
 
 
+def plot_property_guidance_grid(
+    all_results: dict[tuple[float, float], dict],
+    property_name: str,
+    output_path: str = "cfg_property_steering_distributions.png",
+):
+    """Save a grid of validity-rate bars (rows=targets, cols=guidance scales).
+
+    Note: measuring actual QM9 property accuracy of generated molecules requires
+    an external DFT/surrogate predictor. Validity rate is the proxy metric here.
+    """
+    if not all_results:
+        print("No property results to plot.")
+        return
+
+    guidance_scales = sorted({key[0] for key in all_results})
+    target_vals = sorted({key[1] for key in all_results})
+
+    n_rows = len(target_vals)
+    n_cols = len(guidance_scales)
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(2.8 * max(1, n_cols), 2.4 * max(1, n_rows)),
+        squeeze=False,
+    )
+
+    for row_idx, target in enumerate(target_vals):
+        for col_idx, scale in enumerate(guidance_scales):
+            ax = axes[row_idx][col_idx]
+            result = all_results.get((scale, target), {})
+            validity = result.get("validity_rate", 0.0)
+            n_total = result.get("n_total", 0)
+
+            bar_color = "#4C72B0" if scale > 0.0 else "#7f7f7f"
+            ax.bar(
+                [0],
+                [validity],
+                color=bar_color,
+                alpha=0.85,
+                edgecolor="black",
+                linewidth=0.8,
+                width=0.6,
+            )
+            ax.set_ylim(0, 1.15)
+            ax.axhline(1.0, color="gray", linestyle="--", linewidth=0.8, alpha=0.5)
+            ax.text(
+                0,
+                min(validity + 0.06, 1.08),
+                f"{validity:.0%}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+            ax.set_xticks([])
+
+            if row_idx == 0:
+                ax.set_title(f"scale={scale}", fontsize=10)
+            if col_idx == 0:
+                ax.set_ylabel(
+                    f"target={target:.3g}\nvalidity",
+                    fontsize=9,
+                )
+            if row_idx == n_rows - 1:
+                ax.set_xlabel(f"n={n_total}", fontsize=8)
+
+            ax.tick_params(labelsize=8)
+
+    fig.suptitle(
+        f"Property CFG validity ({property_name})",
+        fontsize=12,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(output_path, dpi=220)
+    plt.close(fig)
+    print(f"Property guidance figure saved to {output_path}")
+
+
 # ---------------------------------------------------------------------------
 #  Diagnostics
 # ---------------------------------------------------------------------------
@@ -550,10 +712,17 @@ def eval_cfg(cfg: DictConfig):
     datamodule.setup()
 
     n_dist = distributions.n_atoms_distribution
-    median_n = int(
-        (torch.cumsum(n_dist, 0) >= 0.5).nonzero(as_tuple=True)[0][0].item()
-    )
+    median_n = int((torch.cumsum(n_dist, 0) >= 0.5).nonzero(as_tuple=True)[0][0].item())
     print(f"Prior n_atoms fixed to median = {median_n}")
+
+    # ── token weights (mirrors run.py) ──
+    tw = cfg.model.token_weighting
+    atom_type_weights, edge_token_weights, charge_token_weights = setup_token_weights(
+        vocab=vocab,
+        distributions=loss_weight_distributions,
+        weight_alpha=tw.weight_alpha,
+        type_loss_token_weights=tw.type_loss_token_weights,
+    )
 
     # ── model setup ──
     module = hydra.utils.instantiate(
@@ -561,9 +730,12 @@ def eval_cfg(cfg: DictConfig):
         _recursive_=False,
         distributions=token_prior_distribution,
         loss_weight_distributions=loss_weight_distributions,
+        atom_type_weights=atom_type_weights,
+        edge_token_weights=edge_token_weights,
+        charge_token_weights=charge_token_weights,
     )
 
-    ckpt_path = "/capstor/store/cscs/swissai/a131/frankem/chemflow/logs/wandb/mw_cfg/chemflow/fujlz0gr/checkpoints/epoch=449-step=8550.ckpt"
+    ckpt_path = "/capstor/store/cscs/swissai/a131/frankem/chemflow/logs/wandb/poisson_cfg/chemflow/fy8p6jss/checkpoints/epoch=499-step=9500.ckpt"
     ckpt = torch.load(
         ckpt_path,
         map_location="cpu",
@@ -713,6 +885,100 @@ def eval_cfg(cfg: DictConfig):
         )
     else:
         print("Skipping MW sweep (mw_encoder disabled)")
+
+    # ── sweep property guidance ──
+    if adapter._has_property_conditioning:
+        # Derive property name(s) from the hydra config.
+        try:
+            property_names_list = list(cfg.cfg.cfg.property_names)
+        except Exception:
+            property_names_list = ["gap"]
+        primary_prop = property_names_list[0] if property_names_list else "gap"
+        prop_indices: list[int] = adapter.property_indices or [4]  # 4 = gap fallback
+
+        # Collect target values from the test-data distribution.
+        all_prop_vals: list[float] = []
+        for _batch_idx, _batch in enumerate(test_dl):
+            if _batch_idx >= PROP_COLLECT_N_BATCHES:
+                break
+            _mol_t, _ = _batch
+            if hasattr(_mol_t, "y") and _mol_t.y is not None and _mol_t.y.ndim >= 2:
+                col = prop_indices[0]
+                if col < _mol_t.y.shape[1]:
+                    all_prop_vals.extend(_mol_t.y[:, col].float().cpu().tolist())
+
+        if all_prop_vals:
+            _pv = torch.tensor(all_prop_vals)
+            target_prop_values = [
+                float(_pv.quantile(0.10).item()),
+                float(_pv.quantile(0.50).item()),
+                float(_pv.quantile(0.90).item()),
+            ]
+            print(
+                f"\nProperty '{primary_prop}' targets "
+                f"(10th/50th/90th pct): "
+                + ", ".join(f"{v:.4g}" for v in target_prop_values)
+            )
+        else:
+            target_prop_values = [0.05, 0.14, 0.25]
+            print(
+                f"\nNo test-data properties found; "
+                f"using defaults for '{primary_prop}': "
+                + ", ".join(str(v) for v in target_prop_values)
+            )
+
+        original_prop_scale = adapter.cfg_guidance_scale
+        all_prop_results: dict[tuple[float, float], dict] = {}
+
+        for scale in PROPERTY_GUIDANCE_SCALES:
+            adapter.cfg_guidance_scale = scale
+            print(f"\n{'=' * 60}")
+            print(f"Property ({primary_prop}) guidance scale = {scale}")
+            print(f"{'=' * 60}")
+            prop_device = next(module.parameters()).device
+
+            for target_val in target_prop_values:
+                pl.seed_everything(42)
+                print(
+                    f"  {primary_prop}={target_val:.4g} ... ",
+                    end="",
+                    flush=True,
+                )
+                n_valid, n_total = _run_property_guidance_eval(
+                    module=module,
+                    test_dl=test_dl,
+                    target_val=target_val,
+                    property_indices=prop_indices,
+                    n_batches=PROP_EVAL_N_BATCHES,
+                    device=prop_device,
+                )
+                result = summarize_property_steering(
+                    n_valid=n_valid,
+                    n_total=n_total,
+                    target_val=target_val,
+                    property_name=primary_prop,
+                    guidance_scale=scale,
+                )
+                all_prop_results[(scale, round(target_val, 6))] = result
+
+                if n_total == 0:
+                    print("no molecules (n=0)")
+                else:
+                    print(
+                        f"validity={result['validity_rate']:.1%}  "
+                        f"(n={n_valid}/{n_total})"
+                    )
+
+        adapter.cfg_guidance_scale = original_prop_scale
+        torch.save(all_prop_results, "cfg_property_steering_results.pt")
+        print("\nResults saved to cfg_property_steering_results.pt")
+        plot_property_guidance_grid(
+            all_prop_results,
+            property_name=primary_prop,
+            output_path="cfg_property_steering_distributions.png",
+        )
+    else:
+        print("Skipping property sweep (property conditioning disabled)")
 
 
 @hydra.main(

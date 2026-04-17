@@ -25,8 +25,27 @@ from torch_geometric.data import InMemoryDataset, download_url, extract_zip
 
 from chemflow.dataset.molecule_data import MoleculeData
 from chemflow.dataset.vocab import Vocab, Distributions
-from chemflow.utils.rdkit import mol_is_valid, sanitize_mol_correctly, BOND_IDX_MAP
+from chemflow.utils.rdkit import mol_is_valid, sanitize_mol_correctly, BOND_IDX_MAP, smiles_from_mol
 from scipy.spatial.transform import Rotation
+
+# Maps QM9 property names to their column index in the y tensor after
+# the rearrangement `y = torch.cat([y[:, 3:], y[:, :3]], dim=-1)` applied
+# during processing.  The raw CSV columns (A, B, C) are moved to the end, so
+# the first 16 entries are the standard QM9 molecular-property targets:
+QM9_PROPERTY_NAMES: dict[str, int] = {
+    "mu": 0,    # dipole moment (D)
+    "alpha": 1, # isotropic polarizability (a0^3)
+    "homo": 2,  # HOMO energy (eV)
+    "lumo": 3,  # LUMO energy (eV)
+    "gap": 4,   # HOMO-LUMO gap (eV)
+    "r2": 5,    # electronic spatial extent (a0^2)
+    "zpve": 6,  # zero-point vibrational energy (kcal/mol)
+    "u0": 7,    # internal energy at 0 K (kcal/mol)
+    "u": 8,     # internal energy at 298.15 K (kcal/mol)
+    "h": 9,     # enthalpy at 298.15 K (kcal/mol)
+    "g": 10,    # free energy at 298.15 K (kcal/mol)
+    "cv": 11,   # heat capacity at 298.15 K (cal/mol/K)
+}
 
 
 class RevisedQM9(InMemoryDataset):
@@ -51,6 +70,7 @@ class RevisedQM9(InMemoryDataset):
             raise ValueError(
                 f"Invalid split '{split}'. Expected one of {tuple(self.split_to_index)}."
             )
+        self._split = split
         super().load(self.processed_paths[self.split_to_index[split]])
 
     def download(self) -> None:
@@ -157,7 +177,7 @@ class RevisedQM9(InMemoryDataset):
             charges = torch.tensor(charges, dtype=torch.int64)
 
             name = mol.GetProp("_Name")
-            smiles = Chem.MolToSmiles(mol, isomericSmiles=False)
+            smiles = smiles_from_mol(mol, canonical=True) or ""
 
             # TODO exchange with our own MolData object for consistency
             data = Data(
@@ -187,8 +207,23 @@ class RevisedQM9(InMemoryDataset):
         self.save(data_list[n_train : n_train + n_val], self.processed_paths[1])
         self.save(data_list[n_train + n_val :], self.processed_paths[2])
 
+        for split_name, split_data in [
+            ("train", data_list[:n_train]),
+            ("val", data_list[n_train : n_train + n_val]),
+            ("test", data_list[n_train + n_val :]),
+        ]:
+            smiles_path = os.path.join(self.processed_dir, f"{split_name}_smiles.txt")
+            unique_smiles = sorted(set(d.smiles for d in split_data))
+            with open(smiles_path, "w") as f:
+                f.write("\n".join(unique_smiles))
+
         print(f"Errors: {errors}")
         print(f"Skipped: {skipped}")
+
+    def get_all_smiles(self) -> list[str]:
+        smiles_path = os.path.join(self.processed_dir, f"{self._split}_smiles.txt")
+        with open(smiles_path) as f:
+            return f.read().splitlines()
 
 
 class FlowMatchingQM9Dataset(RevisedQM9):
