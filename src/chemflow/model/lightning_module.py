@@ -4,9 +4,15 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
 import hydra
-from chemflow.model.losses import typed_gmm_loss, do_action_loss, rate_loss, class_loss, reduce_loss
+from chemflow.model.losses import (
+    typed_gmm_loss,
+    do_action_loss,
+    rate_loss,
+    class_loss,
+    reduce_loss,
+)
 
-from chemflow.utils.utils import EdgeAligner
+from chemflow.utils.utils import EDGE_ALIGNER
 from external_code.egnn import unsorted_segment_mean, unsorted_segment_sum
 
 from chemflow.dataset.molecule_data import MoleculeBatch
@@ -89,9 +95,9 @@ class LightningModuleRates(pl.LightningModule):
         use_time_weights: bool = False,
     ):
         super().__init__()
-        
+
         self.model = hydra.utils.instantiate(model)
-        
+
         # vocab and distributions
         self.vocab = vocab
         self.distributions = distributions
@@ -122,7 +128,7 @@ class LightningModuleRates(pl.LightningModule):
         # metrics tracking for validation
         self.metrics = metrics
         self.stability_metrics = stability_metrics
-        
+
         self.cfg_adapter = hydra.utils.instantiate(
             cfg_adapter,
             model=self.model,
@@ -136,7 +142,7 @@ class LightningModuleRates(pl.LightningModule):
         self.model_ema.eval()
 
         # handling of edge utilities, especially for upper-triangular handling
-        self.edge_aligner = EdgeAligner()
+        self.edge_aligner = EDGE_ALIGNER
 
         # set up loss weighting for individual loss components
         loss_weight_values = {k: float(v) for k, v in loss_weights.items()}
@@ -168,8 +174,17 @@ class LightningModuleRates(pl.LightningModule):
         self.is_compiled = False
 
         # lastly, save hyperparameters
-        self.save_hyperparameters(ignore=["ema_decay_scheduler", "metrics", "stability_metrics"])
-
+        # ``cfg_adapter`` wraps ``self.model``; excluding it avoids capturing a
+        # duplicate (cyclic) reference to the backbone in the hparams snapshot
+        # and keeps checkpoint size down.
+        self.save_hyperparameters(
+            ignore=[
+                "ema_decay_scheduler",
+                "metrics",
+                "stability_metrics",
+                "cfg_adapter",
+            ]
+        )
 
     def compile(self):
         """Compile the model using torch.compile."""
@@ -210,7 +225,6 @@ class LightningModuleRates(pl.LightningModule):
 
     def forward(self, x):
         pass
-
 
     def shared_step(self, batch, batch_idx):
         self.model.set_training()
@@ -548,8 +562,8 @@ class LightningModuleRates(pl.LightningModule):
 
         self.loss_accumulator.add_stats(
             {
-                "n_ins": (mols_t.lambda_ins > 0.0).sum().float(),
-                "n_del": (mols_t.lambda_del > 0.0).sum().float(),
+                "n_ins": float((mols_t.lambda_ins > 0.0).sum().item()),
+                "n_del": float((mols_t.lambda_del > 0.0).sum().item()),
             }
         )
 
@@ -563,7 +577,6 @@ class LightningModuleRates(pl.LightningModule):
         loss = self.shared_step(batch, batch_idx)
         self.log("loss/train", loss.detach(), prog_bar=True, logger=True)
         return loss
-
 
     def validation_step(self, batch, batch_idx):
         self.model_ema.eval()
@@ -605,8 +618,8 @@ class LightningModuleRates(pl.LightningModule):
         )
 
         try:
-            #pb_metrics = calc_posebusters_metrics(rdkit_mols)
-            #print(pb_metrics)
+            # pb_metrics = calc_posebusters_metrics(rdkit_mols)
+            # print(pb_metrics)
             pb_metrics = False
         except Exception as e:
             print(f"Error calculating PoseBusters metrics: {e}")
@@ -945,7 +958,7 @@ class LightningModuleRates(pl.LightningModule):
         # Compute the 2-norm for each layer
         # If using mixed precision, the gradients are already unscaled here
         norms = grad_norm(self, norm_type=2)
-        self.log_dict(norms)
+        self.log_dict(norms, on_step=True, on_epoch=False)
 
     def optimizer_step(
         self,

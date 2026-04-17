@@ -4,7 +4,7 @@ from torch_geometric.utils import to_dense_adj
 
 from chemflow.flow_matching.assignment import partial_optimal_transport_single
 
-from chemflow.utils.utils import EdgeAligner
+from chemflow.utils.utils import EDGE_ALIGNER
 
 from chemflow.dataset.molecule_data import (
     AugmentedMoleculeData,
@@ -74,7 +74,7 @@ class Interpolator:
         self.c_ins = c_ins
         self.c_del = c_del
 
-        self.edge_aligner = EdgeAligner()
+        self.edge_aligner = EDGE_ALIGNER
 
         self._cat_atom = torch.distributions.Categorical(
             probs=distributions.atom_type_distribution

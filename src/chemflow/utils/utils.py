@@ -354,6 +354,10 @@ class EdgeAligner:
     """
     Helper class to handle edge indices and attributes.
     Can be used to align edge indices and attributes between two groups of edges.
+
+    The class is stateless, so prefer the module-level ``EDGE_ALIGNER`` singleton
+    over instantiating new objects in hot loops (e.g. per-batch integration or
+    per-molecule join ops) to avoid unnecessary Python allocations.
     """
 
     def __init__(self):
@@ -483,3 +487,8 @@ class EdgeAligner:
             full_attrs_sorted.append(full_attr[perm])
 
         return full_edge_index_sorted, tuple(full_attrs_sorted)
+
+
+# Stateless shared instance — reuse in hot paths instead of constructing new
+# ``EdgeAligner()`` objects per batch / per molecule.
+EDGE_ALIGNER = EdgeAligner()
