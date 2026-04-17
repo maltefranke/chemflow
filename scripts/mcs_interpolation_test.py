@@ -354,50 +354,54 @@ def run(cfg: DictConfig):
     results = []
     targets_single = []
 
+    from chemflow.dataset.flow_matching_wrapper import FlowMatchingDatasetWrapperScaffoldGrowth
+    is_growth_mode = isinstance(val_dataset, FlowMatchingDatasetWrapperScaffoldGrowth)
+
     for i in range(32):
         base_idx = val_dataset._filtered_indices[i]
-        gid = int(val_dataset._mol_to_group[base_idx])
-        candidates = [j for j in val_dataset._groups[gid] if j != base_idx]
-        source_idx = random.choice(candidates)
-
         target = base_dataset[base_idx]
         smiles_target = base_dataset.get(base_idx).smiles
-        source = base_dataset[source_idx]
-        smiles_source = base_dataset.get(source_idx).smiles
-
-        src_matches = val_dataset._scaffold_atom_indices[source_idx]
         tgt_matches = val_dataset._scaffold_atom_indices[base_idx]
-        print(f"Source scaffold matches: {src_matches}")
-        print(f"Target scaffold matches: {tgt_matches}")
-        hydra.utils.log.info(
-            f"Found {src_matches} scaffold matches for source and {tgt_matches} for target."
-        )
-        scaffold_pairs = select_scaffold_pairs_spatially(
-            src_matches, tgt_matches,
-            source.x.cpu().numpy(),
-            target.x.cpu().numpy(),
-            val_dataset._scaffold_substituents[source_idx],
-            val_dataset._scaffold_substituents[base_idx],
-        )
 
-        if assignment_method == "substituent" and scaffold_pairs:
-            scaffold_substituents = (
+        if is_growth_mode:
+            # Source = scaffold-only subgraph of the target (random automorphism)
+            scaffold_indices = list(random.choice(tgt_matches))
+            idx_tensor = torch.tensor(scaffold_indices, dtype=torch.long)
+            source = target.get_permuted_subgraph(idx_tensor)
+            scaffold_pairs = [(j, scaffold_indices[j]) for j in range(len(scaffold_indices))]
+            smiles_source = f"<scaffold of {smiles_target}>"
+            scaffold_substituents = None
+        else:
+            gid = int(val_dataset._mol_to_group[base_idx])
+            candidates = [j for j in val_dataset._groups[gid] if j != base_idx]
+            source_idx = random.choice(candidates)
+            source = base_dataset[source_idx]
+            smiles_source = base_dataset.get(source_idx).smiles
+            src_matches = val_dataset._scaffold_atom_indices[source_idx]
+            scaffold_pairs = select_scaffold_pairs_spatially(
+                src_matches, tgt_matches,
+                source.x.cpu().numpy(),
+                target.x.cpu().numpy(),
                 val_dataset._scaffold_substituents[source_idx],
                 val_dataset._scaffold_substituents[base_idx],
             )
-        else:
-            scaffold_substituents = None
+            if assignment_method == "substituent" and scaffold_pairs:
+                scaffold_substituents = (
+                    val_dataset._scaffold_substituents[source_idx],
+                    val_dataset._scaffold_substituents[base_idx],
+                )
+            else:
+                scaffold_substituents = None
+            src_mol = Chem.MolFromSmiles(smiles_source)
+            for atom in src_mol.GetAtoms():
+                print(atom.GetIdx(), atom.GetSymbol())
 
-        src_mol = Chem.MolFromSmiles(smiles_source)
         tgt_mol = Chem.MolFromSmiles(smiles_target)
-        for atom in src_mol.GetAtoms():
-            print(atom.GetIdx(), atom.GetSymbol())
         for atom in tgt_mol.GetAtoms():
             print(atom.GetIdx(), atom.GetSymbol())
         hydra.utils.log.info(
             f"Processing pair {i}: {smiles_source} → {smiles_target}\n"
             f"  scaffold_pairs ({len(scaffold_pairs)}): {scaffold_pairs}\n"
-            f"  source (CDK): {Chem.MolToSmiles(src_mol)}\n"
             f"  target (CDK): {Chem.MolToSmiles(tgt_mol)}"
         )
 

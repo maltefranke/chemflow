@@ -94,11 +94,7 @@ class EmbeddingBackbone(nn.Module):
         embeddings_to_concat = [a_embed, N_nodes_embedding, t_embedding]
 
         if self.cfg_embedding is not None:
-        if self.cfg_embedding is not None:
             num_graphs = N_nodes.shape[0]
-            cfg_embed = self.cfg_embedding(
-                cfg_inputs if cfg_inputs is not None else {},
-                batch_size=num_graphs,
             cfg_embed = self.cfg_embedding(
                 cfg_inputs if cfg_inputs is not None else {},
                 batch_size=num_graphs,

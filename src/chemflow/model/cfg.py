@@ -274,14 +274,11 @@ class CFGAdapter:
                 mol_t, t.view(-1, 1),
                 prev_outs=prev_preds,
                 cfg_inputs=cfg_inputs,
-                cfg_inputs=cfg_inputs,
             )
             preds = self.apply_cfg(
-                
                 preds_cond,
                 preds,
                 self.cfg_guidance_scale,
-            ,
             )
 
         # Apply activations after CFG so guidance operates on raw logits.

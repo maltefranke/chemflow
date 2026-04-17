@@ -43,12 +43,12 @@ def build_callbacks(cfg: DictConfig) -> list[Callback]:
         callbacks.append(
             ModelCheckpoint(
                 dirpath=cfg.callbacks.best_train_checkpoint.dirpath,
-                monitor="loss_total",
+                monitor="loss/total",
                 mode="min",
                 save_top_k=cfg.callbacks.best_train_checkpoint.save_top_k,
                 verbose=cfg.callbacks.best_train_checkpoint.verbose,
                 save_last=cfg.callbacks.best_train_checkpoint.save_last,
-                filename="best_train-{epoch:04d}-{step:06d}-{loss_total:.4f}",
+                filename="best_train-{epoch:04d}-{step:06d}-{loss/total:.4f}",
                 every_n_train_steps=cfg.callbacks.best_train_checkpoint.every_n_train_steps,
                 save_on_train_epoch_end=False,
             )

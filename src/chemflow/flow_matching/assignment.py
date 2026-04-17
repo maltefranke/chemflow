@@ -492,7 +492,7 @@ def mcs_based_assignment_single(
     sample = AugmentedMoleculeData.from_molecule(sample_mol)
     target = AugmentedMoleculeData.from_molecule(target_mol)
 
-    hydra.utils.log.info(f"[MCS] Running MCS-based assignment with {len(fixed_pairs) if fixed_pairs else 'auto-detected'} fixed pairs.")
+    # hydra.utils.log.info(f"[MCS] Running MCS-based assignment with {len(fixed_pairs) if fixed_pairs else 'auto-detected'} fixed pairs.")
 
     N, M = sample.x.shape[0], target.x.shape[0]
     x0 = sample.x.detach().cpu().numpy()
@@ -525,7 +525,7 @@ def mcs_based_assignment_single(
         pts_t = torch.tensor(x1[mcs_t_idxs], dtype=torch.float32)
         R, t = rigid_alignment(pts_s, pts_t)
         x0 = (torch.tensor(x0, dtype=torch.float32) @ R.T + t).numpy()
-        sample.x = torch.tensor(x0, dtype=sample.x.dtype)
+        sample.x = torch.tensor(x0, dtype=sample.x.dtype, device=sample.x.device)
 
     row_ind, col_ind = mcs_constrained_assignment(
         x0, x1, a0, a1, mcs_pairs, c_move, c_sub, c_ins, c_del

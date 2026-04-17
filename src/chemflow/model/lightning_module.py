@@ -893,6 +893,10 @@ class LightningModuleRates(pl.LightningModule):
                 ins_edge_head=ins_edge_head,
             )
 
+            # Refresh scaffold_mask from mol_t: the integrator slices it on deletion
+            # and extends it on insertion, so the local variable must stay in sync.
+            scaffold_mask = getattr(mol_t, 'scaffold_mask', None)
+
             # Drop per-step intermediates before the next forward pass so the peak
             # live-tensor count doesn't include two steps' worth of activations.
             del (

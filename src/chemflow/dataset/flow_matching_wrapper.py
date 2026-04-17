@@ -18,6 +18,18 @@ from chemflow.dataset.molecule_data import MoleculeBatch
 from chemflow.flow_matching.sampling import sample_prior_graph
 
 
+def _substituents_need_rebuild(subs):
+    """True if scaffold_substituents key is absent or in the old flat list[int] format."""
+    if subs is None:
+        return True
+    for mol_subs in subs:
+        if mol_subs is None:
+            continue
+        for branches in mol_subs.values():
+            return bool(branches) and not isinstance(branches[0], list)
+    return False
+
+
 class FlowMatchingDatasetWrapper(Dataset):
     """Wraps a molecule dataset to move prior sampling and interpolation into
     ``__getitem__``, enabling parallel processing across DataLoader workers.
@@ -255,18 +267,6 @@ class FlowMatchingDatasetWrapperScaffoldDecoration(FlowMatchingDatasetWrapper):
             )
             torch.save(scaffold_groups, path)
 
-        def _substituents_need_rebuild(subs):
-            """True if key is absent or stored in the old flat list[int] format."""
-            if subs is None:
-                return True
-            for mol_subs in subs:
-                if mol_subs is None:
-                    continue
-                for branches in mol_subs.values():
-                    # New format: list[list[int]]; old: list[int]
-                    return bool(branches) and not isinstance(branches[0], list)
-            return False
-
         if _substituents_need_rebuild(scaffold_groups.get("scaffold_substituents")):
             from chemflow.dataset.data_utils import compute_scaffold_substituents
             scaffold_groups["scaffold_substituents"] = compute_scaffold_substituents(
@@ -372,6 +372,112 @@ class FlowMatchingDatasetWrapperScaffoldDecoration(FlowMatchingDatasetWrapper):
         return source, target
 
 
+class FlowMatchingDatasetWrapperScaffoldGrowth(FlowMatchingDatasetWrapper):
+    """Wrapper where the source is the bare scaffold of each target molecule.
+
+    For every target, the source consists only of its Bemis-Murcko scaffold
+    atoms (heavy ring atoms) — all residues and H atoms are deleted.  The
+    model learns to grow a full molecule from this scaffold skeleton.
+
+    Drop-in replacement for :class:`FlowMatchingDatasetWrapper` — select via
+    ``data.datamodule.wrapper._target_`` in the Hydra config.
+    """
+
+    def __init__(
+        self,
+        base_dataset,
+        distributions,
+        interpolator,
+        n_atoms_strategy="flexible",
+        time_dist=None,
+        stage="train",
+        scaffold_groups_dir=None,
+    ):
+        super().__init__(
+            base_dataset, distributions, interpolator, n_atoms_strategy, time_dist, stage
+        )
+
+        path = os.path.join(scaffold_groups_dir, f"scaffold_groups_{stage}.pt")
+
+        if os.path.exists(path):
+            scaffold_groups = torch.load(path, weights_only=False)
+        else:
+            from chemflow.dataset.data_utils import compute_scaffold_groups
+            mol_to_group, groups = compute_scaffold_groups(base_dataset)
+            scaffold_groups = {"mol_to_group": mol_to_group, "groups": groups}
+            os.makedirs(scaffold_groups_dir, exist_ok=True)
+            torch.save(scaffold_groups, path)
+
+        if "scaffold_atom_indices" not in scaffold_groups or not isinstance(
+            scaffold_groups["scaffold_atom_indices"][0], list
+        ):
+            from chemflow.dataset.data_utils import compute_scaffold_atom_indices
+            scaffold_groups["scaffold_atom_indices"] = compute_scaffold_atom_indices(base_dataset)
+            torch.save(scaffold_groups, path)
+
+        self._scaffold_atom_indices = scaffold_groups["scaffold_atom_indices"]
+
+        mol_to_group = scaffold_groups["mol_to_group"]
+        groups = scaffold_groups["groups"]
+        self._mol_to_group = mol_to_group
+        self._groups = [
+            [i for i in grp if self._scaffold_atom_indices[i]]
+            for grp in groups
+        ]
+
+        if _substituents_need_rebuild(scaffold_groups.get("scaffold_substituents")):
+            from chemflow.dataset.data_utils import compute_scaffold_substituents
+            scaffold_groups["scaffold_substituents"] = compute_scaffold_substituents(
+                base_dataset, scaffold_groups["scaffold_atom_indices"]
+            )
+            torch.save(scaffold_groups, path)
+        self._scaffold_substituents = scaffold_groups["scaffold_substituents"]
+
+        self._filtered_indices = [
+            i for i in range(len(self.base_dataset))
+            if self._scaffold_atom_indices[i]
+        ]
+
+    def __len__(self):
+        if hasattr(self, "_filtered_indices"):
+            return len(self._filtered_indices)
+        return len(self.base_dataset)
+
+    def __getitem__(self, index):
+        base_idx = self._filtered_indices[index]
+        target = self.base_dataset[base_idx]
+
+        scaffold_indices = list(random.choice(self._scaffold_atom_indices[base_idx]))
+        idx_tensor = torch.tensor(scaffold_indices, dtype=torch.long)
+        source = target.get_permuted_subgraph(idx_tensor)
+
+        scaffold_pairs = [(i, scaffold_indices[i]) for i in range(len(scaffold_indices))]
+
+        if self.stage == "train":
+            t = self.time_dist.sample((1,)).squeeze(0)
+            t = torch.clamp(t, min=0.0, max=1 - 1e-8)
+
+            mol_t, mol_1, ins_targets = self.interpolator.interpolate_single(
+                source, target, t.item(),
+                scaffold_pairs=scaffold_pairs,
+                scaffold_substituents=None,
+            )
+
+            n_scaffold = len(scaffold_pairs)
+            scaffold_mask = torch.zeros(mol_t.num_nodes, dtype=torch.long)
+            scaffold_mask[:n_scaffold] = 1
+            mol_t.scaffold_mask = scaffold_mask
+
+            if hasattr(target, "y") and target.y is not None:
+                mol_t.y = target.y
+
+            return mol_t, mol_1, ins_targets, t
+
+        scaffold_mask = torch.ones(source.num_nodes, dtype=torch.long)
+        source.scaffold_mask = scaffold_mask
+        return source, target
+
+
 def train_collate_fn(batch):
     """Collate pre-processed training samples into batched tensors.
 
@@ -413,26 +519,6 @@ def train_collate_fn(batch):
             and ins_targets.ins_edge_ins_local_idx.numel() > 0
         ):
             ins_targets.ins_edge_ins_local_idx.add_(ins_offset)
-        if (
-            hasattr(ins_targets, "ins_to_ins_edge_src_local_idx")
-            and ins_targets.ins_to_ins_edge_src_local_idx.numel() > 0
-        ):
-            ins_targets.ins_to_ins_edge_src_local_idx.add_(ins_offset)
-        if (
-            hasattr(ins_targets, "ins_to_ins_edge_dst_local_idx")
-            and ins_targets.ins_to_ins_edge_dst_local_idx.numel() > 0
-        ):
-            ins_targets.ins_to_ins_edge_dst_local_idx.add_(ins_offset)
-        if (
-            hasattr(ins_targets, "ins_to_ins_edge_spawn_src_idx")
-            and ins_targets.ins_to_ins_edge_spawn_src_idx.numel() > 0
-        ):
-            ins_targets.ins_to_ins_edge_spawn_src_idx.add_(offset)
-        if (
-            hasattr(ins_targets, "ins_to_ins_edge_spawn_dst_idx")
-            and ins_targets.ins_to_ins_edge_spawn_dst_idx.numel() > 0
-        ):
-            ins_targets.ins_to_ins_edge_spawn_dst_idx.add_(offset)
         if (
             hasattr(ins_targets, "ins_to_ins_edge_src_local_idx")
             and ins_targets.ins_to_ins_edge_src_local_idx.numel() > 0
