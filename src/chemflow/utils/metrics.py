@@ -16,6 +16,7 @@ from chemflow.utils.utils import token_to_index
 from posebusters import PoseBusters
 
 import faulthandler
+
 faulthandler.enable()
 
 # Silence RDKit warnings here too (in addition to chemflow.utils.rdkit) because
@@ -142,9 +143,7 @@ def _rdkit_mols_edge_type_indices(
     return torch.tensor(vals, dtype=torch.long, device=device)
 
 
-def _kl_divergence(
-    gen: torch.Tensor, target: torch.Tensor, eps: float
-) -> torch.Tensor:
+def _kl_divergence(gen: torch.Tensor, target: torch.Tensor, eps: float) -> torch.Tensor:
     return torch.sum(
         gen * (torch.log(gen.clamp(min=eps)) - torch.log(target.clamp(min=eps)))
     )
@@ -188,6 +187,7 @@ def atom_count_distribution_metrics(
     target = target / target.sum().clamp(min=eps)
 
     return {"atom_count_dist_kl": _kl_divergence(gen, target, eps)}
+
 
 def calc_atom_stabilities(mol):
     problems = Chem.DetectChemistryProblems(mol)
@@ -305,7 +305,9 @@ class AtomCountDistributionMetric(GenerativeMetric):
         )
         counts_t = counts_t.clamp(min=0, max=self.target_len - 1)
 
-        hist = torch.bincount(counts_t, minlength=self.target_len).to(dtype=torch.float32)
+        hist = torch.bincount(counts_t, minlength=self.target_len).to(
+            dtype=torch.float32
+        )
         self.gen_hist += hist
         self.n_total += float(len(counts))
 
@@ -435,11 +437,7 @@ class Validity(GenerativeMetric):
         self.add_state("total", default=torch.tensor(0), dist_reduce_fx="sum")
 
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
-        is_valid = [
-            chemflowRD.mol_is_valid(mol)
-            for mol in mols
-            if mol is not None
-        ]
+        is_valid = [chemflowRD.mol_is_valid(mol) for mol in mols if mol is not None]
         self.valid += sum(is_valid)
         self.total += len(mols)
 
@@ -456,13 +454,13 @@ class Uniqueness(GenerativeMetric):
         self.valid_smiles = []
 
     def reset(self):
+        # Chain to the base Metric.reset() so that torchmetrics' internal
+        super().reset()
         self.valid_smiles = []
 
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
         smiles = [
-            Chem.MolToSmiles(mol, canonical=True)
-            for mol in mols
-            if mol is not None
+            Chem.MolToSmiles(mol, canonical=True) for mol in mols if mol is not None
         ]
         valid_smiles = [smi for smi in smiles if smi is not None]
         self.valid_smiles.extend(valid_smiles)
@@ -575,7 +573,9 @@ class AverageEnergy(GenerativeMetric):
     def compute(self) -> torch.Tensor:
         return self.energy / self.n_valid_energies
 
+
 # TODO: Add xTB as level of theory option and add forces as a metric
+
 
 class AverageStrainEnergy(GenerativeMetric):
     """
@@ -736,35 +736,38 @@ def calc_posebusters_metrics(
 
     valid_mols = [mol for mol in rdkit_mols if mol is not None]
     if len(valid_mols) == 0:
-        return {}    
+        return {}
 
     buster = PoseBusters(config="mol", max_workers=-1)
-    
 
     df = buster.bust(valid_mols, None, None)
 
     results = {}
     for col in df.columns:
         # Skip string index columns if they are in the dataframe
-        if col in ['file', 'molecule']: 
+        if col in ["file", "molecule"]:
             continue
-            
+
         try:
             # Force the column to numeric (True=1.0, False=0.0, NaN=NaN)
             # errors='coerce' turns anything it can't convert into a NaN
-            numeric_series = pd.to_numeric(df[col], errors='coerce')
-            
+            numeric_series = pd.to_numeric(df[col], errors="coerce")
+
             # If the column isn't entirely NaNs after conversion, get the mean
             if not numeric_series.isna().all():
                 # Note: Adding the "posebusters/" prefix to match your logs!
                 results[col] = float(numeric_series.mean())
         except Exception:
-            print(f"Warning: Could not process column '{col}' in PoseBusters results. Skipping this metric.")
+            print(
+                f"Warning: Could not process column '{col}' in PoseBusters results. Skipping this metric."
+            )
             pass
 
     return results
 
+
 # {'modules': [{'name': 'Loading', 'function': 'loading', 'chosen_binary_test_output': ['mol_pred_loaded'], 'rename_outputs': {'mol_pred_loaded': 'MOL_PRED loaded'}}, {'name': 'Chemistry', 'function': 'rdkit_sanity', 'chosen_binary_test_output': ['passes_rdkit_sanity_checks'], 'rename_outputs': {'passes_rdkit_sanity_checks': 'Sanitization'}}, {'name': 'Chemistry', 'function': 'inchi_convertible', 'chosen_binary_test_output': ['inchi_convertible'], 'rename_outputs': {'inchi_convertible': 'InChI convertible'}}, {'name': 'Chemistry', 'function': 'atoms_connected', 'chosen_binary_test_output': ['all_atoms_connected'], 'rename_outputs': {'all_atoms_connected': 'All atoms connected'}}, {'name': 'Chemistry', 'function': 'check_radicals', 'chosen_binary_test_output': ['no_radicals'], 'rename_outputs': {'no_radicals': 'No radicals'}}, {'name': 'Geometry', 'function': 'distance_geometry', 'parameters': {'bound_matrix_params': {'set15bounds': True, 'scaleVDW': True, 'doTriangleSmoothing': True, 'useMacrocycle14config': False}, 'threshold_bad_bond_length': 0.25, 'threshold_bad_angle': 0.25, 'threshold_clash': 0.3, 'ignore_hydrogens': True, 'sanitize': True}, 'chosen_binary_test_output': ['bond_lengths_within_bounds', 'bond_angles_within_bounds', 'no_internal_clash'], 'rename_outputs': {'bond_lengths_within_bounds': 'Bond lengths', 'bond_angles_within_bounds': 'Bond angles', 'no_internal_clash': 'Internal steric clash'}}, {'name': 'Ring flatness', 'function': 'flatness', 'parameters': {'flat_systems': {'aromatic_5_membered_rings_sp2': '[ar5^2]1[ar5^2][ar5^2][ar5^2][ar5^2]1', 'aromatic_6_membered_rings_sp2': '[ar6^2]1[ar6^2][ar6^2][ar6^2][ar6^2][ar6^2]1'}, 'threshold_flatness': 0.25}, 'chosen_binary_test_output': ['flatness_passes'], 'rename_outputs': {'num_systems_checked': 'number_aromatic_rings_checked', 'num_systems_passed': 'number_aromatic_rings_pass', 'max_distance': 'aromatic_ring_maximum_distance_from_plane', 'flatness_passes': 'Aromatic ring flatness'}}, {'name': 'Ring non-flatness', 'function': 'flatness', 'parameters': {'check_nonflat': True, 'flat_systems': {'non-aromatic_6_membered_rings': '[C,O,S,N;R1]~1[C,O,S,N;R1][C,O,S,N;R1][C,O,S,N;R1][C,O,S,N;R1][C,O,S,N;R1]1', 'non-aromatic_6_membered_rings_db03_0': '[C;R1]~1[C;R1][C,O,S,N;R1]~[C,O,S,N;R1][C;R1][C;R1]1', 'non-aromatic_6_membered_rings_db03_1': '[C;R1]~1[C;R1][C;R1]~[C;R1][C,O,S,N;R1][C;R1]1', 'non-aromatic_6_membered_rings_db02_0': '[C;R1]~1[C;R1][C;R1][C,O,S,N;R1]~[C,O,S,N;R1][C;R1]1', 'non-aromatic_6_membered_rings_db02_1': '[C;R1]~1[C;R1][C,O,S,N;R1][C;R1]~[C;R1][C;R1]1'}, 'threshold_flatness': 0.05}, 'chosen_binary_test_output': ['flatness_passes'], 'rename_outputs': {'num_systems_checked': 'number_non-aromatic_rings_checked', 'num_systems_passed': 'number_non-aromatic_rings_pass', 'max_distance': 'non-aromatic_ring_maximum_distance_from_plane', 'flatness_passes': 'Non-aromatic ring non-flatness'}}, {'name': 'Double bond flatness', 'function': 'flatness', 'parameters': {'flat_systems': {'trigonal_planar_double_bonds': '[C;X3;^2](*)(*)=[C;X3;^2](*)(*)'}, 'threshold_flatness': 0.25}, 'chosen_binary_test_output': ['flatness_passes'], 'rename_outputs': {'num_systems_checked': 'number_double_bonds_checked', 'num_systems_passed': 'number_double_bonds_pass', 'max_distance': 'double_bond_maximum_distance_from_plane', 'flatness_passes': 'Double bond flatness'}}, {'name': 'Energy ratio', 'function': 'energy_ratio', 'parameters': {'threshold_energy_ratio': 100.0, 'ensemble_number_conformations': 50}}, {'name': 'Energy ratio', 'function': 'energy_ratio', 'parameters': {'threshold_energy_ratio': 100.0, 'ensemble_number_conformations': 50}, 'chosen_binary_test_output': ['energy_ratio_passes'], 'rename_outputs': {'energy_ratio_passes': 'Internal energy'}}], 'loading': {'mol_pred': {'cleanup': False, 'sanitize': False, 'add_hs': False, 'assign_stereo': False, 'load_all': True}, 'mol_true': {'cleanup': False, 'sanitize': False, 'add_hs': False, 'assign_stereo': False, 'load_all': True}, 'mol_cond': {'cleanup': False, 'sanitize': False, 'add_hs': False, 'assign_stereo': False, 'proximityBonding': False}}, 'top_n': None, 'max_workers': 0, 'chunk_size': 100}
+
 
 def calc_metrics_(
     rdkit_mols,
@@ -778,7 +781,9 @@ def calc_metrics_(
     metrics.reset()
     metrics.update(rdkit_mols)
     raw = metrics.compute()
-    results = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in raw.items()}
+    results = {
+        k: v.item() if isinstance(v, torch.Tensor) else v for k, v in raw.items()
+    }
 
     if mols is not None and target_n_atoms_distribution is not None:
         if device is None:
@@ -793,7 +798,10 @@ def calc_metrics_(
         )
         results = {
             **results,
-            **{k: v.item() if isinstance(v, torch.Tensor) else v for k, v in atom_count_results.items()},
+            **{
+                k: v.item() if isinstance(v, torch.Tensor) else v
+                for k, v in atom_count_results.items()
+            },
         }
 
     if stab_metrics is None:
@@ -802,7 +810,9 @@ def calc_metrics_(
     stab_metrics.reset()
     stab_metrics.update(mol_stabs)
     stab_raw = stab_metrics.compute()
-    stab_results = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in stab_raw.items()}
+    stab_results = {
+        k: v.item() if isinstance(v, torch.Tensor) else v for k, v in stab_raw.items()
+    }
 
     results = {**results, **stab_results}
     return results

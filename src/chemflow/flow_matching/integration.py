@@ -5,8 +5,7 @@ from chemflow.model.gmm import (
     sample_from_typed_gmm,
 )
 from chemflow.utils.utils import (
-    token_to_index,
-    EdgeAligner,
+    EDGE_ALIGNER,
 )
 
 from chemflow.dataset.molecule_data import (
@@ -87,12 +86,12 @@ class RateIntegrator:
         else:
             self.sub_e_schedule = sub_e_schedule
 
-        self.edge_aligner = EdgeAligner()
+        self.edge_aligner = EDGE_ALIGNER
 
         n_atoms_distribution = self.distributions.n_atoms_distribution
-        # NOTE true max_atoms would be 2* max(n_atoms_distr) to account for ins / del, 
+        # NOTE true max_atoms would be 2* max(n_atoms_distr) to account for ins / del,
         # but we add a buffer instead to be safe and avoid OOM errors
-        self.max_atoms = len(n_atoms_distribution) + 10 # add some buffer
+        self.max_atoms = len(n_atoms_distribution) + 10  # add some buffer
 
         self._cat_atom = torch.distributions.Categorical(
             probs=distributions.atom_type_distribution.to(device)
@@ -103,10 +102,20 @@ class RateIntegrator:
         self._cat_edge = torch.distributions.Categorical(
             probs=distributions.edge_type_distribution.to(device)
         )
+        self._cat_device = (
+            torch.device(device) if not isinstance(device, torch.device) else device
+        )
 
     def _distr_to_device(self, device: torch.device):
         # Keep all base categorical distributions on the current batch device.
         # This avoids mixed-device ops in insertion/substitution branches.
+        # Rebuilding Categoricals allocates a new logits tensor each call, so
+        # short-circuit when the device hasn't changed to avoid per-step churn.
+        device = (
+            torch.device(device) if not isinstance(device, torch.device) else device
+        )
+        if getattr(self, "_cat_device", None) == device:
+            return
         self._cat_atom = torch.distributions.Categorical(
             probs=self._cat_atom.probs.to(device)
         )
@@ -116,6 +125,7 @@ class RateIntegrator:
         self._cat_edge = torch.distributions.Categorical(
             probs=self._cat_edge.probs.to(device)
         )
+        self._cat_device = device
 
     def get_time_steps(self, num_steps: int | None = None) -> list[float]:
         if num_steps is None:
@@ -261,14 +271,14 @@ class RateIntegrator:
         # Fail-safe: ensure that the number of atoms per graph won't be greater than the max number of atoms
         if do_ins.any():
             n_atoms_per_graph = torch.bincount(batch_id, minlength=num_graphs)
-            n_ins_per_graph = torch.bincount(
-                batch_id[do_ins], minlength=num_graphs
+            n_ins_per_graph = torch.bincount(batch_id[do_ins], minlength=num_graphs)
+            overflow = (n_atoms_per_graph + n_ins_per_graph - self.max_atoms).clamp(
+                min=0
             )
-            overflow = (
-                n_atoms_per_graph + n_ins_per_graph - self.max_atoms
-            ).clamp(min=0)
             if overflow.any():
-                overflow_graphs = torch.nonzero(overflow, as_tuple=False).flatten().tolist()
+                overflow_graphs = (
+                    torch.nonzero(overflow, as_tuple=False).flatten().tolist()
+                )
                 for g in overflow_graphs:
                     n_to_remove = int(overflow[g].item())
                     removed_indices = torch.where((batch_id == g) & do_ins)[0]
@@ -357,17 +367,13 @@ class RateIntegrator:
             keep_mask = ~do_del
 
             # Fail-safe: prevent deletion of entire sample (keep at least 2 nodes per batch_id)
-            n_kept_per_graph = torch.bincount(
-                batch_id[keep_mask], minlength=num_graphs
-            )
+            n_kept_per_graph = torch.bincount(batch_id[keep_mask], minlength=num_graphs)
             under = (2 - n_kept_per_graph).clamp(min=0)
             if under.any():
                 under_graphs = torch.nonzero(under, as_tuple=False).flatten().tolist()
                 for g in under_graphs:
                     n_to_restore = int(under[g].item())
-                    deleted_in_graph_idx = torch.where(
-                        (batch_id == g) & do_del
-                    )[0]
+                    deleted_in_graph_idx = torch.where((batch_id == g) & do_del)[0]
                     n_restore = min(n_to_restore, deleted_in_graph_idx.shape[0])
                     if n_restore > 0:
                         keep_mask[deleted_in_graph_idx[:n_restore]] = True

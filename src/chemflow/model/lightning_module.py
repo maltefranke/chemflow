@@ -9,16 +9,16 @@ from chemflow.model.losses import (
     do_action_loss,
     rate_loss,
     class_loss,
-    reduce_loss,
 )
 
-from chemflow.utils.utils import EdgeAligner
-from external_code.egnn import unsorted_segment_mean, unsorted_segment_sum
+from chemflow.utils.utils import EDGE_ALIGNER
+from external_code.egnn import unsorted_segment_mean
 
 from chemflow.dataset.molecule_data import MoleculeBatch
 from chemflow.dataset.vocab import Vocab, Distributions
 from chemflow.utils.metrics import (
     calc_metrics_,
+    MetricCollection,
     calc_posebusters_metrics,
     init_metrics,
 )
@@ -27,8 +27,6 @@ from chemflow.utils.loss_accumulation import LossAccumulator
 from chemflow.model.learnable_loss import UnifiedWeightedLoss
 from chemflow.utils.loss_weighing import (
     InverseSquaredTimeLossWeighting,
-    ConstantTimeLossWeighting,
-    ShiftedParabolaTimeLossWeighting,
 )
 from chemflow.utils import rdkit as chemflowRD
 from chemflow.utils.lr_schedulers import EMADecayScheduler
@@ -84,8 +82,8 @@ class LightningModuleRates(pl.LightningModule):
         charge_token_weights: torch.Tensor,
         cfg_adapter: DictConfig,
         time_dist: DictConfig,
-        metrics: "MetricCollection",
-        stability_metrics: "MetricCollection",
+        metrics: MetricCollection,
+        stability_metrics: MetricCollection,
         n_atoms_strategy: str = "fixed",
         ins_noise_scale: float = 0.5,
         use_learnable_loss_weights: bool = False,
@@ -142,7 +140,7 @@ class LightningModuleRates(pl.LightningModule):
         self.model_ema.eval()
 
         # handling of edge utilities, especially for upper-triangular handling
-        self.edge_aligner = EdgeAligner()
+        self.edge_aligner = EDGE_ALIGNER
 
         # set up loss weighting for individual loss components
         loss_weight_values = {k: float(v) for k, v in loss_weights.items()}
@@ -174,8 +172,16 @@ class LightningModuleRates(pl.LightningModule):
         self.is_compiled = False
 
         # lastly, save hyperparameters
+        # ``cfg_adapter`` wraps ``self.model``; excluding it avoids capturing a
+        # duplicate (cyclic) reference to the backbone in the hparams snapshot
+        # and keeps checkpoint size down.
         self.save_hyperparameters(
-            ignore=["ema_decay_scheduler", "metrics", "stability_metrics"]
+            ignore=[
+                "ema_decay_scheduler",
+                "metrics",
+                "stability_metrics",
+                "cfg_adapter",
+            ]
         )
 
     def compile(self):
@@ -554,8 +560,8 @@ class LightningModuleRates(pl.LightningModule):
 
         self.loss_accumulator.add_stats(
             {
-                "n_ins": (mols_t.lambda_ins > 0.0).sum().float(),
-                "n_del": (mols_t.lambda_del > 0.0).sum().float(),
+                "n_ins": float((mols_t.lambda_ins > 0.0).sum().item()),
+                "n_del": float((mols_t.lambda_del > 0.0).sum().item()),
             }
         )
 
@@ -610,6 +616,8 @@ class LightningModuleRates(pl.LightningModule):
         )
 
         try:
+            # pb_metrics = calc_posebusters_metrics(rdkit_mols)
+            # print(pb_metrics)
             # pb_metrics = calc_posebusters_metrics(rdkit_mols)
             # print(pb_metrics)
             pb_metrics = False
@@ -955,7 +963,7 @@ class LightningModuleRates(pl.LightningModule):
         # Compute the 2-norm for each layer
         # If using mixed precision, the gradients are already unscaled here
         norms = grad_norm(self, norm_type=2)
-        self.log_dict(norms)
+        self.log_dict(norms, on_step=True, on_epoch=False)
 
     def optimizer_step(
         self,
