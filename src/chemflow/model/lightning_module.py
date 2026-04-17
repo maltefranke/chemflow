@@ -4,7 +4,13 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
 import hydra
-from chemflow.model.losses import typed_gmm_loss, do_action_loss, rate_loss, class_loss, reduce_loss
+from chemflow.model.losses import (
+    typed_gmm_loss,
+    do_action_loss,
+    rate_loss,
+    class_loss,
+    reduce_loss,
+)
 
 from chemflow.utils.utils import EdgeAligner
 from external_code.egnn import unsorted_segment_mean, unsorted_segment_sum
@@ -89,9 +95,9 @@ class LightningModuleRates(pl.LightningModule):
         use_time_weights: bool = False,
     ):
         super().__init__()
-        
+
         self.model = hydra.utils.instantiate(model)
-        
+
         # vocab and distributions
         self.vocab = vocab
         self.distributions = distributions
@@ -122,7 +128,7 @@ class LightningModuleRates(pl.LightningModule):
         # metrics tracking for validation
         self.metrics = metrics
         self.stability_metrics = stability_metrics
-        
+
         self.cfg_adapter = hydra.utils.instantiate(
             cfg_adapter,
             model=self.model,
@@ -168,8 +174,9 @@ class LightningModuleRates(pl.LightningModule):
         self.is_compiled = False
 
         # lastly, save hyperparameters
-        self.save_hyperparameters(ignore=["ema_decay_scheduler", "metrics", "stability_metrics"])
-
+        self.save_hyperparameters(
+            ignore=["ema_decay_scheduler", "metrics", "stability_metrics"]
+        )
 
     def compile(self):
         """Compile the model using torch.compile."""
@@ -210,7 +217,6 @@ class LightningModuleRates(pl.LightningModule):
 
     def forward(self, x):
         pass
-
 
     def shared_step(self, batch, batch_idx):
         self.model.set_training()
@@ -564,7 +570,6 @@ class LightningModuleRates(pl.LightningModule):
         self.log("loss/train", loss.detach(), prog_bar=True, logger=True)
         return loss
 
-
     def validation_step(self, batch, batch_idx):
         self.model_ema.eval()
         batched_mols = self.sample(batch, batch_idx, return_traj=False)
@@ -605,8 +610,8 @@ class LightningModuleRates(pl.LightningModule):
         )
 
         try:
-            #pb_metrics = calc_posebusters_metrics(rdkit_mols)
-            #print(pb_metrics)
+            # pb_metrics = calc_posebusters_metrics(rdkit_mols)
+            # print(pb_metrics)
             pb_metrics = False
         except Exception as e:
             print(f"Error calculating PoseBusters metrics: {e}")
@@ -781,8 +786,13 @@ class LightningModuleRates(pl.LightningModule):
         )
 
         # Integration loop: integrate from t=0 to t=1
-        for step_size in step_sizes:
+        for step_idx, step_size in enumerate(step_sizes):
             batch_id = mol_t.batch
+
+            # Force contiguity on every step, avoid memory fragmentation.
+            mol_t.edge_index = mol_t.edge_index.contiguous()
+            if mol_t.batch is not None:
+                mol_t.batch = mol_t.batch.contiguous()
 
             prev_preds = preds
 

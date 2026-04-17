@@ -1,11 +1,12 @@
 """Code adapted from SemlaFlow"""
 
 import os
+import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 
 import torch
 import pandas as pd
-from rdkit import Chem
+from rdkit import Chem, RDLogger
 from torchmetrics import Metric
 from torchmetrics import MetricCollection
 
@@ -16,6 +17,71 @@ from posebusters import PoseBusters
 
 import faulthandler
 faulthandler.enable()
+
+# Silence RDKit warnings here too (in addition to chemflow.utils.rdkit) because
+# this module may be imported first from some code paths.
+RDLogger.DisableLog("rdApp.*")
+
+
+# ---------------------------------------------------------------------------
+# Shared process pool for CPU-heavy RDKit work (optimise_mol / calc_energy).
+#
+# Why this exists:
+#   * MMFF optimisation + energy calc is Python/C serial per-molecule.
+#   * Running it on the main thread inside validation_step starves the
+#     TorchElastic rendezvous keep-alive thread and triggers
+#     RendezvousTimeoutError on long val cycles.
+#   * We use a "spawn" context so the children do not inherit the parent's
+#     CUDA context (fork + CUDA = undefined behavior).
+#   * The pool is lazy so simply importing metrics.py does not pay the
+#     spawn cost; it starts on the first validation step.
+# ---------------------------------------------------------------------------
+
+_RD_POOL: ProcessPoolExecutor | None = None
+_RD_POOL_MAX_WORKERS = int(os.environ.get("CHEMFLOW_RD_POOL_WORKERS", "4"))
+
+
+def _get_rdkit_pool() -> ProcessPoolExecutor:
+    global _RD_POOL
+    if _RD_POOL is None:
+        affinity = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
+        # Leave at least half the cores for DataLoader workers + rendezvous.
+        n = max(1, min(_RD_POOL_MAX_WORKERS, affinity // 2))
+        _RD_POOL = ProcessPoolExecutor(
+            max_workers=n,
+            mp_context=mp.get_context("spawn"),
+        )
+    return _RD_POOL
+
+
+def _pool_map(fn, items: list) -> list:
+    """Run `fn` over `items` in the shared RDKit pool.
+
+    Falls back to a plain list comprehension if the pool cannot be
+    constructed (e.g. spawn is unavailable) so metrics never break
+    training.
+    """
+    if not items:
+        return []
+    try:
+        pool = _get_rdkit_pool()
+        n_workers = pool._max_workers  # type: ignore[attr-defined]
+        chunk = max(1, len(items) // (n_workers * 4))
+        return list(pool.map(fn, items, chunksize=chunk))
+    except Exception:
+        return [fn(x) for x in items]
+
+
+def _rd_optimise_mol(mol):
+    return chemflowRD.optimise_mol(mol)
+
+
+def _rd_calc_energy(mol):
+    return chemflowRD.calc_energy(mol)
+
+
+def _rd_calc_energy_per_atom(mol):
+    return chemflowRD.calc_energy(mol, per_atom=True)
 
 
 _BOND_TYPE_TO_EDGE_TOKEN = {
@@ -459,11 +525,12 @@ class EnergyValidity(GenerativeMetric):
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
         num_mols = len(mols)
 
+        non_none = [m for m in mols if m is not None]
         if self.optimise:
-            mols = [chemflowRD.optimise_mol(mol) for mol in mols if mol is not None]
+            non_none = [m for m in _pool_map(_rd_optimise_mol, non_none) if m is not None]
 
-        energies = [chemflowRD.calc_energy(mol) for mol in mols if mol is not None]
-        valid_energies = [energy for energy in energies if _is_valid_float(energy)]
+        energies = _pool_map(_rd_calc_energy, non_none)
+        valid_energies = [e for e in energies if _is_valid_float(e)]
 
         self.n_valid += len(valid_energies)
         self.total += num_mols
@@ -494,15 +561,13 @@ class AverageEnergy(GenerativeMetric):
         )
 
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
+        non_none = [m for m in mols if m is not None]
         if self.optimise:
-            mols = [chemflowRD.optimise_mol(mol) for mol in mols if mol is not None]
+            non_none = [m for m in _pool_map(_rd_optimise_mol, non_none) if m is not None]
 
-        energies = [
-            chemflowRD.calc_energy(mol, per_atom=self.per_atom)
-            for mol in mols
-            if mol is not None
-        ]
-        valid_energies = [energy for energy in energies if _is_valid_float(energy)]
+        energy_fn = _rd_calc_energy_per_atom if self.per_atom else _rd_calc_energy
+        energies = _pool_map(energy_fn, non_none)
+        valid_energies = [e for e in energies if _is_valid_float(e)]
 
         self.energy += sum(valid_energies)
         self.n_valid_energies += len(valid_energies)
@@ -539,26 +604,28 @@ class AverageStrainEnergy(GenerativeMetric):
         self.add_state("n_valid", default=torch.tensor(0), dist_reduce_fx="sum")
 
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
-        opt_mols = [
-            (idx, chemflowRD.optimise_mol(mol))
-            for idx, mol in list(enumerate(mols))
-            if mol is not None
-        ]
-        energies = [
-            (idx, chemflowRD.calc_energy(mol, per_atom=self.per_atom))
-            for idx, mol in opt_mols
-            if mol is not None
-        ]
-        valids = [(idx, energy) for idx, energy in energies if energy is not None]
-
-        if len(valids) == 0:
+        indexed = [(idx, m) for idx, m in enumerate(mols) if m is not None]
+        if not indexed:
             return
 
-        valid_indices, valid_energies = tuple(zip(*valids))
-        original_energies = [
-            chemflowRD.calc_energy(mols[idx], per_atom=self.per_atom)
-            for idx in valid_indices
-        ]
+        indices, non_none = zip(*indexed)
+        optimised = _pool_map(_rd_optimise_mol, list(non_none))
+
+        energy_fn = _rd_calc_energy_per_atom if self.per_atom else _rd_calc_energy
+
+        opt_pairs = [(i, m) for i, m in zip(indices, optimised) if m is not None]
+        if not opt_pairs:
+            return
+        opt_indices, opt_mols_list = zip(*opt_pairs)
+        opt_energies = _pool_map(energy_fn, list(opt_mols_list))
+
+        pairs = [(i, e) for i, e in zip(opt_indices, opt_energies) if e is not None]
+        if not pairs:
+            return
+
+        valid_indices, valid_energies = zip(*pairs)
+        original_energies = _pool_map(energy_fn, [mols[i] for i in valid_indices])
+
         energy_diffs = [
             orig - opt for orig, opt in zip(original_energies, valid_energies)
         ]
@@ -587,18 +654,19 @@ class AverageOptRmsd(GenerativeMetric):
         self.add_state("n_valid", default=torch.tensor(0), dist_reduce_fx="sum")
 
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
-        valids = [
-            (idx, chemflowRD.optimise_mol(mol))
-            for idx, mol in list(enumerate(mols))
-            if mol is not None
-        ]
-        valids = [(idx, mol) for idx, mol in valids if mol is not None]
-
-        if len(valids) == 0:
+        indexed = [(idx, m) for idx, m in enumerate(mols) if m is not None]
+        if not indexed:
             return
 
-        valid_indices, opt_mols = tuple(zip(*valids))
-        original_mols = [mols[idx] for idx in valid_indices]
+        indices, non_none = zip(*indexed)
+        optimised = _pool_map(_rd_optimise_mol, list(non_none))
+
+        pairs = [(i, m) for i, m in zip(indices, optimised) if m is not None]
+        if not pairs:
+            return
+
+        valid_indices, opt_mols = zip(*pairs)
+        original_mols = [mols[i] for i in valid_indices]
         rmsds = [
             chemflowRD.conf_distance(mol1, mol2)
             for mol1, mol2 in zip(original_mols, opt_mols)
