@@ -123,7 +123,7 @@ class RateIntegrator:
             time_points = torch.linspace(0, 1, num_steps + 1).tolist()
 
         elif self.time_strategy == "log":
-            time_points = (1 - torch.logspace(0, -4, num_steps)).tolist()
+            time_points = (1 - torch.logspace(0, -3, num_steps)).tolist()
 
         else:
             raise ValueError(f"Invalid time strategy: {self.time_strategy}")
@@ -347,6 +347,11 @@ class RateIntegrator:
             edge_index=edge_index,
             batch=batch_id,
         )
+
+        # Carry scaffold_mask through so filter_nodes / join / sort_nodes_by_batch
+        # can propagate it correctly (fixes node-ordering bug from sort_nodes_by_batch).
+        if hasattr(mol_t, "scaffold_mask") and mol_t.scaffold_mask is not None:
+            mol.scaffold_mask = mol_t.scaffold_mask
 
         keep_mask_out = None
         n_insertions_out = 0

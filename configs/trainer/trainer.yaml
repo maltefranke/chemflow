@@ -13,7 +13,7 @@ trainer:
   gradient_clip_algorithm: norm
   
   #val_check_interval: 5000
-  check_val_every_n_epoch: 10
+  check_val_every_n_epoch: 1 #0
  # profiler: simple
 
   #limit_train_batches: 50

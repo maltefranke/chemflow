@@ -133,14 +133,76 @@ def distance_and_class_based_assignment(
     return row_ind, col_ind
 
 
+def match_branches(
+    i_s: int,
+    i_t: int,
+    src_branches: list[list[int]],
+    tgt_branches: list[list[int]],
+    x0: np.ndarray,
+    x1: np.ndarray,
+) -> tuple[list[tuple[int, int]], list[int], list[int]]:
+    """Match substituent branches by spatial direction after Kabsch alignment.
+
+    For each branch the root atom (index 0, the direct non-scaffold neighbour)
+    defines the branch position.  The cost of matching source branch ``bi`` to
+    target branch ``bj`` is the Euclidean distance between their root atoms
+    (``x0[src_branches[bi][0]]`` and ``x1[tgt_branches[bj][0]]``).
+
+    Because ``x0`` has already been Kabsch-aligned to ``x1`` before this
+    function is called, "up" in source directly corresponds to "up" in target.
+
+    Args:
+        i_s: Scaffold atom index in source (used for the root-position lookup).
+        i_t: Scaffold atom index in target (used for the root-position lookup).
+        src_branches: List of branches for scaffold atom ``i_s``; each branch
+            is a list of atom indices with the root atom first.
+        tgt_branches: List of branches for scaffold atom ``i_t``; each branch
+            is a list of atom indices with the root atom first.
+        x0: Source atom positions (already Kabsch-aligned), shape (N, 3).
+        x1: Target atom positions, shape (M, 3).
+
+    Returns:
+        matched: List of (src_branch_idx, tgt_branch_idx) pairs.
+        unmatched_src: Source branch indices with no target partner.
+        unmatched_tgt: Target branch indices with no source partner.
+    """
+    n_s = len(src_branches)
+    n_t = len(tgt_branches)
+
+    if n_s == 0 and n_t == 0:
+        return [], [], []
+    if n_s == 0:
+        return [], [], list(range(n_t))
+    if n_t == 0:
+        return [], list(range(n_s)), []
+
+    # Cost matrix: distance between branch root positions
+    cost = np.zeros((n_s, n_t), dtype=float)
+    for bi, branch_s in enumerate(src_branches):
+        for bj, branch_t in enumerate(tgt_branches):
+            cost[bi, bj] = np.linalg.norm(
+                x0[branch_s[0]] - x1[branch_t[0]]
+            )
+
+    # Hungarian assignment on the smaller of the two sides
+    row_ind, col_ind = linear_sum_assignment(cost)
+
+    matched = list(zip(row_ind.tolist(), col_ind.tolist()))
+    matched_src = set(row_ind.tolist())
+    matched_tgt = set(col_ind.tolist())
+    unmatched_src = [i for i in range(n_s) if i not in matched_src]
+    unmatched_tgt = [j for j in range(n_t) if j not in matched_tgt]
+    return matched, unmatched_src, unmatched_tgt
+
+
 def substituent_constrained_assignment(
     x0,
     x1,
     a0,
     a1,
     scaffold_pairs: list[tuple[int, int]],
-    src_subs: dict[int, list[int]],
-    tgt_subs: dict[int, list[int]],
+    src_subs: dict[int, list[list[int]]],
+    tgt_subs: dict[int, list[list[int]]],
     c_move=1.0,
     c_sub=10.0,
     c_ins=5.0,
@@ -156,8 +218,9 @@ def substituent_constrained_assignment(
         x0, x1: positions
         a0, a1: atom types
         scaffold_pairs: fixed backbone correspondences
-        src_subs: dict[scaffold_atom_idx -> list of substituent atom indices] for source
-        tgt_subs: dict[scaffold_atom_idx -> list of substituent atom indices] for target
+        src_subs: dict[scaffold_atom_idx -> list of residue branches] for source;
+            each branch is a list of atom indices with the root atom first
+        tgt_subs: same structure for target
         c_move, c_sub, c_ins, c_del: OT cost weights
     """
     N = x0.shape[0]
@@ -186,49 +249,66 @@ def substituent_constrained_assignment(
     for i_s, i_t in valid_pairs:
         global_pairs.append((N + i_t, M + i_s))
 
-    # Phase 3: Per-position OT on substituent groups
-    for i_s, i_t in valid_pairs:
-        sub0 = [a for a in src_subs.get(i_s, []) if a not in used_src]
-        sub1 = [b for b in tgt_subs.get(i_t, []) if b not in used_tgt]
-        used_src.update(sub0)
-        used_tgt.update(sub1)
-
+    # Helper: run partial OT between one matched branch pair and record results
+    # in global_pairs.  Captures N, M, x0, x1, a0, a1 and cost weights from
+    # the enclosing scope.
+    def _ot_branch(sub0, sub1):
         n_u, m_u = len(sub0), len(sub1)
-
         if n_u == 0 and m_u == 0:
-            continue
-        elif n_u == 0:
-            # All tgt substituents are insertions
+            return
+        if n_u == 0:
             global_pairs.extend((N + j, j) for j in sub1)
-        elif m_u == 0:
-            # All src substituents are deletions
+            return
+        if m_u == 0:
             global_pairs.extend((i, M + i) for i in sub0)
-        else:
-            # Run independent partial OT on this substituent group
-            row_u, col_u = distance_and_class_based_assignment(
-                x0[np.array(sub0)],
-                x1[np.array(sub1)],
-                a0[np.array(sub0)],
-                a1[np.array(sub1)],
-                c_move=c_move,
-                c_sub=c_sub,
-                c_ins=c_ins,
-                c_del=c_del,
-            )
+            return
+        row_u, col_u = distance_and_class_based_assignment(
+            x0[np.array(sub0)],
+            x1[np.array(sub1)],
+            a0[np.array(sub0)],
+            a1[np.array(sub1)],
+            c_move=c_move,
+            c_sub=c_sub,
+            c_ins=c_ins,
+            c_del=c_del,
+        )
+        for r_loc, c_loc in zip(
+            row_u.tolist(), col_u.tolist(), strict=True
+        ):
+            r_glob = sub0[r_loc] if r_loc < n_u else N + sub1[r_loc - n_u]
+            c_glob = sub1[c_loc] if c_loc < m_u else M + sub0[c_loc - m_u]
+            global_pairs.append((r_glob, c_glob))
 
-            for r_loc, c_loc in zip(row_u.tolist(), col_u.tolist(), strict=True):
-                # Map reduced augmented indices to full augmented indices
-                if r_loc < n_u:
-                    r_glob = sub0[r_loc]
-                else:
-                    r_glob = N + sub1[r_loc - n_u]
+    # Phase 3: Per-residue OT — match branches by spatial direction, then OT
+    # within each matched branch pair.
+    for i_s, i_t in valid_pairs:
+        src_branches = src_subs.get(i_s, [])
+        tgt_branches = tgt_subs.get(i_t, [])
 
-                if c_loc < m_u:
-                    c_glob = sub1[c_loc]
-                else:
-                    c_glob = M + sub0[c_loc - m_u]
+        matched, unmatched_src_b, unmatched_tgt_b = match_branches(
+            i_s, i_t, src_branches, tgt_branches, x0, x1
+        )
 
-                global_pairs.append((r_glob, c_glob))
+        for bi_s, bi_t in matched:
+            sub0 = [
+                a for a in src_branches[bi_s] if a not in used_src
+            ]
+            sub1 = [
+                b for b in tgt_branches[bi_t] if b not in used_tgt
+            ]
+            used_src.update(sub0)
+            used_tgt.update(sub1)
+            _ot_branch(sub0, sub1)
+
+        for bi_s in unmatched_src_b:
+            sub0 = [a for a in src_branches[bi_s] if a not in used_src]
+            used_src.update(sub0)
+            global_pairs.extend((a, M + a) for a in sub0)
+
+        for bi_t in unmatched_tgt_b:
+            sub1 = [b for b in tgt_branches[bi_t] if b not in used_tgt]
+            used_tgt.update(sub1)
+            global_pairs.extend((N + b, b) for b in sub1)
 
     # Phase 4: Handle atoms not in any substituent (unowned atoms)
     unowned_src = [i for i in range(N) if i not in used_src]
@@ -474,8 +554,8 @@ def substituent_based_assignment_single(
     sample_mol: MoleculeData,
     target_mol: MoleculeData,
     fixed_pairs: list[tuple[int, int]],
-    src_subs: dict[int, list[int]],
-    tgt_subs: dict[int, list[int]],
+    src_subs: dict[int, list[list[int]]],
+    tgt_subs: dict[int, list[list[int]]],
     c_move: float = 1.0,
     c_sub: float = 10.0,
     c_ins: float = 5.0,
@@ -484,19 +564,19 @@ def substituent_based_assignment_single(
 ) -> tuple[AugmentedMoleculeData, AugmentedMoleculeData]:
     """Substituent-based partial optimal transport alignment.
 
-    Fixes scaffold atom pairs, then runs independent partial OT on each
-    scaffold position's substituent group. This constrains decorations
-    so atoms from one scaffold position can only match against decorations
-    from the corresponding paired position.
+    Fixes scaffold atom pairs, then matches substituent branches by spatial
+    direction (after Kabsch alignment) and runs independent partial OT within
+    each matched branch pair.
 
     Args:
         sample_mol: Prior sample molecule.
         target_mol: Target molecule from the dataset.
         fixed_pairs: Scaffold atom correspondences (source_idx, target_idx).
-        src_subs: dict mapping scaffold atom index to list of substituent atom indices
-                 (source molecule).
-        tgt_subs: dict mapping scaffold atom index to list of substituent atom indices
-                 (target molecule).
+        src_subs: dict mapping scaffold atom index to list of residue branches;
+            each branch is a list of atom indices with the root atom first
+            (source molecule).
+        tgt_subs: dict mapping scaffold atom index to list of residue branches
+            (target molecule).
         c_move, c_sub, c_ins, c_del: OT cost weights.
         optimal_transport: Alignment strategy ("equivariant" or other).
 

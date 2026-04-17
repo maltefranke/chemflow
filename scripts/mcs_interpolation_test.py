@@ -10,7 +10,7 @@ from omegaconf import DictConfig, OmegaConf
 from rdkit import Chem
 from torch_geometric.utils import to_dense_adj
 
-from chemflow.dataset.data_utils import select_scaffold_pairs_by_neighbor_count
+from chemflow.dataset.data_utils import select_scaffold_pairs_spatially
 from chemflow.dataset.molecule_data import (
     AugmentedMoleculeData,
     MoleculeData,
@@ -34,20 +34,6 @@ torch.set_float32_matmul_precision("medium")
 
 pl.seed_everything(42)
 
-
-def compute_scaffold_pairs(
-    src_matches: list,
-    tgt_matches: list,
-    src_dec: torch.Tensor,
-    tgt_dec: torch.Tensor,
-) -> list:
-    """Pick the scaffold automorphism pair by decoration-count L1 score.
-
-    Returns a list of (src_atom_idx, tgt_atom_idx) pairs, or [] if no matches.
-    """
-    return select_scaffold_pairs_by_neighbor_count(
-        src_dec, src_matches, tgt_dec, tgt_matches
-    )
 
 
 def pre_sample_events_mcs(
@@ -386,10 +372,12 @@ def run(cfg: DictConfig):
         hydra.utils.log.info(
             f"Found {src_matches} scaffold matches for source and {tgt_matches} for target."
         )
-        scaffold_pairs = compute_scaffold_pairs(
+        scaffold_pairs = select_scaffold_pairs_spatially(
             src_matches, tgt_matches,
-            src_dec=val_dataset._scaffold_decoration_counts[source_idx],
-            tgt_dec=val_dataset._scaffold_decoration_counts[base_idx],
+            source.x.cpu().numpy(),
+            target.x.cpu().numpy(),
+            val_dataset._scaffold_substituents[source_idx],
+            val_dataset._scaffold_substituents[base_idx],
         )
 
         if assignment_method == "substituent" and scaffold_pairs:

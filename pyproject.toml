@@ -16,6 +16,7 @@ dependencies = [
     "posebusters>=0.6.0",
     "py3dmol>=2.5.4",
     "ipywidgets>=8.1.8",
+    "matplotlib>=3.10.8",
 ]
 
  [tool.uv.extra-build-dependencies]

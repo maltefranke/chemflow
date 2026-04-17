@@ -1,15 +1,21 @@
 ## Put your callback args here
-callbacks:
-  monitor_metric: "val_validity" 
-  monitor_metric_mode: max
+monitor_metric: "val/validity"
+monitor_metric_mode: max
 
-  model_checkpoints:
-    save_top_k: 1
-    verbose: False
-    save_last: False
+model_checkpoints:
+  save_top_k: 1
+  verbose: False
+  save_last: False
 
-  every_n_epochs_checkpoint:
-    every_n_epochs: 1
-    save_top_k: 3
-    verbose: False
-    save_last: True
+best_train_checkpoint:
+  dirpath: "best_train"
+  save_top_k: 1
+  verbose: False
+  save_last: False
+  every_n_train_steps: 100
+
+every_n_epochs_checkpoint:
+  every_n_epochs: 100
+  save_top_k: 1
+  verbose: False
+  save_last: True

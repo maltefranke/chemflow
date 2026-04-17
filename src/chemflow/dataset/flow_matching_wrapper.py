@@ -12,7 +12,7 @@ from torch.utils.data import Dataset
 
 from chemflow.dataset.data_utils import (
     compute_scaffold_decoration_counts,
-    select_scaffold_pairs_by_neighbor_count,
+    select_scaffold_pairs_spatially,
 )
 from chemflow.dataset.molecule_data import MoleculeBatch
 from chemflow.flow_matching.sampling import sample_prior_graph
@@ -253,7 +253,19 @@ class FlowMatchingDatasetWrapperScaffoldDecoration(FlowMatchingDatasetWrapper):
             )
             torch.save(scaffold_groups, path)
 
-        if "scaffold_substituents" not in scaffold_groups:
+        def _substituents_need_rebuild(subs):
+            """True if key is absent or stored in the old flat list[int] format."""
+            if subs is None:
+                return True
+            for mol_subs in subs:
+                if mol_subs is None:
+                    continue
+                for branches in mol_subs.values():
+                    # New format: list[list[int]]; old: list[int]
+                    return bool(branches) and not isinstance(branches[0], list)
+            return False
+
+        if _substituents_need_rebuild(scaffold_groups.get("scaffold_substituents")):
             from chemflow.dataset.data_utils import compute_scaffold_substituents
             scaffold_groups["scaffold_substituents"] = compute_scaffold_substituents(
                 base_dataset, scaffold_groups["scaffold_atom_indices"]
@@ -266,14 +278,23 @@ class FlowMatchingDatasetWrapperScaffoldDecoration(FlowMatchingDatasetWrapper):
         self._scaffold_decoration_counts = scaffold_groups["scaffold_decoration_counts"]
         self._scaffold_substituents = scaffold_groups["scaffold_substituents"]
 
-        # Keep only molecules in a group with ≥2 members (need ≥1 other source)
+        # Rebuild groups to exclude molecules whose RWMol reconstruction failed
+        # (scaffold_atom_indices is empty for them even though mol_to_group >= 0).
+        filtered_groups = [
+            [i for i in grp if self._scaffold_atom_indices[i]]
+            for grp in groups
+        ]
+
+        # Keep only molecules in a group with ≥2 valid members (need ≥1 other source)
         self._filtered_indices = [
             i
             for i in range(len(self.base_dataset))
-            if mol_to_group[i] >= 0 and len(groups[mol_to_group[i]]) >= 2
+            if mol_to_group[i] >= 0
+            and self._scaffold_atom_indices[i]
+            and len(filtered_groups[mol_to_group[i]]) >= 2
         ]
         self._mol_to_group = mol_to_group
-        self._groups = groups
+        self._groups = filtered_groups
 
     def __len__(self):
         if hasattr(self, "_filtered_indices"):
@@ -305,10 +326,12 @@ class FlowMatchingDatasetWrapperScaffoldDecoration(FlowMatchingDatasetWrapper):
             tgt_matches = self._scaffold_atom_indices[base_idx]    # list[tuple]
 
             if src_matches and tgt_matches:
-                src_dec = self._scaffold_decoration_counts[source_idx]
-                tgt_dec = self._scaffold_decoration_counts[base_idx]
-                scaffold_pairs = select_scaffold_pairs_by_neighbor_count(
-                    src_dec, src_matches, tgt_dec, tgt_matches
+                scaffold_pairs = select_scaffold_pairs_spatially(
+                    src_matches, tgt_matches,
+                    source.x.detach().cpu().numpy(),
+                    target.x.detach().cpu().numpy(),
+                    self._scaffold_substituents[source_idx],
+                    self._scaffold_substituents[base_idx],
                 )
             else:
                 scaffold_pairs = []

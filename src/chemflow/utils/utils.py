@@ -38,6 +38,22 @@ def build_callbacks(cfg: DictConfig) -> list[Callback]:
             )
         )
 
+    if "best_train_checkpoint" in cfg.callbacks:
+        hydra.utils.log.info("Adding callback <ModelCheckpoint> for best train loss")
+        callbacks.append(
+            ModelCheckpoint(
+                dirpath=cfg.callbacks.best_train_checkpoint.dirpath,
+                monitor="loss_total",
+                mode="min",
+                save_top_k=cfg.callbacks.best_train_checkpoint.save_top_k,
+                verbose=cfg.callbacks.best_train_checkpoint.verbose,
+                save_last=cfg.callbacks.best_train_checkpoint.save_last,
+                filename="best_train-{epoch:04d}-{step:06d}-{loss_total:.4f}",
+                every_n_train_steps=cfg.callbacks.best_train_checkpoint.every_n_train_steps,
+                save_on_train_epoch_end=False,
+            )
+        )
+
     if "every_n_epochs_checkpoint" in cfg.callbacks:
         hydra.utils.log.info(
             f"Adding callback <ModelCheckpoint> for every {cfg.callbacks.every_n_epochs_checkpoint.every_n_epochs} epochs"

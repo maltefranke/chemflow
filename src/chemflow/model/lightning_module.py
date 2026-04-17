@@ -199,6 +199,7 @@ class LightningModuleRates(pl.LightningModule):
             on_epoch=False,
             prog_bar=False,
             logger=True,
+            batch_size=1,
         )
 
     def _reduce_loss(self, loss, reduction: str = "mean"):
@@ -727,13 +728,15 @@ class LightningModuleRates(pl.LightningModule):
         )
 
         loss = self.safe_loss(self.loss_accumulator.total_loss())
-        self.log_dict(self.loss_accumulator.log_dict(), prog_bar=False, logger=True)
+        self.log_dict(self.loss_accumulator.log_dict(), prog_bar=False, logger=True, batch_size=mols_t.num_graphs)
 
         return loss
 
     def training_step(self, batch, batch_idx):
+        batch_size = batch[0].num_graphs
         loss = self.shared_step(batch, batch_idx)
-        self.log("loss/train", loss, prog_bar=True, logger=True)
+        self.log("loss/train", loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, batch_size=batch_size)
+        self.log("loss_total", loss, prog_bar=False, logger=True, on_step=True, on_epoch=False, batch_size=batch_size)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -1035,7 +1038,7 @@ class LightningModuleRates(pl.LightningModule):
                 smask = scaffold_mask.bool()
                 do_del_probs[smask] = 0.0
                 do_sub_a_probs[smask] = 0.0
-                num_ins_pred[smask] = 0.0
+                # num_ins_pred[smask] = 0.0
                 sc_edge_mask = smask[mol_t.edge_index[0]] & smask[mol_t.edge_index[1]]
                 do_sub_e_probs[sc_edge_mask] = 0.0
 
@@ -1043,7 +1046,7 @@ class LightningModuleRates(pl.LightningModule):
             ins_edge_head = getattr(model, "ins_edge_head", None)
 
             # Integrate one step (edge prediction happens inside if head is provided)
-            mol_t, keep_mask, n_insertions = self.integrator.integrate_step_gnn(
+            mol_t, _, _ = self.integrator.integrate_step_gnn(
                 mol_t=mol_t.clone(),
                 mol_1_pred=mol_1_pred.clone(),
                 do_sub_a_probs=do_sub_a_probs,
@@ -1057,14 +1060,9 @@ class LightningModuleRates(pl.LightningModule):
                 ins_edge_head=ins_edge_head,
             )
 
-            if scaffold_mask is not None:
-                if keep_mask is not None:
-                    scaffold_mask = scaffold_mask[keep_mask]
-                if n_insertions > 0:
-                    scaffold_mask = torch.cat([
-                        scaffold_mask,
-                        torch.zeros(n_insertions, dtype=torch.long, device=scaffold_mask.device),
-                    ])
+            # scaffold_mask is now propagated automatically through mol_t
+            # (filter_nodes / join functions / sort_nodes_by_batch all handle it)
+            scaffold_mask = getattr(mol_t, "scaffold_mask", None)
 
             # remove mean from xt for each batch
             _ = mol_t.remove_com()

@@ -203,3 +203,57 @@ def visualize_variable_topology(trajectory_frames, width=800, height=400, interv
     view.zoomTo()
 
     return view
+
+
+def visualize_variable_topology_slider(trajectory_frames, width=800, height=400):
+    """
+    Like visualize_variable_topology but with a manual frame-by-frame slider
+    instead of auto-looping animation.
+    """
+    from IPython.display import HTML, display
+
+    combined_sdf_string = ""
+
+    for frame in trajectory_frames:
+        mol = Chem.RWMol()
+
+        for i, symbol in enumerate(frame["atoms"]):
+            atom = Chem.Atom(symbol)
+            atom.SetFormalCharge(int(frame["charges"][i]))
+            mol.AddAtom(atom)
+
+        for (src, dst), b_type in zip(frame["edges"], frame["edge_types"]):
+            rdkit_type = bond_mapping.get(b_type, Chem.BondType.SINGLE)
+            mol.AddBond(int(src), int(dst), rdkit_type)
+
+        conf = Chem.Conformer(len(frame["atoms"]))
+        for i, (x, y, z) in enumerate(frame["pos"]):
+            conf.SetAtomPosition(i, (float(x), float(y), float(z)))
+
+        mol.AddConformer(conf)
+
+        mol_block = _mol_to_mol_block_with_single_bond_fallback(mol)
+        combined_sdf_string += mol_block + "$$$$\n"
+
+    view = py3Dmol.view(width=width, height=height)
+    view.addModelsAsFrames(combined_sdf_string, "sdf")
+    view.setStyle({"stick": {"radius": 0.15}, "sphere": {"scale": 0.2}})
+    view.setFrame(0)
+    view.zoomTo()
+
+    html = view.write_html()
+    uid = view.uniqueid
+    html = html.replace(f"var viewer_{uid} =", f"window.viewer_{uid} =")
+
+    n_frames = len(trajectory_frames)
+    slider = f"""
+<div style="margin:6px 0">
+  <input type="range" min="0" max="{n_frames - 1}" value="0" style="width:600px"
+         oninput="this.nextElementSibling.textContent = 'Frame ' + this.value;
+                  window.viewer_{uid}.setFrame(parseInt(this.value));
+                  window.viewer_{uid}.render();">
+  <span style="margin-left:8px">Frame 0</span>
+</div>
+"""
+
+    display(HTML(slider + html))

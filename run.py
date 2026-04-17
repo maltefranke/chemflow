@@ -106,7 +106,7 @@ def run(cfg: DictConfig):
     )
 
     ckpt_path = None
-    # ckpt_path = "/capstor/store/cscs/swissai/a131/frankem/chemflow/logs/wandb/uniform_w/chemflow/8owhjxf9/checkpoints/epoch=499-step=9500.ckpt"
+    # ckpt_path = "/cluster/project/jorner/schmiste/flexflow/chemflow/outputs/2026-04-10/11-47-12/best_train/best_train-epoch=0238-step=018100-loss_total=1.0491.ckpt"
 
     # Train the model
     trainer.fit(

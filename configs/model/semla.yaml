@@ -94,18 +94,18 @@ module:
   # MuonWithAuxAdam: Muon for 2D backbone weights, AdamW for the rest.
   optimizer_config:
     optimizer:
-      lr: 0.005
+      lr: 0.0005 #0.005
       momentum: 0.95
       weight_decay: 0.0
 
     aux_optimizer:
-      lr: 1e-4
+      lr: 1e-5 #1e-4
       betas: [0.9, 0.95]
       eps: 1e-10
       weight_decay: 0.0
 
     emb_optimizer:
-      lr: 1e-4
+      lr: 1e-5 #1e-4
 
     scheduler:
       _target_: chemflow.utils.lr_schedulers.MultiGroupCosineWarmupLR
@@ -200,6 +200,18 @@ cfg:
 cfg_embedding: ${if:${model.do_cfg}, ${model.cfg.embedding}, null}
 cfg_embed_dim: ${if:${model.do_cfg}, ${model.cfg.embed_dim}, 0}
 
+scaffold_mask_embedding:
+  _target_: chemflow.model.embedding.Embedding
+  num_embeddings: 2
+  embedding_dim: 32
+  out_dim: 64
+
+edge_scaffold_embedding:
+  _target_: chemflow.model.embedding.Embedding
+  num_embeddings: 3       # 0=dec-dec, 1=scaffold-dec, 2=scaffold-scaffold
+  embedding_dim: 32
+  out_dim: 64
+
 embedding_backbone:
   _target_: chemflow.model.model.EmbeddingBackbone
   _recursive_: false
@@ -208,9 +220,11 @@ embedding_backbone:
   time_embedding_args: ${model.time_embedding}
   node_count_embedding_args: ${model.node_count_embedding}
   cfg_embedding_args: ${model.cfg_embedding}
-  h0_input_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.cfg_embed_dim}"}
+  scaffold_mask_embedding_args: ${model.scaffold_mask_embedding}
+  edge_scaffold_embedding_args: ${model.edge_scaffold_embedding}
+  h0_input_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.cfg_embed_dim} + ${model.scaffold_mask_embedding.out_dim}"}
   h0_projection_dim: ${model.backbone.d_model}
-  e_input_dim: ${model.edge_type_embedding.out_dim}
+  e_input_dim: ${oc.eval:"${model.edge_type_embedding.out_dim} + ${model.edge_scaffold_embedding.out_dim}"}
   e_projection_dim: ${model.backbone.d_edge}
 
 backbone:

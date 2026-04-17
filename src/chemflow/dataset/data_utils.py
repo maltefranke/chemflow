@@ -1,14 +1,17 @@
 """A dataset for editing molecules."""
 
+import numpy as np
 import torch
 
 from collections import deque
+from scipy.optimize import linear_sum_assignment
 from rdkit import Chem
 from rdkit.Chem import RWMol
 from rdkit.Chem.Scaffolds import MurckoScaffold
 from rdkit.Chem import rdFMCS
 
 from chemflow.utils.rdkit import IDX_BOND_MAP
+from chemflow.utils.utils import rigid_alignment
 
 
 def compute_scaffold_groups(dataset):
@@ -120,11 +123,19 @@ def compute_scaffold_decoration_counts(dataset, scaffold_atom_indices):
 
 
 def compute_scaffold_substituents(dataset, scaffold_atom_indices):
-    """For each molecule: {scaffold_atom_mol_idx -> [substituent atom mol indices]}.
+    """For each molecule: {scaffold_atom_mol_idx -> list of residue branches}.
 
-    BFS from each scaffold atom's non-scaffold neighbors through the non-scaffold
-    subgraph. Each non-scaffold atom is owned by the lowest-indexed scaffold atom
-    whose BFS reaches it first (deterministic, automorphism-invariant).
+    Each residue branch is a list of atom indices forming one connected
+    component rooted at a direct non-scaffold neighbour of the scaffold atom.
+    A scaffold atom with k non-scaffold neighbours will therefore have (up to)
+    k branches.
+
+    BFS ownership is identical to before: each non-scaffold atom is owned by
+    the lowest-indexed scaffold atom whose BFS reaches it first (deterministic,
+    automorphism-invariant).  The only change is that branches initiated from
+    different direct neighbours of the same scaffold atom are kept separate as
+    individual lists rather than merged into one flat list.
+
     Returns None for molecules with no valid scaffold match.
     """
     result = []
@@ -144,23 +155,25 @@ def compute_scaffold_substituents(dataset, scaffold_atom_indices):
             dst = int(data.edge_index[1, k])
             adj[src].append(dst)
 
-        subs = {s: [] for s in scaffold_set}
-        owned = {}  # non_scaffold_atom -> owning scaffold atom
+        subs: dict[int, list[list[int]]] = {s: [] for s in scaffold_set}
+        owned: dict[int, int] = {}  # non_scaffold_atom -> owning scaffold atom
 
         for s in sorted(scaffold_set):  # sorted for determinism
-            queue = deque()
-            for nbr in adj[s]:
-                if nbr not in scaffold_set and nbr not in owned:
-                    owned[nbr] = s
-                    subs[s].append(nbr)
-                    queue.append(nbr)
-            while queue:
-                node = queue.popleft()
-                for nbr in adj[node]:
-                    if nbr not in scaffold_set and nbr not in owned:
-                        owned[nbr] = s
-                        subs[s].append(nbr)
-                        queue.append(nbr)
+            for seed in sorted(adj[s]):  # sorted for determinism
+                if seed in scaffold_set or seed in owned:
+                    continue
+                # New branch rooted at this direct non-scaffold neighbour
+                branch: list[int] = [seed]
+                owned[seed] = s
+                queue = deque([seed])
+                while queue:
+                    node = queue.popleft()
+                    for nbr in adj[node]:
+                        if nbr not in scaffold_set and nbr not in owned:
+                            owned[nbr] = s
+                            branch.append(nbr)
+                            queue.append(nbr)
+                subs[s].append(branch)
 
         result.append(subs)
     return result
@@ -204,60 +217,89 @@ def select_scaffold_pairs_by_neighbor_count(
     return list(zip(best_src, best_tgt, strict=True))
 
 
-def compute_scaffold_groups(dataset):
-    """Compute Bemis-Murcko scaffold groups for a dataset.
+def select_scaffold_pairs_spatially(
+    src_matches: list,
+    tgt_matches: list,
+    x0,
+    x1,
+    src_subs,
+    tgt_subs,
+    c_ins=500.0,
+) -> list:
+    """Pick scaffold automorphism pair by minimising spatial branch-root cost.
 
-    Molecules with empty scaffolds (acyclic) or disconnected scaffolds
-    (multiple ring systems, indicated by "." in SMILES) are dropped.
+    For each candidate ``(src_auto, tgt_auto)`` pair:
 
-    Returns:
-        mol_to_group: np.ndarray[N] of int64, -1 for dropped molecules
-        groups: list[list[int]], group_id -> list of dataset indices
+    1. Kabsch-aligns ``x0[src_auto]`` to ``x1[tgt_auto]``.
+    2. Sums the Hungarian-matched branch-root distances across all scaffold
+       positions — including H branches — so that "up" in source maps to
+       "up" in target.
+
+    Falls back gracefully when substituents are absent (all costs = 0, first
+    pair wins).  Returns ``[]`` if either match list is empty.
+
+    Args:
+        src_matches: list of automorphism tuples for the source scaffold.
+        tgt_matches: list of automorphism tuples for the target scaffold.
+        x0: Source atom positions, shape ``(N, 3)`` (numpy, unaligned).
+        x1: Target atom positions, shape ``(M, 3)`` (numpy).
+        src_subs: ``dict[scaffold_atom -> list[list[int]]]`` for source,
+            or ``None``.
+        tgt_subs: Same structure for target, or ``None``.
+
+    Returns list of ``(src_atom_idx, tgt_atom_idx)`` pairs.
     """
-    scaffold_to_group = {}
-    mol_to_group = torch.full((len(dataset),), -1, dtype=torch.long)
-    groups = []
+    if not src_matches or not tgt_matches:
+        return []
 
-    for idx in range(len(dataset)):
-        data = dataset.get(idx)
-        mol = Chem.MolFromSmiles(data.smiles)
-        scaffold = MurckoScaffold.GetScaffoldForMol(mol)
-        smi = Chem.MolToSmiles(scaffold)
+    best_cost = float("inf")
+    best_src = src_matches[0]
+    best_tgt = tgt_matches[0]
 
-        # Drop empty scaffold (acyclic) and disconnected scaffolds
-        if not smi or "." in smi:
-            continue
+    for src_auto in src_matches:
+        for tgt_auto in tgt_matches:
+            pts_s = torch.tensor(
+                x0[list(src_auto)], dtype=torch.float32
+            )
+            pts_t = torch.tensor(
+                x1[list(tgt_auto)], dtype=torch.float32
+            )
+            if pts_s.shape[0] >= 3:
+                R, t = rigid_alignment(pts_s, pts_t)
+                R_np = R.detach().cpu().numpy()
+                t_np = t.detach().cpu().numpy()
+            else:
+                R_np = np.eye(3, dtype=np.float32)
+                t_np = np.zeros(3, dtype=np.float32)
 
-        if smi not in scaffold_to_group:
-            scaffold_to_group[smi] = len(groups)
-            groups.append([])
+            cost = 0.0
+            for src_atom, tgt_atom in zip(src_auto, tgt_auto):
+                sb = (src_subs or {}).get(src_atom, [])
+                tb = (tgt_subs or {}).get(tgt_atom, [])
+                if not sb or not tb:
+                    continue
+                s_roots = np.array(
+                    [x0[b[0]] for b in sb], dtype=np.float32
+                )
+                s_roots = s_roots @ R_np.T + t_np
+                t_roots = np.array(
+                    [x1[b[0]] for b in tb], dtype=np.float32
+                )
+                s_sizes = np.array([len(b) for b in sb], dtype=np.float32)
+                t_sizes = np.array([len(b) for b in tb], dtype=np.float32)
+                cost_mat = (
+                    np.linalg.norm(s_roots[:, None, :] - t_roots[None, :, :], axis=-1)
+                    + c_ins * np.abs(s_sizes[:, None] - t_sizes[None, :])
+                )
+                ri, ci = linear_sum_assignment(cost_mat)
+                cost += cost_mat[ri, ci].sum()
 
-        gid = scaffold_to_group[smi]
-        mol_to_group[idx] = gid
-        groups[gid].append(idx)
+            if cost < best_cost:
+                best_cost = cost
+                best_src = src_auto
+                best_tgt = tgt_auto
 
-    return mol_to_group, groups
-
-
-def compute_scaffold_atom_indices(dataset) -> list[list[tuple[int, ...]]]:
-    """For each molecule, return ALL scaffold atom index matches (handles symmetry).
-
-    Uses GetSubstructMatches(uniquify=False) to capture all automorphisms of the
-    scaffold within the molecule. Returns a list of matches per molecule; each
-    match is a tuple of atom indices. Returns an empty list for molecules with
-    no valid scaffold.
-    """
-    result = []
-    for idx in range(len(dataset)):
-        data = dataset.get(idx)
-        mol = Chem.MolFromSmiles(data.smiles)
-        if mol is None:
-            result.append([])
-            continue
-        scaffold = MurckoScaffold.GetScaffoldForMol(mol)
-        matches = mol.GetSubstructMatches(scaffold, uniquify=False)
-        result.append(list(matches))
-    return result
+    return list(zip(best_src, best_tgt, strict=True))
 
 
 def sort_by_scaffold(data_list):
