@@ -143,6 +143,26 @@ def _rdkit_mols_edge_type_indices(
     return torch.tensor(vals, dtype=torch.long, device=device)
 
 
+def _rdkit_mols_charge_type_indices(
+    mols: list,
+    charge_tokens: list[str],
+    device: torch.device,
+) -> torch.Tensor:
+    """Map each atom's formal charge to a charge token index; skip mols with unknown charges."""
+    vals: list[int] = []
+    for mol in mols:
+        if mol is None:
+            continue
+        try:
+            for atom in mol.GetAtoms():
+                vals.append(token_to_index(charge_tokens, str(atom.GetFormalCharge())))
+        except ValueError:
+            continue
+    if not vals:
+        return torch.tensor([], dtype=torch.long, device=device)
+    return torch.tensor(vals, dtype=torch.long, device=device)
+
+
 def _kl_divergence(gen: torch.Tensor, target: torch.Tensor, eps: float) -> torch.Tensor:
     return torch.sum(
         gen * (torch.log(gen.clamp(min=eps)) - torch.log(target.clamp(min=eps)))
@@ -430,6 +450,60 @@ class EdgeTypeDistributionMetric(GenerativeMetric):
         return _kl_divergence(gen, target, self.eps)
 
 
+class ChargeTypeDistributionMetric(GenerativeMetric):
+    """KL(gen || target) for atom formal-charge histogram vs training distribution."""
+
+    def __init__(
+        self,
+        target_distribution: torch.Tensor,
+        charge_tokens: list[str],
+        eps: float = 1e-8,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+        target = target_distribution.detach().to(dtype=torch.float32)
+        target = target / target.sum().clamp(min=eps)
+
+        self.eps = eps
+        self.target_len = int(target.numel())
+        self.charge_tokens = list(charge_tokens)
+
+        if self.target_len != len(self.charge_tokens):
+            raise ValueError(
+                "charge_type_distribution length must match len(charge_tokens)"
+            )
+
+        self.register_buffer("target_distribution", target)
+        self.add_state(
+            "gen_hist",
+            default=torch.zeros(self.target_len, dtype=torch.float32),
+            dist_reduce_fx="sum",
+        )
+        self.add_state("n_total", default=torch.tensor(0.0), dist_reduce_fx="sum")
+
+    def update(self, mols: list[Chem.rdchem.Mol]) -> None:
+        idx = _rdkit_mols_charge_type_indices(
+            mols, self.charge_tokens, self.gen_hist.device
+        )
+        if idx.numel() == 0:
+            return
+        idx = idx.clamp(min=0, max=self.target_len - 1)
+        hist = torch.bincount(idx, minlength=self.target_len).to(dtype=torch.float32)
+        self.gen_hist += hist
+        self.n_total += float(idx.numel())
+
+    def compute(self) -> torch.Tensor:
+        if self.n_total <= 0:
+            return torch.tensor(0.0, device=self.gen_hist.device)
+
+        gen = self.gen_hist / self.gen_hist.sum().clamp(min=1.0)
+        target = self.target_distribution
+        target = target / target.sum().clamp(min=self.eps)
+
+        return _kl_divergence(gen, target, self.eps)
+
+
 class Validity(GenerativeMetric):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -684,8 +758,10 @@ def init_metrics(
     target_n_atoms_distribution: torch.Tensor | None = None,
     atom_type_distribution: torch.Tensor | None = None,
     edge_type_distribution: torch.Tensor | None = None,
+    charge_type_distribution: torch.Tensor | None = None,
     atom_tokens: list[str] | None = None,
     edge_tokens: list[str] | None = None,
+    charge_tokens: list[str] | None = None,
 ):
 
     metrics = {
@@ -700,20 +776,32 @@ def init_metrics(
         "strain-per-atom": AverageStrainEnergy(per_atom=True),
         "opt-rmsd": AverageOptRmsd(),
     }
+
+    # Distribution metrics are kept in their own collection so they can accumulate
+    # across an entire validation epoch (rather than being reset per batch) and
+    # so the lightning module can additionally render ground-truth-vs-generated
+    # marginal plots from their internal histograms.
+    distribution_metrics: dict = {}
     if target_n_atoms_distribution is not None:
-        metrics["atom_count_dist_kl"] = AtomCountDistributionMetric(
+        distribution_metrics["atom_count_dist_kl"] = AtomCountDistributionMetric(
             target_distribution=target_n_atoms_distribution,
         )
     if atom_type_distribution is not None and atom_tokens is not None:
-        metrics["atom_type_dist_kl"] = AtomTypeDistributionMetric(
+        distribution_metrics["atom_type_dist_kl"] = AtomTypeDistributionMetric(
             target_distribution=atom_type_distribution,
             atom_tokens=atom_tokens,
         )
     if edge_type_distribution is not None and edge_tokens is not None:
-        metrics["edge_type_dist_kl"] = EdgeTypeDistributionMetric(
+        distribution_metrics["edge_type_dist_kl"] = EdgeTypeDistributionMetric(
             target_distribution=edge_type_distribution,
             edge_tokens=edge_tokens,
         )
+    if charge_type_distribution is not None and charge_tokens is not None:
+        distribution_metrics["charge_type_dist_kl"] = ChargeTypeDistributionMetric(
+            target_distribution=charge_type_distribution,
+            charge_tokens=charge_tokens,
+        )
+
     stability_metrics = {
         "atom-stability": AtomStability(),
         "molecule-stability": MoleculeStability(),
@@ -721,8 +809,151 @@ def init_metrics(
 
     metrics = MetricCollection(metrics, compute_groups=False)
     stability_metrics = MetricCollection(stability_metrics, compute_groups=False)
+    distribution_metrics = MetricCollection(
+        distribution_metrics, compute_groups=False
+    )
 
-    return metrics, stability_metrics
+    return metrics, stability_metrics, distribution_metrics
+
+
+# ---------------------------------------------------------------------------
+# Marginal distribution plotting for wandb logging.
+# ---------------------------------------------------------------------------
+
+
+def _labels_for_n_atoms(target_len: int) -> list[str]:
+    return [str(i) for i in range(target_len)]
+
+
+def plot_marginal_comparison(
+    gen_hist: torch.Tensor,
+    target_hist: torch.Tensor,
+    labels: list[str] | None,
+    title: str,
+    xlabel: str,
+    eps: float = 1e-8,
+):
+    """Return a matplotlib Figure comparing ground-truth vs generated marginal densities.
+
+    Both inputs are unnormalized histograms; they are normalized to densities here.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg", force=False)
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    gen = gen_hist.detach().to("cpu", dtype=torch.float32)
+    target = target_hist.detach().to("cpu", dtype=torch.float32)
+
+    n = max(gen.numel(), target.numel())
+    if gen.numel() < n:
+        gen = torch.cat([gen, torch.zeros(n - gen.numel())])
+    if target.numel() < n:
+        target = torch.cat([target, torch.zeros(n - target.numel())])
+
+    gen_sum = float(gen.sum())
+    target_sum = float(target.sum())
+    gen = gen / max(gen_sum, eps)
+    target = target / max(target_sum, eps)
+
+    if labels is None or len(labels) != n:
+        labels = [str(i) for i in range(n)]
+
+    x = np.arange(n)
+    width = 0.4
+
+    fig, ax = plt.subplots(figsize=(max(6.0, n * 0.35), 4.0))
+    ax.bar(
+        x - width / 2.0,
+        target.numpy(),
+        width,
+        label="ground truth",
+        color="steelblue",
+        alpha=0.85,
+    )
+    ax.bar(
+        x + width / 2.0,
+        gen.numpy(),
+        width,
+        label="generated",
+        color="darkorange",
+        alpha=0.85,
+    )
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45 if n > 10 else 0, ha="right")
+    ax.set_ylabel("probability")
+    ax.set_xlabel(xlabel)
+    ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def build_marginal_plots(distribution_metrics: MetricCollection) -> dict:
+    """Build one matplotlib Figure per distribution metric present in the collection.
+
+    Returns a dict keyed by a short plot name (e.g. ``"n_atoms"``) mapping to a Figure.
+    Metrics that have not yet seen any samples (``n_total == 0``) are skipped.
+    Caller is responsible for closing the figures after logging.
+    """
+    plots: dict = {}
+
+    def _has_samples(metric) -> bool:
+        n_total = getattr(metric, "n_total", None)
+        if n_total is None:
+            return False
+        try:
+            return float(n_total.item() if isinstance(n_total, torch.Tensor) else n_total) > 0.0
+        except Exception:
+            return False
+
+    if "atom_count_dist_kl" in distribution_metrics:
+        m = distribution_metrics["atom_count_dist_kl"]
+        if _has_samples(m):
+            plots["n_atoms"] = plot_marginal_comparison(
+                gen_hist=m.gen_hist,
+                target_hist=m.target_distribution,
+                labels=_labels_for_n_atoms(m.target_len),
+                title="Number of atoms: ground truth vs generated",
+                xlabel="n_atoms",
+            )
+
+    if "atom_type_dist_kl" in distribution_metrics:
+        m = distribution_metrics["atom_type_dist_kl"]
+        if _has_samples(m):
+            plots["atom_types"] = plot_marginal_comparison(
+                gen_hist=m.gen_hist,
+                target_hist=m.target_distribution,
+                labels=list(m.atom_tokens),
+                title="Atom types: ground truth vs generated",
+                xlabel="atom type",
+            )
+
+    if "edge_type_dist_kl" in distribution_metrics:
+        m = distribution_metrics["edge_type_dist_kl"]
+        if _has_samples(m):
+            plots["edge_types"] = plot_marginal_comparison(
+                gen_hist=m.gen_hist,
+                target_hist=m.target_distribution,
+                labels=list(m.edge_tokens),
+                title="Edge types (upper-tri pairs incl. NO_BOND): "
+                "ground truth vs generated",
+                xlabel="edge type",
+            )
+
+    if "charge_type_dist_kl" in distribution_metrics:
+        m = distribution_metrics["charge_type_dist_kl"]
+        if _has_samples(m):
+            plots["charges"] = plot_marginal_comparison(
+                gen_hist=m.gen_hist,
+                target_hist=m.target_distribution,
+                labels=list(m.charge_tokens),
+                title="Formal charges: ground truth vs generated",
+                xlabel="formal charge",
+            )
+
+    return plots
 
 
 def calc_posebusters_metrics(
