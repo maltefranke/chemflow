@@ -80,13 +80,15 @@ def run(cfg: DictConfig):
 
     # Build metrics (including novelty against the training set)
     train_smiles = datamodule.train_dataset.base_dataset.get_all_smiles()
-    metrics, stability_metrics = init_metrics(
+    metrics, stability_metrics, distribution_metrics = init_metrics(
         train_smiles=train_smiles,
         target_n_atoms_distribution=loss_weight_distributions.n_atoms_distribution,
         atom_type_distribution=loss_weight_distributions.atom_type_distribution,
         edge_type_distribution=loss_weight_distributions.edge_type_distribution,
+        charge_type_distribution=loss_weight_distributions.charge_type_distribution,
         atom_tokens=list(vocab.atom_tokens),
         edge_tokens=list(vocab.edge_tokens),
+        charge_tokens=list(vocab.charge_tokens),
     )
 
     # Instantiate module
@@ -101,6 +103,7 @@ def run(cfg: DictConfig):
         charge_token_weights=charge_token_weights,
         metrics=metrics,
         stability_metrics=stability_metrics,
+        distribution_metrics=distribution_metrics,
     )
 
     # module.compile()
@@ -120,7 +123,7 @@ def run(cfg: DictConfig):
     )
 
     ckpt_path = None
-    # ckpt_path = "/cluster/project/krause/frankem/chemflow/outputs/epoch=499-step=9500.ckpt"
+    ckpt_path = "/capstor/store/cscs/swissai/a131/frankem/chemflow/logs/wandb/geom/chemflow/pq2nlem1/checkpoints/epoch=0-step=3000.ckpt"
 
     # Train the model
     trainer.fit(
@@ -134,7 +137,7 @@ def run(cfg: DictConfig):
         dataloaders=datamodule.val_dataloader(),
         ckpt_path=ckpt_path,
     )
-    exit()
+    
 
     predictions = trainer.predict(
         module,
