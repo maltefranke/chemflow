@@ -1,6 +1,6 @@
 ## Put your model args here
 gmm_params:
-    K: 5
+    K: 10
     D: 3
 
 rotate: false

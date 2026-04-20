@@ -66,11 +66,11 @@ def generate_geom(root: str) -> None:
     for split in ("train", "val", "test"):
         smiles_path = os.path.join(root, "processed", f"{split}_smiles.txt")
         ds = GEOM(root, split)
-        # _mol_bytes is already in memory; skip Data reconstruction and decode
-        # only the smiles field. pickle.loads is CPU-bound so use processes.
+        # Stream bytes from LMDB (memory-mapped) and decode only the smiles
+        # field in parallel. pickle.loads is CPU-bound, so use processes.
         with ProcessPoolExecutor() as pool:
             raw = list(tqdm(
-                pool.map(_bytes_to_smiles, ds._mol_bytes, chunksize=512),
+                pool.map(_bytes_to_smiles, ds.iter_bytes(), chunksize=512),
                 total=len(ds),
                 desc=split,
             ))
