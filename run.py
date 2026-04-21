@@ -121,7 +121,7 @@ def run(cfg: DictConfig):
     )
 
     ckpt_path = None
-    # ckpt_path = "/cluster/project/jorner/schmiste/flexflow/chemflow/outputs/2026-04-10/11-47-12/best_train/best_train-epoch=0238-step=018100-loss_total=1.0491.ckpt"
+    # ckpt_path = "/cluster/project/jorner/schmiste/flexflow/chemflow/outputs/2026-04-18/10-50-21/best_train/best_train-epoch=0825-step=071800-loss/total=0.9296.ckpt"
 
     # Train the model
     trainer.fit(
@@ -135,7 +135,6 @@ def run(cfg: DictConfig):
         dataloaders=datamodule.val_dataloader(),
         ckpt_path=ckpt_path,
     )
-    exit()
 
     predictions = trainer.predict(
         module,

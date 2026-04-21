@@ -91,6 +91,7 @@ class LightningModuleRates(pl.LightningModule):
         ema_decay_scheduler: EMADecayScheduler | DictConfig | None = None,
         use_ema_for_eval: bool = True,
         use_time_weights: bool = False,
+        exclude_scaffold_from_sub_loss: bool = False,
     ):
         super().__init__()
 
@@ -111,6 +112,7 @@ class LightningModuleRates(pl.LightningModule):
 
         self.gmm_params = gmm_params
         self.n_atoms_strategy = n_atoms_strategy
+        self.exclude_scaffold_from_sub_loss = exclude_scaffold_from_sub_loss
         self.time_dist = hydra.utils.instantiate(time_dist)
 
         self.integrator = hydra.utils.instantiate(
@@ -268,6 +270,12 @@ class LightningModuleRates(pl.LightningModule):
         to_delete_mask = mols_t.lambda_del > 0.0
         non_del_mask = ~to_delete_mask
 
+        _scaffold_mask = getattr(mols_t, 'scaffold_mask', None)
+        if self.exclude_scaffold_from_sub_loss and _scaffold_mask is not None:
+            _non_sc_node = ~_scaffold_mask.bool()
+        else:
+            _non_sc_node = None
+
         # NOTE take loss on all non-deletion nodes
         c_loss, c_batch_mask = class_loss(
             c_pred,
@@ -282,16 +290,26 @@ class LightningModuleRates(pl.LightningModule):
         # 1. Handle substitutions
 
         #### Handle atom type substitutions
-        # NOTE take loss on all nodes
-        do_sub_a_loss = do_action_loss(
-            do_sub_a_head,
-            mols_t.lambda_a_sub,
-            mols_t.batch,
-            mols_t.num_graphs,
-        )
+        # NOTE take loss on all nodes (optionally excluding scaffold atoms)
+        if _non_sc_node is not None:
+            do_sub_a_loss = do_action_loss(
+                do_sub_a_head[_non_sc_node],
+                mols_t.lambda_a_sub[_non_sc_node],
+                mols_t.batch[_non_sc_node],
+                mols_t.num_graphs,
+            )
+        else:
+            do_sub_a_loss = do_action_loss(
+                do_sub_a_head,
+                mols_t.lambda_a_sub,
+                mols_t.batch,
+                mols_t.num_graphs,
+            )
         # NOTE take loss on all non-deletion & to-be-substituted nodes
         # del nodes have lambda_a_sub = 0 anyway, this is just for clarity
         to_sub_mask = (non_del_mask) & (mols_t.lambda_a_sub > 0.0)
+        if _non_sc_node is not None:
+            to_sub_mask = to_sub_mask & _non_sc_node
         sub_a_class_loss, sub_a_batch_mask = class_loss(
             a_pred,
             mols_1.a,
@@ -318,17 +336,34 @@ class LightningModuleRates(pl.LightningModule):
         _dst_idx = edge_infos["edge_index"][0][1]
         non_del_edge_mask = ~to_delete_mask[_src_idx] & ~to_delete_mask[_dst_idx]
 
+        if _non_sc_node is not None:
+            # exclude edges where BOTH endpoints are scaffold (matches inference masking)
+            _non_sc_edge = _non_sc_node[_src_idx] | _non_sc_node[_dst_idx]
+        else:
+            _non_sc_edge = None
+
         # NOTE As per EditFlow, only count class loss for edges that need modification
-        do_sub_e_loss = do_action_loss(
-            do_sub_e_head_triu,
-            do_sub_e_target_triu,
-            e_batch_triu,
-            mols_t.num_graphs,
-            reduction="none",
-        )
+        if _non_sc_edge is not None:
+            do_sub_e_loss = do_action_loss(
+                do_sub_e_head_triu[_non_sc_edge],
+                do_sub_e_target_triu[_non_sc_edge],
+                e_batch_triu[_non_sc_edge],
+                mols_t.num_graphs,
+                reduction="none",
+            )
+        else:
+            do_sub_e_loss = do_action_loss(
+                do_sub_e_head_triu,
+                do_sub_e_target_triu,
+                e_batch_triu,
+                mols_t.num_graphs,
+                reduction="none",
+            )
 
         # NOTE take loss on all non-deletion & to-be-substituted edges
         to_sub_edge_mask = (non_del_edge_mask) & (do_sub_e_target_triu > 0.0)
+        if _non_sc_edge is not None:
+            to_sub_edge_mask = to_sub_edge_mask & _non_sc_edge
         sub_e_class_loss, sub_e_batch_mask = class_loss(
             e_pred_triu,
             e_target_triu,
@@ -865,7 +900,7 @@ class LightningModuleRates(pl.LightningModule):
 
             # Hard-zero all discrete rates for scaffold atoms so the scaffold
             # identity is guaranteed to be preserved during inference.
-            # Positions are left free so the model can learn geometric relaxation.
+            # Positions are frozen in integration.py via scaffold velocity masking.
             if scaffold_mask is not None:
                 smask = scaffold_mask.bool()
                 do_del_probs[smask] = 0.0

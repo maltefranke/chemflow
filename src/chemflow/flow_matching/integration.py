@@ -257,6 +257,9 @@ class RateIntegrator:
         x_t_original = x_t
 
         velocity = (x_1 - x_t) * move_rate_node.view(-1, 1)
+        scaffold_mask = getattr(mol_t, 'scaffold_mask', None)
+        if scaffold_mask is not None:
+            velocity[scaffold_mask.bool()] = 0.0
         x_t = x_t + velocity * dt
 
         """INSERTION"""

@@ -102,6 +102,7 @@ module:
 
   # Loss component weights
   use_learnable_loss_weights: false
+  exclude_scaffold_from_sub_loss: false
   
   
   loss_weights:
@@ -206,6 +207,12 @@ edge_scaffold_embedding:
   embedding_dim: 32
   out_dim: 64
 
+scaffold_mask_embedding:
+  _target_: chemflow.model.embedding.Embedding
+  num_embeddings: 2       # 0=decoration, 1=scaffold
+  embedding_dim: 32
+  out_dim: 64
+
 token_weighting:
   type_loss_token_weights: uniform
   weight_alpha: 1.0
@@ -218,8 +225,9 @@ embedding_backbone:
   time_embedding_args: ${model.time_embedding}
   node_count_embedding_args: ${model.node_count_embedding}
   edge_scaffold_embedding_args: ${model.edge_scaffold_embedding}
+  scaffold_mask_embedding_args: ${model.scaffold_mask_embedding}
   cfg_embedding_args: ${model.cfg_embedding}
-  h0_input_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.cfg_embed_dim}"}
+  h0_input_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${model.cfg_embed_dim} + ${model.scaffold_mask_embedding.out_dim}"}
   h0_projection_dim: ${model.backbone.d_model}
   e_input_dim: ${oc.eval:"${model.edge_type_embedding.out_dim} + ${model.edge_scaffold_embedding.out_dim}"}
   e_projection_dim: ${model.backbone.d_edge}

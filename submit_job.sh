@@ -14,4 +14,4 @@ cd /cluster/project/jorner/schmiste/flexflow/chemflow
 source .env
 source .venv/bin/activate
 
-uv run --active --env-file .env run.py data=qm9_scaffold_growth trainer.trainer.max_epochs=250 model.integrator.num_integration_steps=300 model.integrator.time_strategy=log model=semla # model=transformer dit logging.offline=true
+uv run --active --env-file .env run.py data=qm9_scaffold trainer.trainer.max_epochs=900 model.integrator.num_integration_steps=300 model.integrator.time_strategy=log model=semla # model=transformer dit logging.offline=true
