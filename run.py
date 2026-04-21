@@ -10,7 +10,7 @@ from omegaconf import OmegaConf
 from rdkit import RDLogger
 from pytorch_lightning.strategies import DDPStrategy
 
-from chemflow.utils.utils import build_callbacks, init_uniform_prior
+from chemflow.utils.utils import build_callbacks, init_uniform_prior, bootstrap_run_id
 from chemflow.dataset.vocab import setup_token_weights
 from chemflow.model.lightning_module import LightningModuleRates
 from chemflow.utils.metrics import init_metrics
@@ -30,7 +30,7 @@ RDLogger.DisableLog("rdApp.*")
 pl.seed_everything(42)
 
 
-def run(cfg: DictConfig):
+def setup(cfg: DictConfig):
     OmegaConf.set_struct(cfg, False)
 
     # Instantiate preprocessing to compute distributions from training dataset
@@ -43,11 +43,9 @@ def run(cfg: DictConfig):
 
     # Keep training-frequency distributions for loss weighting.
     loss_weight_distributions = deepcopy(distributions)
-
     token_prior_distribution = init_uniform_prior(distributions)
 
     cfg.data.vocab = vocab
-    print(cfg)
 
     hydra.utils.log.info(
         f"Preprocessing complete.\n"
@@ -112,32 +110,35 @@ def run(cfg: DictConfig):
     wandb_logger = WandbLogger(**cfg.logging)
     callbacks = build_callbacks(cfg)
     lr_monitor = LearningRateMonitor(logging_interval="step")
-
     callbacks.append(lr_monitor)
+
     # Instantiate trainer
     trainer = pl.Trainer(
-        # strategy=DDPStrategy(find_unused_parameters=True),
         logger=wandb_logger,
         callbacks=callbacks,
         **cfg.trainer.trainer,
     )
 
-    ckpt_path = None
-    ckpt_path = "/capstor/store/cscs/swissai/a131/frankem/chemflow/logs/wandb/geom/chemflow/pq2nlem1/checkpoints/epoch=0-step=3000.ckpt"
+    return module, datamodule, trainer
 
-    # Train the model
+
+def train(module, datamodule, trainer, ckpt_path=None):
     trainer.fit(
         module,
         datamodule=datamodule,
         ckpt_path=ckpt_path,
     )
 
+
+def validate(module, datamodule, trainer, ckpt_path=None):
     trainer.validate(
         module,
         dataloaders=datamodule.val_dataloader(),
         ckpt_path=ckpt_path,
     )
-    
+
+
+def predict(module, datamodule, trainer, ckpt_path=None):
 
     predictions = trainer.predict(
         module,
@@ -179,8 +180,18 @@ def run(cfg: DictConfig):
     version_base="1.1",
 )
 def main(cfg: omegaconf.DictConfig):
-    run(cfg)
+    ckpt_path = cfg.trainer.checkpoint_path
+
+    module, datamodule, trainer = setup(cfg)
+
+    if cfg.trainer.do_train:
+        train(module, datamodule, trainer, ckpt_path)
+    if cfg.trainer.do_validate:
+        validate(module, datamodule, trainer, ckpt_path)
+    if cfg.trainer.do_predict:
+        predict(module, datamodule, trainer, ckpt_path)
 
 
 if __name__ == "__main__":
+    bootstrap_run_id()
     main()

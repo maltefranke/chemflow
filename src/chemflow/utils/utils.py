@@ -1,3 +1,5 @@
+import os
+import wandb
 from typing import Any
 import hydra
 from omegaconf import DictConfig
@@ -53,6 +55,31 @@ def build_callbacks(cfg: DictConfig) -> list[Callback]:
         )
 
     return callbacks
+
+
+def bootstrap_run_id() -> None:
+    """Ensure CHEMFLOW_RUN_ID / WANDB_RUN_ID exist before Hydra composes (matches hydra.run.dir).
+
+    Hydra output dir is outputs/<data>/<cfg>/<YYYY-MM-DD>/<this id>. Single-process: generates
+    a wandb-style id. Multi-process (torchrun): id must be set in the environment before launch
+    so every rank shares the same output directory and run.
+    """
+    if os.environ.get("CHEMFLOW_RUN_ID"):
+        os.environ.setdefault("WANDB_RUN_ID", os.environ["CHEMFLOW_RUN_ID"])
+        return
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size > 1:
+        raise RuntimeError(
+            "Multi-process runs require CHEMFLOW_RUN_ID in the environment (use the same "
+            "value as WANDB_RUN_ID). Example:\n"
+            '  export CHEMFLOW_RUN_ID="$(python -c "import wandb; print(wandb.util.generate_id())")"\n'
+            '  export WANDB_RUN_ID="$CHEMFLOW_RUN_ID"'
+        )
+
+    rid = wandb.util.generate_id()
+    os.environ["CHEMFLOW_RUN_ID"] = rid
+    os.environ["WANDB_RUN_ID"] = rid
 
 
 def edge_types_to_triu_entries(edge_index, edge_types_one_hot, num_atoms):
