@@ -7,3 +7,11 @@ defaults:
   - trainer: trainer
   - callbacks: callbacks
   - logging: wandb_logger
+  - integrator: integrator
+
+# Run directory: outputs/<dataset>/<cfg_method>/<date>/<wandb_id>.
+# wandb id is CHEMFLOW_RUN_ID (same as WANDB_RUN_ID). Set in the shell before
+# torchrun, or set automatically for single-process runs in run.py before Hydra composes.
+hydra:
+  run:
+    dir: ${hydra:runtime.cwd}/outputs/${hydra:runtime.choices.data}/${hydra:runtime.choices.cfg}/${now:%Y-%m-%d}/${oc.env:CHEMFLOW_RUN_ID}
