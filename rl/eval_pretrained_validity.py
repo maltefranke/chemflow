@@ -92,6 +92,14 @@ def load_ckpt_into_module(module, ckpt_path: str):
     return module
 
 
+def _count_atoms_from_traj(traj) -> int:
+    """Count total atoms in the final state of a generated trajectory."""
+    try:
+        return int(traj[-1].a.numel())
+    except Exception:
+        return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -147,6 +155,9 @@ def main():
             invalid_rdkit = invalid_rdkit[:keep_invalid]
     total = len(valid) + len(invalid)
     validity = (len(valid) / total) if total else 0.0
+    valid_n_atoms = [_count_atoms_from_traj(traj) for traj in valid]
+    invalid_n_atoms = [_count_atoms_from_traj(traj) for traj in invalid]
+    all_n_atoms = valid_n_atoms + invalid_n_atoms
     out = dict(
         ckpt=args.ckpt,
         n_requested=args.n_mols,
@@ -157,11 +168,25 @@ def main():
         valid_mols=valid,
         invalid_mols=invalid,
         invalid_mols_rdkit=invalid_rdkit,
+        valid_n_atoms=valid_n_atoms,
+        invalid_n_atoms=invalid_n_atoms,
+        all_n_atoms=all_n_atoms,
+        n_atoms_mean_valid=(sum(valid_n_atoms) / len(valid_n_atoms)) if valid_n_atoms else 0.0,
+        n_atoms_max_valid=max(valid_n_atoms) if valid_n_atoms else 0,
+        n_atoms_mean_all=(sum(all_n_atoms) / len(all_n_atoms)) if all_n_atoms else 0.0,
+        n_atoms_max_all=max(all_n_atoms) if all_n_atoms else 0,
         hydra_overrides=list(args.overrides),
     )
     torch.save(out, args.out)
     print(f"saved: {args.out}")
     print(f"generated: {total} | valid: {len(valid)} | validity: {validity:.4f}")
+    print(
+        "n_atoms: "
+        f"mean_valid={out['n_atoms_mean_valid']:.2f} "
+        f"max_valid={out['n_atoms_max_valid']} "
+        f"mean_all={out['n_atoms_mean_all']:.2f} "
+        f"max_all={out['n_atoms_max_all']}"
+    )
 
 
 if __name__ == "__main__":

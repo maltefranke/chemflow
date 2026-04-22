@@ -68,6 +68,7 @@ Open knobs / TODOs
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, List, Optional
 
@@ -110,6 +111,7 @@ class GRPOConfig:
     log_ratio_clamp: float = DEFAULT_LOG_RATIO_CLAMP  # clamp |lp_new - lp_old| before exp (see §A)
     p_ins_clamp: float = DEFAULT_P_INS_CLAMP       # overleaf §4.1: `min(p_ins, 1-eps)` (see §4)
     num_integration_steps: int | None = None       # None -> module's default
+    max_grad_norm: float | None = 1.0              # clip_grad_norm_ threshold; None disables
     # CFG inputs to feed guided_predict.  Built at rollout time from a batch's
     # (mol_t, mol_1) pair and stashed here so every step + log-prob call shares
     # the exact same conditioning.
@@ -587,7 +589,14 @@ def _per_channel_logprob(
             edge_batch_id_ii = batch_id[step.ins_ii_spawn_src_orig]
             lp_ins_edge_ii = _scatter_sum(lp_per_ii, edge_batch_id_ii, num_graphs)
 
-    return lp_pos + lp_node + lp_edge + lp_charge + lp_ins_gate + lp_gmm + lp_ins_edge_ext + lp_ins_edge_ii
+    total = lp_pos + lp_node + lp_edge + lp_charge + lp_ins_gate + lp_gmm + lp_ins_edge_ext + lp_ins_edge_ii
+    breakdown = {
+        "pos": lp_pos.detach(), "node": lp_node.detach(), "edge": lp_edge.detach(),
+        "charge": lp_charge.detach(), "ins_gate": lp_ins_gate.detach(),
+        "gmm": lp_gmm.detach(), "ins_e_ext": lp_ins_edge_ext.detach(),
+        "ins_e_ii": lp_ins_edge_ii.detach(),
+    }
+    return total, breakdown
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -908,7 +917,8 @@ def _rollout_step(module, mol_t, t: torch.Tensor, dt: float, cfg: GRPOConfig):
     step.hat_e_ins_full = hat_e_ins_full
 
     # Fill logp_old using the fresh preds from this rollout pass.
-    step.logp_old = _per_channel_logprob(preds, step, cfg, module).detach()
+    lp_total_old, _ = _per_channel_logprob(preds, step, cfg, module)
+    step.logp_old = lp_total_old.detach()
     return mol_t_next, step
 
 
@@ -941,7 +951,8 @@ def rollout_trajectory(module, batch, cfg: GRPOConfig) -> Trajectory:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _step_logprob_with_grad(module, step: StepData, cfg: GRPOConfig) -> torch.Tensor:
+def _step_logprob_with_grad(module, step: StepData, cfg: GRPOConfig):
+    """Returns `(total_lp, channel_breakdown)`.  Breakdown entries are detached."""
     preds = _forward_preds(module, step.mol_t, step.t, cfg)
     return _per_channel_logprob(preds, step, cfg, module)
 
@@ -953,7 +964,19 @@ def grpo_step(
     optimizer: torch.optim.Optimizer,
     reward_fn: Callable = validity_reward,
 ) -> dict:
-    """One GRPO update: rollout -> reward -> per-step clipped loss -> step."""
+    """One GRPO update: rollout -> reward -> per-step clipped loss -> step.
+
+    Note on diagnostics (mu = 1 inner epoch):
+        * `ratio ≡ 1` within this call because `lp_new` and `lp_old` are both
+          evaluated under theta_old -- so `ratio_*` would be uninformative and
+          we don't log it.
+        * `signal/{channel}` = mean over steps of `mean_batch(adv * lp_channel)`.
+          This is the policy-gradient "learning signal" per channel: its sign
+          and magnitude tell us whether that channel's log-prob correlates
+          with reward across the batch.
+        * `grad_norm` is the L2 norm of the accumulated gradient before
+          `optimizer.step()`.  Non-zero => the policy is actually moving.
+    """
     trajectory = rollout_trajectory(module, batch, cfg)
     reward_tensor, reward_aux = reward_fn(module, trajectory)
     trajectory.reward = reward_tensor
@@ -963,11 +986,14 @@ def grpo_step(
 
     optimizer.zero_grad(set_to_none=True)
     loss_sum = 0.0
-    ratio_log: list[torch.Tensor] = []
     n_steps = len(trajectory.steps)
 
+    # Per-channel accumulators (averaged over steps at the end).
+    lp_mean: dict[str, float] = {}
+    adv_signal: dict[str, float] = {}
+
     for step in trajectory.steps:
-        lp_new = _step_logprob_with_grad(module, step, cfg)
+        lp_new, breakdown = _step_logprob_with_grad(module, step, cfg)
         # DEPARTURES.md §A: clamp log-ratio before exp.
         log_ratio = (lp_new - step.logp_old).clamp(
             -cfg.log_ratio_clamp, cfg.log_ratio_clamp,
@@ -977,18 +1003,43 @@ def grpo_step(
         step_loss = -torch.minimum(ratio * adv, clipped * adv).mean()
         (step_loss / n_steps).backward()
         loss_sum += step_loss.item()
-        ratio_log.append(ratio.detach())
+
+        for name, lp_ch in breakdown.items():
+            lp_mean[name] = lp_mean.get(name, 0.0) + float(lp_ch.mean()) / n_steps
+            adv_signal[name] = adv_signal.get(name, 0.0) + float((adv * lp_ch).mean()) / n_steps
+
+    # Gradient norm BEFORE clipping: the raw magnitude of the policy nudge.
+    # We use clip_grad_norm_ (which also returns the pre-clip total norm) when
+    # `cfg.max_grad_norm is not None`, and fall back to a manual sum otherwise.
+    if cfg.max_grad_norm is not None:
+        grad_norm_pre = float(
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in module.parameters() if p.requires_grad],
+                max_norm=cfg.max_grad_norm,
+            )
+        )
+        grad_norm_post = min(grad_norm_pre, float(cfg.max_grad_norm))
+    else:
+        grad_sq = 0.0
+        for p in module.parameters():
+            if p.grad is not None:
+                grad_sq += float(p.grad.pow(2).sum())
+        grad_norm_pre = grad_sq ** 0.5
+        grad_norm_post = grad_norm_pre
 
     optimizer.step()
 
-    ratios = torch.stack(ratio_log)
     return {
         "loss": loss_sum / n_steps,
+        "grad_norm": grad_norm_pre,
+        "grad_norm_post_clip": grad_norm_post,
         "reward_mean": float(r.mean()),
         "reward_std": float(r.std()),
-        "ratio_mean": float(ratios.mean()),
-        "ratio_max": float(ratios.max()),
-        "ratio_min": float(ratios.min()),
+        "reward_min": float(r.min()),
+        "reward_max": float(r.max()),
+        "adv_abs_mean": float(adv.abs().mean()),
+        **{f"lp/{k}": v for k, v in lp_mean.items()},
+        **{f"signal/{k}": v for k, v in adv_signal.items()},
         **reward_aux,
     }
 
@@ -1008,7 +1059,22 @@ def train(
     device: str | torch.device = "cuda",
     log_every: int = 1,
     reward_fn: Callable = validity_reward,
+    best_save_path: str | None = None,
+    best_ema_beta: float = 0.9,
+    best_warmup_steps: int = 3,
 ) -> None:
+    """GRPO training loop.
+
+    Best-checkpoint tracking
+    ------------------------
+    If `best_save_path` is set, we track an EMA of `reward_mean` with
+    coefficient `best_ema_beta` (default 0.9, ~10-step effective window) and
+    save the module state_dict whenever the EMA hits a new maximum, after a
+    short warmup of `best_warmup_steps` steps so the very first noisy update
+    doesn't win by default.  All built-in rewards already gate on RDKit
+    validity (invalid -> 0), so `reward_mean` is a validity-aware signal --
+    no extra `p_valid` multiplier needed.
+    """
     module = module.to(device)
     for p in module.parameters():
         p.requires_grad_(True)
@@ -1024,6 +1090,11 @@ def train(
     except ImportError:
         pass
 
+    if best_save_path is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(best_save_path)) or ".", exist_ok=True)
+    reward_ema: float | None = None
+    best_ema: float = -float("inf")
+
     it = iter(dataloader)
     for step in range(n_updates):
         try:
@@ -1034,6 +1105,28 @@ def train(
 
         batch = _batch_to_device(batch, device)
         info = grpo_step(module, batch, cfg, optimizer, reward_fn=reward_fn)
+
+        r_mean = info["reward_mean"]
+        if reward_ema is None:
+            reward_ema = r_mean
+        else:
+            reward_ema = best_ema_beta * reward_ema + (1.0 - best_ema_beta) * r_mean
+        info["reward_ema"] = reward_ema
+
+        if best_save_path is not None and step >= best_warmup_steps and reward_ema > best_ema:
+            best_ema = reward_ema
+            torch.save(
+                {
+                    "state_dict": module.state_dict(),
+                    "step": step,
+                    "reward_ema": reward_ema,
+                    "reward_mean": r_mean,
+                },
+                best_save_path,
+            )
+            info["best_ema"] = best_ema
+            info["best_saved_at_step"] = step
+            print(f"[grpo] best: step={step:04d} reward_ema={reward_ema:.4f} -> {best_save_path}", flush=True)
 
         if wandb_run is not None:
             wandb_run.log(info, step=step)

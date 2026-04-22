@@ -165,3 +165,5 @@ slurm-*.out
 #RL
 .pretrained_model/
 wandb/
+.rl_ckpts/
+*.pt

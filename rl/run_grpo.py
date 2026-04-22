@@ -130,6 +130,8 @@ def main():
     ap.add_argument("--a_sde", type=float, default=0.1)
     ap.add_argument("--sigma_noise", type=float, default=0.2)
     ap.add_argument("--clip_eps", type=float, default=0.2)
+    ap.add_argument("--max_grad_norm", type=float, default=1.0,
+                    help="Global-norm gradient clip threshold; pass 0 or negative to disable")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--log_every", type=int, default=1)
     ap.add_argument(
@@ -140,6 +142,12 @@ def main():
     ap.add_argument("--wandb_project", default="chemflow-grpo")
     ap.add_argument("--wandb_name", default=None)
     ap.add_argument("--save", default=None, help="Optional path to dump final module state_dict")
+    ap.add_argument("--save_best", default=None,
+                    help="Optional path to save the best (smoothed) reward checkpoint during training")
+    ap.add_argument("--best_ema_beta", type=float, default=0.9,
+                    help="EMA smoothing coefficient for reward (higher = smoother, ~1/(1-beta) effective window)")
+    ap.add_argument("--best_warmup_steps", type=int, default=3,
+                    help="Skip best-ckpt updates for the first N steps")
     ap.add_argument("overrides", nargs="*")
     args = ap.parse_args()
 
@@ -152,6 +160,7 @@ def main():
         a_sde=args.a_sde,
         clip_eps=args.clip_eps,
         num_integration_steps=args.num_steps,
+        max_grad_norm=(args.max_grad_norm if args.max_grad_norm and args.max_grad_norm > 0 else None),
     )
 
     dataloader = first_test_dataloader(datamodule)
@@ -170,6 +179,9 @@ def main():
             device=args.device,
             log_every=args.log_every,
             reward_fn=REWARDS[args.reward],
+            best_save_path=args.save_best,
+            best_ema_beta=args.best_ema_beta,
+            best_warmup_steps=args.best_warmup_steps,
         )
     finally:
         if args.wandb:
@@ -177,6 +189,7 @@ def main():
             wandb.finish()
 
     if args.save is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(args.save)) or ".", exist_ok=True)
         torch.save({"state_dict": module.state_dict()}, args.save)
         print(f"saved: {args.save}")
 

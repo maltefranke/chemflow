@@ -101,6 +101,40 @@ def qed_reward(module, trajectory) -> tuple[torch.Tensor, dict[str, float]]:
     }
 
 
+def n_atoms_reward(module, trajectory) -> tuple[torch.Tensor, dict[str, float]]:
+    """Total atom count if valid, else 0.  Higher = better.
+
+    Returned as raw integer count (not normalized): GRPO standardizes the
+    advantage `(r - r.mean()) / (r.std() + 1e-6)` anyway, so reward scale is
+    irrelevant for the gradient -- only ordering matters.  Keeping the raw
+    count makes `reward_mean` directly readable as "average atoms this
+    batch", and `reward_max` as "largest valid mol seen".
+
+    Diagnostics:
+        - `p_valid`
+        - `n_atoms_mean_valid` / `n_atoms_max_valid` over valid mols only
+        - `n_atoms_mean_all` / `n_atoms_max_all` over all RDKit-convertible mols
+    """
+    device = trajectory.mol_final.x.device
+    counts_valid_gated: list[float] = []
+    counts_all: list[float] = []
+    for rd, ok in _iter_valid_mols(module, trajectory):
+        n_atoms = float(rd.GetNumAtoms()) if rd is not None else 0.0
+        counts_all.append(n_atoms)
+        counts_valid_gated.append(n_atoms if ok else 0.0)
+    r = _as_tensor(counts_valid_gated, device)
+    n_valid = sum(1 for c in counts_valid_gated if c > 0)
+    sum_valid = sum(c for c in counts_valid_gated if c > 0)
+    sum_all = sum(counts_all)
+    return r, {
+        "p_valid": n_valid / max(len(counts_valid_gated), 1),
+        "n_atoms_mean_valid": (sum_valid / n_valid) if n_valid > 0 else 0.0,
+        "n_atoms_max_valid": max(counts_valid_gated) if counts_valid_gated else 0.0,
+        "n_atoms_mean_all": (sum_all / len(counts_all)) if counts_all else 0.0,
+        "n_atoms_max_all": max(counts_all) if counts_all else 0.0,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Registry (add new rewards here)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -109,4 +143,5 @@ def qed_reward(module, trajectory) -> tuple[torch.Tensor, dict[str, float]]:
 REWARDS: dict[str, Callable] = {
     "validity": validity_reward,
     "qed": qed_reward,
+    "n_atoms": n_atoms_reward,
 }
