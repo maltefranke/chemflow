@@ -17,7 +17,13 @@ from __future__ import annotations
 from typing import Callable, Iterator, Optional
 
 import torch
-from rdkit import Chem
+from rdkit import Chem, RDLogger
+
+# Silence RDKit's "Explicit valence for atom..." spam emitted during GRPO
+# rollouts where intermediate (and some final) molecules are invalid by
+# construction.  The validity flag returned by `mol_is_valid` is the signal
+# we care about; the log lines just obscure `print`-based training metrics.
+RDLogger.DisableLog("rdApp.*")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

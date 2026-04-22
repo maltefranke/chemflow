@@ -1,4 +1,4 @@
-# Departures from the Overleaf (Phase 1)
+# Departures from the Overleaf (Phase 2)
 
 This document lists every place the implementation in `rl/grpo.py` deviates from
 the derivations in the project's overleaf, and why.
@@ -26,13 +26,15 @@ The minus on the score correction is correct — it is the same object
 expressed in forward time. This is documented in the module docstring of
 `rl/grpo.py`.
 
-## 2. Self-conditioning disabled
+## 2. Self-conditioning is dead code in the base repo
 
-`prev_preds = None` is passed at every step during both rollout and log-prob
-recomputation. Keeping the pretrained model's self-conditioning faithfully
-would require either quadratic re-rollouts, or storing the entire `preds`
-dictionary per step as a detached observation. Easy to add back once we see it
-matters.
+`prev_preds = None` is passed at every step. This is not actually a
+departure: `SelfConditioningResidualLayer` is defined in
+`src/chemflow/model/self_conditioning.py` but **never imported**, and the
+active backbone `DiTBackboneWithHeads.forward` accepts `prev_outs` /
+`is_random_self_conditioning` as kwargs but does not read them. The base
+model never consumed self-conditioning, so our rollout passing `None`
+matches `sample()` exactly.
 
 ## 3. Position SDE $\sigma_t^2$ clamp at $t \approx 0$
 
@@ -43,11 +45,14 @@ the **start** of sampling in code convention). We clamp $t$ from below with
 - (a) skip the SDE on the first step (deterministic Euler for step 0);
 - (b) pick a bounded schedule.
 
-## 4. Insertion probability clamp deferred
+## 4. Insertion probability clamp (implemented)
 
 $\tilde p_\mathrm{ins}^i = \min(p_\mathrm{ins}^i,\,1-\epsilon)$ from §4.1 of the
-overleaf is **not** implemented yet because Phase 1 disables insertions
-entirely. It will be added together with the insertion channel.
+overleaf is applied both when sampling (so the Bernoulli probability is
+well-defined) and when evaluating the log-prob. Because the integrator's
+sampling path `torch.rand() < p` is equivalent to clamping at 1 (a uniform
+draw always falls below any $p \ge 1$), this changes the numerical value
+of the log-prob but not the action distribution.
 
 ## 5. Per-step PPO-style ratio + shared trajectory-level advantage
 
@@ -177,6 +182,196 @@ rollouts sharing the same `GRPOConfig` object.
 `_rollout_step`, `_step_logprob_with_grad`, and `_per_channel_logprob`. Defer
 until we actually parallelise.
 
+---
+
+# Phase-2 specific design choices
+
+The entries below are introduced by enabling the full variable-atom regime
+(insertions + deletions + typed-GMM + ins-edge heads). None of them is a
+departure from the overleaf in the "we simplified the math" sense; they
+are choices about how to thread the integrator's action-sampling into a
+policy-gradient framework where every random draw must have a log-prob.
+
+## F. Integrator safeguards treated as environment (severity: medium)
+
+**Problem.** `integrate_step_gnn` applies two safety nets that modify the
+sampled action outside the policy:
+
+1. **Insertion overflow** (integration.py lines 272–288): if a graph's
+   post-ins atom count would exceed `max_atoms`, randomly drop excess
+   `do_ins` flags.
+2. **Deletion underflow** (lines 369–379): if a graph would retain fewer
+   than 2 nodes, restore some `do_del` flags.
+
+Both are valid environmental behaviour but introduce a mismatch between
+the *nominal* policy (Bernoulli with rate $p$) and the *realised* action
+distribution.
+
+**Fix.** We apply the exact same safeguards in `_rollout_step` so the
+trajectory distribution matches the integrator bit-for-bit, then evaluate
+the log-prob under the unmodified Bernoulli probabilities. The safeguard
+is treated as part of the environment $p(\text{next state} \mid \text{action})$
+rather than the policy. Practically this is a mild log-prob miscalibration
+on the ~1% of steps where a safeguard fires; the bias is the same under
+$\theta_\mathrm{old}$ and $\theta_\mathrm{new}$, so the GRPO *ratio* is
+unaffected on those steps (both sides score the same action under the
+same Bernoulli).
+
+## G. Two-stage ins-edge marginalisation
+
+**Source.** Overleaf Eq. `ins_edge_marginal`.
+
+The integrator samples insertion edges in two stages: a clean prediction
+$e_1 \sim \mathrm{Cat}(\pi_\mathrm{edge})$, one-hot encoded, mixed with
+the prior at the current noise level
+$\kappa_t = \kappa_{\mathrm{sub},e}(t+\Delta t)$, then the final
+$\hat e \sim \mathrm{Cat}((1-\kappa_t)\,p_\mathrm{prior} + \kappa_t\,\mathbf{1}[e_1])$.
+
+We do not store the latent $e_1$. At scoring time we use the closed-form
+marginal
+$$P(\hat e = k) = (1-\kappa_t)\,p_\mathrm{prior}[k] + \kappa_t\,\pi_\mathrm{edge}[k],$$
+re-computing $\kappa_t$ from `step.t + step.dt` via
+`module.integrator.sub_e_schedule.kappa_t`. This applies to both
+ins→existing and ins→ins edges.
+
+**Note on rollout.** We *also* sample directly from this marginal in
+`_rollout_step` rather than replicating the integrator's two-stage draw.
+The two procedures produce the same distribution over $\hat e$ (by the
+law of total probability), so no additional departure is introduced.
+The practical benefit is that we never need to store $e_1$.
+
+## H. GMM component marginalisation
+
+**Source.** Overleaf Remark after Eq. `gmm_logprob_lse`.
+
+`sample_from_typed_gmm` picks a component $k$ internally but we do not
+store it. The log-prob is the logsumexp over components
+$$\log\pi^\mathrm{GMM}(x,a,c) = \mathrm{logsumexp}_k\Big[\log\pi_k +
+\log\mathcal{N}(x|\mu_k,\sigma_k^2 I) + \log p_{\mathrm{atom},k}[a] +
+\log p_{\mathrm{charge},k}[c]\Big],$$
+which is invariant to which component was drawn. This reduces variance
+in the policy-gradient signal, at the cost of evaluating all $K$
+components ($K \le 8$) once per inserted atom.
+
+## I. `node_atom_types` to the insertion edge head
+
+**Situation.** The integrator constructs the argument to
+`ins_edge_head.predict_edges_for_insertion(..., node_atom_types=a_t, ...)`
+*after* applying substitutions (integration.py line 320 sets
+`a_t[do_sub_a] = a_1[do_sub_a]`, then line 444 passes the post-sub `a_t`).
+This creates an asymmetry inside one step: the latent features
+`h_latent` were produced from the *pre-sub* atom types, but the explicit
+`node_atom_types` tensor used by the edge MLP sees *post-sub* types.
+
+**Our choice.** We mirror the integrator exactly: rollout rebuilds
+`a_next = mol_t.a; a_next[do_sub_a] = hat_a[do_sub_a]` and passes that,
+and scoring rebuilds the same tensor from `step.a_choice == 1` and
+`step.hat_a`. Any alternative (pass pre-sub, or recompute `h_latent`
+from post-sub) would differ from the integrator and therefore from the
+policy the pretrained model was trained under. First implementation
+pass used pre-sub `mol_t.a` in both places and was silently wrong
+(rollout didn't match the integrator; scoring and rollout agreed with
+each other only because both used the wrong value). Caught during
+review; see commit.
+
+## J. Invalid ins→existing edges: predicted in full, zeroed in log-prob
+
+**Situation.** `ins_edge_head.predict_edges_for_insertion` returns
+pairs `(spawn_orig, existing_orig)` for *every* same-graph node of every
+spawn, regardless of whether the `existing` endpoint survives deletion.
+The integrator filters these to the valid subset
+(`orig_to_postdel[existing] >= 0`) before placing them on the graph;
+invalid edges are simply never placed.
+
+**Our choice.** At rollout we sample `hat_e_ins_full` for **all**
+returned pairs (valid and invalid), then record both the full edge set
+and a `ins_edge_valid_mask`. At scoring time we re-run
+`predict_edges_for_insertion` on the same `do_ins` mask (so the pair
+ordering matches — asserted) and evaluate the marginal log-prob on the
+full set, then zero out invalid-edge contributions before the
+scatter-sum.
+
+**Why not subset.** Either (a) include all pairs in the log-prob or
+(b) subset to valid-only before sampling both the edge and the log-prob.
+We picked (a) for a simpler ordering assertion; subsetting would require
+stable re-ordering of the valid subset at scoring time. The gradient on
+invalid edges is zero (we multiplied by `valid_mask`) so the effective
+objective is identical under (a) and (b).
+
+## K. Deleted spawn nodes may still insert atoms
+
+**Situation.** Integrator line 397: `do_ins_valid = do_ins`. A node
+that will be deleted this step can still spawn an insertion — the spawn
+node only provides the GMM conditioning signal (its latent features and
+position), not a structural parent in the post-step graph. The
+post-deletion mapping `orig_to_postdel[spawn] == -1` is fine because
+the *new atom* uses its own fresh index, not the spawn's.
+
+**Our choice.** We match this exactly: `do_ins` is applied without
+being intersected with `~do_del`. The GMM conditioning tensors in
+`ins_gmm_preds` are indexed by the original `do_ins` mask, which
+reaches deleted nodes just as well as survivors.
+
+## L. Phantom sampling on deleted nodes
+
+**Situation.** The integrator evaluates every per-node channel (position
+update, atom-type sample via `a_pred`, charge sample via `c_pred`) on
+**all** $N_\mathrm{orig}$ nodes before filtering (lines 259, 878–895
+in lightning_module.py, line 391 in integration.py). There is no
+short-circuit that skips these draws for nodes marked `do_del`.
+
+**Our choice.** Rollout matches: we compute `x_next`, `hat_a`, `hat_c`
+for all original nodes. Deleted rows are "phantom" — sampled but never
+placed in `mol_t_next`. The corresponding log-prob terms multiply by
+`survive_mask = step.a_choice != 2` before `_scatter_sum`, which zeros
+them out per-graph. The phantom samples are independent of the reward
+and of $\theta$, so their masked contribution is structurally zero and
+does not affect the gradient.
+
+Alternative (skip these draws on deleted nodes) would add branching
+without changing the distribution and would make the scoring path
+harder to keep in lock-step with the rollout path.
+
+## M. Charge channel partitioning: existing vs inserted
+
+**Invariant.** Every atom in the final state has exactly one charge
+log-prob contribution.  Existing survivors get theirs from the
+`charge_head` categorical (node-channel log-prob, masked by
+`survive_mask`).  Inserted atoms get theirs from the typed GMM term
+(which jointly models `(x, a, c)` for each insertion).  Double-counting
+either side would bias the gradient.
+
+**Where this shows up in code.** `charge_logprob(...)` is called with
+`survive_mask` derived from `step.a_choice != 2`, scattering only over
+mol_t's *original* nodes.  `gmm_marginal_logprob(...)` reads `ins_c`
+from `step.ins_c` and uses the GMM's `c_probs` head — these atoms are
+newly inserted, not in mol_t, so the two sets are disjoint by
+construction.
+
+## N. Integrator parity (documentation only)
+
+These points match the integrator and `LightningModuleRates.sample()`
+exactly; they are listed only because they are easy to get wrong.
+
+- **COM removal**: `remove_com()` is called once before the loop and
+  once after every integrator step (`sample()` lightning_module.py
+  lines 829 and 957). We match.
+- **Topology edit order**: within a step, the integrator applies
+  substitutions → deletions → insertions on `mol_post_sub`. Insertions
+  receive the post-deletion index mapping. We match.
+- **`n_atoms_strategy == "fixed"`**: zero out `q_del` and
+  `num_ins_pred` *before* any safeguard or clamp, exactly as
+  `sample()` does.
+- **`p_sub + p_del > 1` edge case**: neither rollout nor scoring
+  re-normalise the two rates. Both paths clamp
+  `p_any = (p_sub + p_del).clamp(max=1-EPS)` consistently, so the
+  effective distribution is always a valid categorical over
+  $\{\text{noop}, \text{sub}, \text{del}\}$ and rollout / scoring
+  agree.
+- **`cfg_inputs`**: built once per rollout from the `(mol_t, mol_1)`
+  pair at $t=0$ and reused for every step and every scoring pass —
+  the CFG conditioning is constant over the trajectory by design.
+
 ## Priority order
 
 1. A (log-ratio clamp) — required for stability.
@@ -184,4 +379,9 @@ until we actually parallelise.
 3. C (canonical `q → p`) — hygiene; forecloses the latent mismatch.
 4. D (alignment assertion) — one-line insurance.
 5. E (config mutation) — defer to the parallelisation PR.
+6. F (integrator safeguards) — mild calibration bias; documented.
+7. G / H (closed-form marginalisations) — exact; no workaround needed.
+8. I (post-sub atom types in ins-edge head) — correctness-critical; fixed.
+9. J / K / L / M — documentation of invariants and phantom-sampling semantics.
+10. N — documentation of exact integrator parity.
 
