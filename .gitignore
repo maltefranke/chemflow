@@ -161,3 +161,7 @@ logs/
 data/
 
 slurm-*.out
+
+#RL
+.pretrained_model/
+wandb/

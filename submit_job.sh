@@ -14,4 +14,4 @@ cd /cluster/project/krause/frankem/chemflow
 source .env
 source .venv/bin/activate
 
-uv run --active --env-file .env run.py trainer.trainer.max_epochs=2000 model.integrator.num_integration_steps=300 model.ins_rate_strategy=poisson model.integrator.time_strategy=log model=dit # model=transformer dit
+uv run --active --env-file .env run.py trainer.trainer.max_epochs=500 model.integrator.num_integration_steps=100
