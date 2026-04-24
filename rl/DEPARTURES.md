@@ -82,7 +82,7 @@ This section logs issues raised during review of `rl/grpo.py` that are not
 conceptual departures from the overleaf but do affect correctness or stability.
 Each entry states the problem, my assessment, and the minimal fix.
 
-## A. Log-ratio overflow / underflow (severity: high)
+## A. Log-ratio overflow / underflow (severity: high, **applied**)
 
 **Problem.** `grpo_step` computes `ratio = exp(lp_new - lp_old)` where both
 `lp_new` and `lp_old` are *graph-summed* log-probs over all nodes, triu edges,
@@ -93,10 +93,13 @@ Once `ratio = inf`, `torch.minimum(ratio*adv, clipped*adv)` can return a
 finite value but the gradient path through the `inf` branch is `NaN`, silently
 breaking training.
 
-**Fix.** Clamp the *log-ratio* before exponentiating:
+**Fix (applied in `grpo_step`, configurable via `GRPOConfig.log_ratio_clamp`,
+default $\pm 20$).** Clamp the log-ratio before exponentiating:
 
 ```python
-log_ratio = (lp_new - step.logp_old).clamp(-20.0, 20.0)
+log_ratio = (lp_new - step.logp_old).clamp(
+    -cfg.log_ratio_clamp, cfg.log_ratio_clamp,
+)
 ratio = torch.exp(log_ratio)
 ```
 
@@ -104,7 +107,7 @@ $\pm 20$ corresponds to ratios in $[2\cdot 10^{-9},\;5\cdot 10^{8}]$ — far out
 the PPO clip region, so this is a pure safety net and does not change the
 effective objective (the gradient outside the clip region is already zero).
 
-## B. Position-log-prob variance floor (severity: high)
+## B. Position-log-prob variance floor (severity: high, **applied**)
 
 **Problem.** In code convention $\sigma_t^2 = a^2(1-t)/t$ vanishes as $t \to 1$
 (the data end, where the log-time schedule spends most of its steps). With
@@ -117,18 +120,27 @@ and per-step log-ratios blow up. Compounds directly with A.
 The existing `eps_t` clamp only guards the noise end ($t \to 0$); the data
 end is what bites us in practice.
 
-**Fix.** Floor the variance inside `gaussian_logprob_positions`:
+**Fix (applied on both paths, configurable via `GRPOConfig.var_floor`,
+default $10^{-6}$).** Floor the variance identically in scoring and sampling so
+the behaviour policy equals the scoring policy:
 
 ```python
-var = (sigma_t2 * dt).clamp_min(var_floor)  # var_floor = 1e-6 is a reasonable default
+# gaussian_logprob_positions (scoring):
+var = (sigma_t2 * dt).clamp_min(var_floor)
+
+# _rollout_step (sampling):
+var_sample = (sigma_t2 * dt).clamp_min(cfg.var_floor)
+x_next = mu + torch.sqrt(var_sample).unsqueeze(-1) * noise_pos
 ```
 
 This is a *soft smoothing* of the policy: the true Gaussian becomes a delta at
 $t = 1$, we train against a smoothed version with $\text{std} \geq 10^{-3}$.
-Because the same floor is applied in both the stored `logp_old` and the
-recomputed `logp_new`, the ratio is consistent — no policy mismatch.
+Applying the floor on both paths makes the PPO score-function estimator
+unbiased (the sample distribution and the scoring distribution now match);
+applying it only on scoring would keep the ratio consistent but leave the
+gradient mis-scaled at tail times.
 
-## C. Canonical `q → p` transformation (severity: low)
+## C. Canonical `q → p` transformation (severity: low, **applied**)
 
 **Problem.** The sampling path in `_rollout_step` uses
 `p_sub = (q * rate * dt).clamp(0, 1)` before drawing the Bernoulli, while the
@@ -139,17 +151,21 @@ $p = 1 - \epsilon$. In practice `q*rate*dt \ll 1` and the disagreement branch is
 never taken, so the real policy mismatch is negligible — but having two
 different transformations is a latent bug.
 
-**Fix.** Factor out one canonical helper used by both paths:
+**Fix (applied).** A single helper `_q_to_p` is defined near the top of
+`grpo.py` and used in both paths (all `sub_a`, `del`, `sub_e` channels, plus
+`_compute_p_ins` for the insertion gate):
 
 ```python
 def _q_to_p(q, rate_node, dt):
     return (q * rate_node * dt).clamp(EPS, 1.0 - EPS)
 ```
 
-Use this in `_rollout_step` for the Bernoulli draw and in `_per_channel_logprob`
-for the log-prob; drop the separate `.clamp` inside `node_action_logprob`.
+`node_action_logprob` still defensively clamps the *sum* `p_any = p_sub + p_del`
+to `1 - EPS` (since two independently-clamped probabilities can still sum to
+more than one); this is not a path disagreement — rollout clamps the sum the
+same way before the conditional split.
 
-## D. Triu-edge alignment assertion (severity: low)
+## D. Triu-edge alignment assertion (severity: low, **applied**)
 
 **Problem.** `step.edge_triu_idx` is stored during rollout but `_per_channel_logprob`
 calls `_extract_triu(mol_t.edge_index, ...)` fresh and relies on the result
@@ -158,7 +174,7 @@ fixed `edge_index`, so this is correct today, but a future refactor could
 silently break the pairing of `step.e_triu_sub` / `step.hat_e_triu` with the
 newly-extracted edge-level probabilities.
 
-**Fix.** Cheap defensive check inside `_per_channel_logprob`:
+**Fix (applied inside `_per_channel_logprob`).**
 
 ```python
 triu_idx, (q_sub_e_triu, edge_probs_triu) = _extract_triu(
@@ -169,18 +185,22 @@ assert torch.equal(triu_idx, step.edge_triu_idx), (
 )
 ```
 
+An analogous assert guards the `predict_edges_for_insertion` ordering for
+ins→existing edges (rollout vs. scoring).
+
 O(E) equality check, loud failure on regression, no change to logic.
 
-## E. Config mutation (severity: low, correctness OK today)
+## E. Config mutation (severity: low, correctness OK today, **not yet fixed**)
 
-**Problem.** `rollout_trajectory` mutates `cfg.cfg_inputs` and downstream calls
-read from the same instance. Works under the current synchronous, single-process
-loop; breaks the first time we run data-parallel GRPO or interleave multiple
-rollouts sharing the same `GRPOConfig` object.
+**Problem.** `rollout_trajectory` mutates `cfg.cfg_inputs` (line `cfg.cfg_inputs
+= module._build_inference_cfg_inputs(...)`) and downstream calls read from the
+same instance. Works under the current synchronous, single-process loop; breaks
+the first time we run data-parallel GRPO or interleave multiple rollouts
+sharing the same `GRPOConfig` object.
 
-**Fix.** Drop `cfg_inputs` from `GRPOConfig` and thread it explicitly through
-`_rollout_step`, `_step_logprob_with_grad`, and `_per_channel_logprob`. Defer
-until we actually parallelise.
+**Fix (pending).** Drop `cfg_inputs` from `GRPOConfig` and thread it explicitly
+through `_rollout_step`, `_step_logprob_with_grad`, and `_per_channel_logprob`.
+Defer until we actually parallelise.
 
 ---
 
@@ -372,16 +392,27 @@ exactly; they are listed only because they are easy to get wrong.
   pair at $t=0$ and reused for every step and every scoring pass —
   the CFG conditioning is constant over the trajectory by design.
 
-## Priority order
+## Status summary
 
-1. A (log-ratio clamp) — required for stability.
-2. B (variance floor) — required for stability; compounds with A.
-3. C (canonical `q → p`) — hygiene; forecloses the latent mismatch.
-4. D (alignment assertion) — one-line insurance.
-5. E (config mutation) — defer to the parallelisation PR.
-6. F (integrator safeguards) — mild calibration bias; documented.
-7. G / H (closed-form marginalisations) — exact; no workaround needed.
-8. I (post-sub atom types in ins-edge head) — correctness-critical; fixed.
-9. J / K / L / M — documentation of invariants and phantom-sampling semantics.
-10. N — documentation of exact integrator parity.
+Applied in the current `grpo.py`:
+
+- §A (log-ratio clamp) — `grpo_step`, configurable via `GRPOConfig.log_ratio_clamp`.
+- §B (variance floor) — `gaussian_logprob_positions`, configurable via `GRPOConfig.var_floor`.
+- §C (canonical `q → p`) — `_q_to_p` helper used by all sigmoid-gated channels.
+- §D (triu alignment assert + ins-edge ordering assert) — `_per_channel_logprob`.
+- §F (integrator safeguards as environment) — `_apply_overflow_safeguard`,
+  `_apply_underflow_safeguard` in `_rollout_step`.
+- §G (two-stage ins-edge marginalisation) — closed-form marginal sampling in
+  rollout, `ins_edge_marginal_logprob` in scoring.
+- §H (GMM component marginalisation) — `gmm_marginal_logprob` via logsumexp.
+- §I (post-sub `node_atom_types` to the ins-edge head) — rebuilt consistently
+  in both rollout (`a_next`) and scoring (`a_next_score`).
+- §J (invalid ins→existing edges zeroed in log-prob) — via `ins_edge_valid_mask`.
+- §K/§L/§M — matched to integrator semantics.
+
+Still pending:
+
+- §E (config mutation of `cfg.cfg_inputs`) — waiting on parallelisation.
+- §3 (position SDE $\sigma_t^2$ lower clamp) — `eps_t = 1e-2` is the current
+  pragmatic choice; the `(a)` / `(b)` alternatives in §3 are still open.
 

@@ -55,18 +55,12 @@ Safeguards (replicated from `integrate_step_gnn`)
 Both are non-policy random modifications to the sampled action.  We apply
 them identically to the integrator and then compute log-prob under the
 *unmodified* Bernoulli probabilities, treating the safeguard as part of
-the environment.  See DEPARTURES.md §E.
-
-Open knobs / TODOs
-------------------
-    * `eps_t` floor on t inside sigma_t^2.
-    * No KL term to a frozen reference policy.
-    * Per-step clipped ratio (LLM-GRPO style); trajectory-level is a sum.
-    * Reward defaults to RDKit validity; swap via `rl.rewards.REWARDS`.
+the environment.  See DEPARTURES.md §F.
 """
 
 from __future__ import annotations
 
+import copy
 import math
 import os
 from dataclasses import dataclass, field
@@ -112,6 +106,14 @@ class GRPOConfig:
     p_ins_clamp: float = DEFAULT_P_INS_CLAMP       # overleaf §4.1: `min(p_ins, 1-eps)` (see §4)
     num_integration_steps: int | None = None       # None -> module's default
     max_grad_norm: float | None = 1.0              # clip_grad_norm_ threshold; None disables
+    # GRPO group size: number of rollouts sharing the same prompt. G=1 keeps
+    # the legacy batch-relative baseline; G>1 replicates each prompt G times
+    # in the batch and normalises advantages within each group (DeepSeek-GRPO
+    # style).  Effective unique-prompt count per update = batch_size // G.
+    group_size: int = 1
+    # β · (sum of per-channel k3) added to the step loss, k3 = exp(t) - t - 1
+    # with t = lp_ref - lp_θ (clamped). 0 disables: no ref model, no extra forward.
+    kl_coef: float = 0.0
     # CFG inputs to feed guided_predict.  Built at rollout time from a batch's
     # (mol_t, mol_1) pair and stashed here so every step + log-prob call shares
     # the exact same conditioning.
@@ -420,7 +422,9 @@ def _per_channel_logprob(
     step: StepData,
     cfg: GRPOConfig,
     module,
-) -> torch.Tensor:
+    *,
+    detach_breakdown: bool = True,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute per-graph log-prob from `preds` (under ANY theta) and `step`'s captured actions.
 
     Mirrors the rollout channel-by-channel.  Every randomness draw in
@@ -590,13 +594,14 @@ def _per_channel_logprob(
             lp_ins_edge_ii = _scatter_sum(lp_per_ii, edge_batch_id_ii, num_graphs)
 
     total = lp_pos + lp_node + lp_edge + lp_charge + lp_ins_gate + lp_gmm + lp_ins_edge_ext + lp_ins_edge_ii
-    breakdown = {
-        "pos": lp_pos.detach(), "node": lp_node.detach(), "edge": lp_edge.detach(),
-        "charge": lp_charge.detach(), "ins_gate": lp_ins_gate.detach(),
-        "gmm": lp_gmm.detach(), "ins_e_ext": lp_ins_edge_ext.detach(),
-        "ins_e_ii": lp_ins_edge_ii.detach(),
+    per_ch = {
+        "pos": lp_pos, "node": lp_node, "edge": lp_edge, "charge": lp_charge,
+        "ins_gate": lp_ins_gate, "gmm": lp_gmm, "ins_e_ext": lp_ins_edge_ext,
+        "ins_e_ii": lp_ins_edge_ii,
     }
-    return total, breakdown
+    if detach_breakdown:
+        per_ch = {k: v.detach() for k, v in per_ch.items()}
+    return total, per_ch
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -780,7 +785,7 @@ def _rollout_step(module, mol_t, t: torch.Tensor, dt: float, cfg: GRPOConfig):
             t_ins_graph = t[batch_id[spawn_idx]] + dt
             kappa_t_e = integrator.sub_e_schedule.kappa_t(t_ins_graph).unsqueeze(1)
             # Closed-form marginal sampling: P(hat_e) = (1 - kappa) * prior + kappa * pi.
-            # Matches integrator's two-stage draw in distribution (DEPARTURES.md §F).
+            # Matches integrator's two-stage draw in distribution (DEPARTURES.md §G).
             mixed_probs = (
                 (1.0 - kappa_t_e) * prior_edge_probs.view(1, -1) + kappa_t_e * ins_probs
             )
@@ -922,6 +927,36 @@ def _rollout_step(module, mol_t, t: torch.Tensor, dt: float, cfg: GRPOConfig):
     return mol_t_next, step
 
 
+def _replicate_batch_for_groups(batch, group_size: int):
+    """Replicate each graph in a `(mol_t, mol_1)` batch `group_size` times.
+
+    Layout is prompt-major: output indices `i*G .. i*G + G-1` are independent
+    clones of the i-th input graph.  This lets downstream code reshape a
+    per-graph reward tensor as `(K, G)` to compute group-relative advantages
+    directly, without any permutation.
+
+    If `batch_size` is not a multiple of `group_size`, the batch is trimmed to
+    the largest divisible prefix (so K = batch_size // G).  G=1 is a no-op.
+    """
+    if group_size == 1:
+        return batch
+    mol_t, mol_1 = batch
+    batch_size = mol_t.num_graphs
+    K = batch_size // group_size
+    if K == 0:
+        raise ValueError(
+            f"batch_size ({batch_size}) must be >= group_size ({group_size})"
+        )
+    t_list = mol_t.to_data_list()[:K]
+    o_list = mol_1.to_data_list()[:K]
+    t_reps, o_reps = [], []
+    for t_d, o_d in zip(t_list, o_list):
+        for _ in range(group_size):
+            t_reps.append(t_d.clone())
+            o_reps.append(o_d.clone())
+    return type(mol_t).from_data_list(t_reps), type(mol_1).from_data_list(o_reps)
+
+
 @torch.no_grad()
 def rollout_trajectory(module, batch, cfg: GRPOConfig) -> Trajectory:
     mol_t, mol_1 = batch
@@ -951,10 +986,45 @@ def rollout_trajectory(module, batch, cfg: GRPOConfig) -> Trajectory:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _step_logprob_with_grad(module, step: StepData, cfg: GRPOConfig):
-    """Returns `(total_lp, channel_breakdown)`.  Breakdown entries are detached."""
+def _step_logprob_with_grad(
+    module, step: StepData, cfg: GRPOConfig, *, detach_breakdown: bool = True,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Returns `(total_lp, channel_breakdown)`.
+
+    By default, breakdown values are `.detach()`'d (cheap diagnostics, no big graph).
+    Set `detach_breakdown=False` for KL, which needs the same per-channel
+    `log p_θ` in the autograd path.
+    """
     preds = _forward_preds(module, step.mol_t, step.t, cfg)
-    return _per_channel_logprob(preds, step, cfg, module)
+    return _per_channel_logprob(
+        preds, step, cfg, module, detach_breakdown=detach_breakdown,
+    )
+
+
+def _k3_kl_per_channel(
+    breakdown_theta: dict[str, torch.Tensor],
+    breakdown_ref: dict[str, torch.Tensor],
+    cfg: GRPOConfig,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Schulman k3 = exp(t) - t - 1 with t = log π_ref - log π_θ, per channel and graph.
+
+    Each channel is one term; the returned `kl_total` is the sum (same as STABILITY_FIXES
+    for a factorised per-step policy).  `t` is clamped like the PPO log-ratio to avoid
+    `exp` overflow.
+    """
+    kl_by_ch: dict[str, torch.Tensor] = {}
+    for name, lp_t in breakdown_theta.items():
+        lp_r = breakdown_ref.get(name)
+        if lp_r is None:
+            continue
+        t = (lp_r - lp_t).clamp(
+            -cfg.log_ratio_clamp, cfg.log_ratio_clamp,
+        )
+        kl_by_ch[name] = torch.exp(t) - t - 1.0
+    if not kl_by_ch:
+        z = next(iter(breakdown_theta.values()))
+        return torch.zeros_like(z), {}
+    return sum(kl_by_ch.values()), kl_by_ch
 
 
 def grpo_step(
@@ -963,8 +1033,21 @@ def grpo_step(
     cfg: GRPOConfig,
     optimizer: torch.optim.Optimizer,
     reward_fn: Callable = validity_reward,
+    ref_module: Optional[torch.nn.Module] = None,
 ) -> dict:
     """One GRPO update: rollout -> reward -> per-step clipped loss -> step.
+
+    Advantage computation
+    ---------------------
+    With `cfg.group_size == 1` (legacy behaviour), advantages are computed
+    batch-relative: `adv_i = (r_i - mean(r)) / std(r)`.
+
+    With `cfg.group_size == G > 1` (DeepSeek-style GRPO), the batch is
+    pre-replicated so each prompt appears G times consecutively.  Advantages
+    are then normalised *within* each group of G:
+        `adv_{k,g} = (r_{k,g} - mean_g r_{k,g}) / std_g r_{k,g}`.
+    This cancels between-prompt reward heterogeneity from the advantage,
+    leaving only the contribution of the stochastic rollout choices.
 
     Note on diagnostics (mu = 1 inner epoch):
         * `ratio ≡ 1` within this call because `lp_new` and `lp_old` are both
@@ -976,37 +1059,80 @@ def grpo_step(
           with reward across the batch.
         * `grad_norm` is the L2 norm of the accumulated gradient before
           `optimizer.step()`.  Non-zero => the policy is actually moving.
+        * `reward_within_std` / `reward_between_std` (group mode only) show
+          how much of the reward variance is attributable to action noise
+          (within) vs prompt heterogeneity (between).
+        * When `cfg.kl_coef > 0` and `ref_module` is set, each step adds
+          `β · mean(sum_c k3_c)` to the loss (Schulman k3 on per-channel
+          log-prob ratios).  Logged as `kl/total` and `kl/{channel}`.
     """
+    batch = _replicate_batch_for_groups(batch, cfg.group_size)
     trajectory = rollout_trajectory(module, batch, cfg)
     reward_tensor, reward_aux = reward_fn(module, trajectory)
     trajectory.reward = reward_tensor
 
     r = trajectory.reward
-    adv = (r - r.mean()) / (r.std() + 1e-6)
+    G = cfg.group_size
+    group_aux: dict[str, float] = {}
+    if G > 1:
+        assert r.numel() % G == 0, (
+            f"reward size {r.numel()} not divisible by group_size {G}; "
+            "did `_replicate_batch_for_groups` run?"
+        )
+        r_groups = r.view(-1, G)
+        mean = r_groups.mean(dim=1, keepdim=True)
+        std = r_groups.std(dim=1, keepdim=True)
+        adv = ((r_groups - mean) / (std + 1e-6)).reshape(-1)
+        group_aux["reward_within_std"] = float(r_groups.std(dim=1).mean())
+        group_aux["reward_between_std"] = float(r_groups.mean(dim=1).std())
+    else:
+        adv = (r - r.mean()) / (r.std() + 1e-6)
 
     optimizer.zero_grad(set_to_none=True)
-    loss_sum = 0.0
+    loss_ppo_sum = 0.0
+    loss_kl_sum = 0.0
     n_steps = len(trajectory.steps)
+    use_kl = cfg.kl_coef > 0.0 and ref_module is not None
 
     # Per-channel accumulators (averaged over steps at the end).
     lp_mean: dict[str, float] = {}
     adv_signal: dict[str, float] = {}
+    kl_mean: dict[str, float] = {}
 
     for step in trajectory.steps:
-        lp_new, breakdown = _step_logprob_with_grad(module, step, cfg)
+        lp_new, breakdown = _step_logprob_with_grad(
+            module, step, cfg, detach_breakdown=not use_kl,
+        )
         # DEPARTURES.md §A: clamp log-ratio before exp.
         log_ratio = (lp_new - step.logp_old).clamp(
             -cfg.log_ratio_clamp, cfg.log_ratio_clamp,
         )
         ratio = torch.exp(log_ratio)
         clipped = torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps)
-        step_loss = -torch.minimum(ratio * adv, clipped * adv).mean()
+        ppo_term = -torch.minimum(ratio * adv, clipped * adv).mean()
+        step_loss = ppo_term
+
+        if use_kl:
+            with torch.inference_mode():
+                _, breakdown_ref = _step_logprob_with_grad(
+                    ref_module, step, cfg, detach_breakdown=True,
+                )
+            kl_total, kl_by_ch = _k3_kl_per_channel(
+                breakdown, breakdown_ref, cfg,
+            )
+            step_loss = step_loss + cfg.kl_coef * kl_total.mean()
+            loss_kl_sum += float((cfg.kl_coef * kl_total.mean()).item())
+            for name, kch in kl_by_ch.items():
+                kl_mean[name] = kl_mean.get(name, 0.0) + float(kch.mean()) / n_steps
+
         (step_loss / n_steps).backward()
-        loss_sum += step_loss.item()
+        loss_ppo_sum += float(ppo_term.item())
 
         for name, lp_ch in breakdown.items():
-            lp_mean[name] = lp_mean.get(name, 0.0) + float(lp_ch.mean()) / n_steps
-            adv_signal[name] = adv_signal.get(name, 0.0) + float((adv * lp_ch).mean()) / n_steps
+            lp_mean[name] = lp_mean.get(name, 0.0) + float(lp_ch.detach().mean()) / n_steps
+            adv_signal[name] = adv_signal.get(name, 0.0) + float(
+                (adv * lp_ch.detach()).mean(),
+            ) / n_steps
 
     # Gradient norm BEFORE clipping: the raw magnitude of the policy nudge.
     # We use clip_grad_norm_ (which also returns the pre-clip total norm) when
@@ -1029,8 +1155,10 @@ def grpo_step(
 
     optimizer.step()
 
-    return {
-        "loss": loss_sum / n_steps,
+    loss_total = (loss_ppo_sum + loss_kl_sum) / n_steps
+    out: dict = {
+        "loss": loss_total,
+        "loss_ppo": loss_ppo_sum / n_steps,
         "grad_norm": grad_norm_pre,
         "grad_norm_post_clip": grad_norm_post,
         "reward_mean": float(r.mean()),
@@ -1038,10 +1166,17 @@ def grpo_step(
         "reward_min": float(r.min()),
         "reward_max": float(r.max()),
         "adv_abs_mean": float(adv.abs().mean()),
+        **group_aux,
         **{f"lp/{k}": v for k, v in lp_mean.items()},
         **{f"signal/{k}": v for k, v in adv_signal.items()},
         **reward_aux,
     }
+    if use_kl:
+        out["loss_kl"] = loss_kl_sum / n_steps
+        # Unscaled k3: same as (step loss KL term) / β, i.e. mean_batch(sum_c k3_c) averaged over time.
+        out["kl/total"] = (loss_kl_sum / n_steps) / cfg.kl_coef
+        out.update({f"kl/{k}": v for k, v in kl_mean.items()})
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1062,8 +1197,12 @@ def train(
     best_save_path: str | None = None,
     best_ema_beta: float = 0.9,
     best_warmup_steps: int = 3,
-) -> None:
+    ) -> None:
     """GRPO training loop.
+
+    When `cfg.kl_coef > 0`, a **frozen** copy of the policy at `train()` start
+    (post-checkpoint) is used as the reference; see `grpo_step` and
+    `STABILITY_FIXES.md` §2.
 
     Best-checkpoint tracking
     ------------------------
@@ -1078,6 +1217,14 @@ def train(
     module = module.to(device)
     for p in module.parameters():
         p.requires_grad_(True)
+
+    ref_module: torch.nn.Module | None = None
+    if cfg.kl_coef > 0.0:
+        ref_module = copy.deepcopy(module)
+        ref_module.eval()
+        for p in ref_module.parameters():
+            p.requires_grad_(False)
+        ref_module = ref_module.to(device)
 
     optimizer = torch.optim.Adam(
         [p for p in module.parameters() if p.requires_grad], lr=lr,
@@ -1104,7 +1251,9 @@ def train(
             batch = next(it)
 
         batch = _batch_to_device(batch, device)
-        info = grpo_step(module, batch, cfg, optimizer, reward_fn=reward_fn)
+        info = grpo_step(
+            module, batch, cfg, optimizer, reward_fn=reward_fn, ref_module=ref_module,
+        )
 
         r_mean = info["reward_mean"]
         if reward_ema is None:

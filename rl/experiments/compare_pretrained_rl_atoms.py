@@ -25,7 +25,6 @@ mols since ``to_rdkit_mol`` adds one RDKit atom per node and sanitize preserves 
 from __future__ import annotations
 
 import argparse
-import glob
 import math
 import os
 import sys
@@ -53,22 +52,8 @@ def _default_pretrained_ckpt() -> str:
     return os.path.join(_PROJECT_ROOT, ".pretrained_model", "epoch=499-step=48500.ckpt")
 
 
-def _default_rl_ckpt() -> str:
-    d = os.path.join(_PROJECT_ROOT, ".rl_ckpts")
-    if not os.path.isdir(d):
-        return os.path.join(d, "grpo_best.pt")
-    cands = sorted(
-        glob.glob(os.path.join(d, "*.pt")),
-        key=lambda p: os.path.getmtime(p),
-        reverse=True,
-    )
-    if not cands:
-        return os.path.join(d, "grpo_best.pt")
-    # Prefer a *best* checkpoint if present (common GRPO artifact).
-    for p in cands:
-        if "best" in os.path.basename(p).lower():
-            return p
-    return cands[0]
+def _default_rl_ckpt(default_name: str) -> str:
+    return os.path.join(_PROJECT_ROOT, ".rl_ckpts", default_name)
 
 
 def _final_n_atoms(traj: list[Any], vocab) -> int:
@@ -121,11 +106,15 @@ def _gather_predict_outputs(module, datamodule, cfg, ckpt_path: str, n_mols: int
     }
 
 
-def main():
+def main(default_rl_ckpt_name: str = "grpo_best.pt"):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--pretrained_ckpt", default=_default_pretrained_ckpt())
-    ap.add_argument("--rl_ckpt", default=None, help="RL fine-tuned weights (.pt or .ckpt). Default: newest in .rl_ckpts")
-    ap.add_argument("--n_mols", type=int, default=100)
+    ap.add_argument(
+        "--rl_ckpt",
+        default=None,
+        help=f"RL fine-tuned weights (.pt or .ckpt). Default: .rl_ckpts/{default_rl_ckpt_name}",
+    )
+    ap.add_argument("--n_mols", type=int, default=300)
     ap.add_argument("--config_path", default=os.path.join(_PROJECT_ROOT, "configs"))
     ap.add_argument("--config_name", default="default")
     ap.add_argument(
@@ -146,17 +135,21 @@ def main():
     )
     ap.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. data.n_atoms_strategy=fixed")
     args = ap.parse_args()
-    rl_ckpt = args.rl_ckpt or _default_rl_ckpt()
+    rl_ckpt = args.rl_ckpt or _default_rl_ckpt(default_rl_ckpt_name)
+    print("pretrained ckpt:", os.path.abspath(args.pretrained_ckpt))
+    print("RL ckpt:        ", os.path.abspath(rl_ckpt))
 
     os.makedirs(args.out_dir, exist_ok=True)
     cfg = compose_cfg(args.config_path, args.config_name, overrides=list(args.overrides))
 
     # --- Pretrained ---
     module_pt, dm = build_module_and_datamodule(cfg)
+    print("loading pretrained ckpt:", os.path.abspath(args.pretrained_ckpt))
     out_pt = _gather_predict_outputs(module_pt, dm, cfg, args.pretrained_ckpt, args.n_mols)
 
     # --- RL (fresh module so weights are not mixed) ---
     module_rl, dm_rl = build_module_and_datamodule(cfg)
+    print("loading RL ckpt:", os.path.abspath(rl_ckpt))
     out_rl = _gather_predict_outputs(module_rl, dm_rl, cfg, rl_ckpt, args.n_mols)
 
     # --- Histogram: valid molecules only (same bin edges for both) ---
@@ -203,7 +196,7 @@ def main():
         bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
     )
     fig.tight_layout()
-    fig_path = os.path.join(args.out_dir, "atom_hist_pretrained_vs_rl.png")
+    fig_path = os.path.join(args.out_dir, "atom_hist_pretrained_vs_rl_alpha01.png")
     fig.savefig(fig_path, dpi=150)
     plt.close(fig)
     print("saved figure:", fig_path)
@@ -213,7 +206,7 @@ def main():
         if n_at >= args.min_atoms:
             traj_records.append({"final_n_atoms": n_at, "trajectory": traj})
 
-    traj_path = args.trajectories_out or os.path.join(args.out_dir, "rl_valid_trajectories.pt")
+    traj_path = args.trajectories_out or os.path.join(args.out_dir, "rl_valid_trajectories_alpha01.pt")
     torch.save(
         {
             "rl_ckpt": rl_ckpt,
@@ -234,4 +227,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(default_rl_ckpt_name="grpo_natoms_seed0_alpha0.1_best.pt")

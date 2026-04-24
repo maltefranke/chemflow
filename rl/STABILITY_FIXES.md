@@ -168,171 +168,110 @@ there is no restoring force on *direction* without KL.
 
 ### Not yet addressed
 
-Logged here for the next entries:
-
-- **KL penalty to a frozen reference policy** (entry 2, next — design
-  notes below).  Required to prevent the edge-channel drift we just
-  saw.  `grad_norm_post_clip = 1.0` caps update magnitude but not
-  direction.
 - **Multi-epoch inner loop** — with μ=1 the PPO ratio is always 1 at
   the first inner step, so `clip_eps` is never active.  Clipping
   grads is a band-aid until we actually use the PPO clip.
-- **Per-prompt group-relative advantage** — `adv = (r − r.mean())/std`
-  is currently over the whole batch; GRPO proper standardises within
-  groups sharing the same starting latent.
+- (Done elsewhere) **Group-relative advantage** and **KL to ref** are
+  implemented in `rl/grpo.py`; see the corresponding entries in this
+  file.
 
 ---
 
-## 2. [TODO] KL penalty to a frozen reference policy
+## 2. KL penalty to a frozen reference policy (k3 per channel)
 
-Status: **design agreed, not yet implemented.**
-Motivated by: wandb run `b2ejeqok` (see §1 post-run verdict).
+Date: 2026-04-23  
+Implemented in: `rl/grpo.py`, `rl/run_grpo.py`, `rl/run_grpo.sh` / `rl/run_grpo_slurm.sh`.  
+Motivated by: wandb run `b2ejeqok` (see §1 post-run verdict) — **edge
+channel runaway** without a restoring force.
 
-### Problem
+### Problem (unchanged)
 
-Gradient clipping bounds update magnitude, not direction.  The edge
-channel drifts monotonically (`lp/edge: −3.7 → −207` in 16 steps) with
-no restoring force, because advantage is consistently highest on
-trajectories that place exotic edges to grow atom count.  A frozen
-reference policy (= the pretrained model at `train()` start) provides
-that restoring force via a KL-to-ref penalty added to the per-step
-loss:
+Gradient clipping bounds magnitude, not direction.  A frozen reference
+is the standard structural fix: anchor the finetuned policy to the
+pretrained one.
+
+### What we implemented
+
+**Config / CLI:** `GRPOConfig.kl_coef: float` (default `0.0`); CLI
+`--kl_coef` (same as β below).  `0` disables: **no** `deepcopy` of the
+module, **no** extra forward pass, behaviour matches pre-KL code paths.
+
+**Reference:** `ref_module = copy.deepcopy(module)` at `train()` start
+**after** the checkpoint is loaded, then `eval()`, all parameters
+`requires_grad_(False)`, same device.  Frozen for the full run.
+
+**Per-step loss:**
 
 $$
-\mathcal{L}_k = -\min(r_k \hat A,\; \mathrm{clip}(r_k) \hat A) \;+\; \beta \cdot \mathrm{KL}\bigl(\pi_\theta^{\mathrm{step}} \,\|\, \pi_\mathrm{ref}^{\mathrm{step}}\bigr).
+\mathcal{L}_k
+  = \underbrace{-\min(r_k \hat A,\, \mathrm{clip}(r_k)\, \hat A)}_{\text{PPO/GRPO surrogate}}
+  + \beta \cdot \frac{1}{B}\sum_{i=1}^B
+      \sum_{c \in \text{channels}} \mathrm{k3}\!\left(
+        t_{i,c};\;
+        t_{i,c} = \Big[\log \pi_\mathrm{ref}^c(a) - \log \pi_\theta^c(a)\Big]_{\text{clamped}}
+      \right)
 $$
 
-### Design: reverse KL, hybrid analytic + k1
+**Estimator:** **Schulman k3** per channel, *not* a hybrid analytic
+formulation from the pre-implementation design notes.  Rationale
+(documented in full when we revisited the plan): same clamp as
+`log_ratio` avoids `exp` overflow; `B \cdot T` samples per update make
+k3’s variance negligible; per-channel k3 is uniform across
+`pos, node, edge, …` because every channel reuses the same
+`_per_channel_logprob` (including GMM / ins edges); and it matches
+common GRPO / RLHF practice.  **Sum over channels** is a practical
+**factorised** penalty; it is *not* the exact joint
+$\mathrm{KL}(\pi_\theta\,\|\,\pi_\mathrm{ref})$ on the one-step
+product measure — if we need exact joint KL later, we can add a
+**single** k3 on the **total** log-prob only.
 
-- **Direction:** reverse KL $\mathrm{KL}(\pi_\theta \,\|\, \pi_\mathrm{ref})$
-  (mode-seeking; explodes when $\pi_\theta$ puts mass where ref has
-  near-zero — exactly the exotic-bond-type failure mode).  Standard
-  RLHF choice.
+`k3(t) = e^t - t - 1$ with $t = (lp^c_\mathrm{ref} - lp^c_\theta)$ clamped
+to `[-log_ratio_clamp, log_ratio_clamp]`.
 
-- **Estimator: analytic per-channel where closed-form exists, k1
-  (log-ratio) for GMM only.**  Unlike LLM-RLHF (|V|=50k categorical,
-  analytic KL expensive, folklore uses k3 from Schulman's note), our
-  action space is small and structured.  7 of 8 channels have
-  cheap analytic KL:
+**Compute:** one policy forward (with per-channel `lp` in the
+autograd path when `kl_coef>0`) + one `inference_mode` ref forward
+per scoring step.  Rollout unchanged.  Memory: second full model when
+`kl_coef>0`.
 
-  | Channel           | Dist.                                   | Analytic KL?                       |
-  |-------------------|-----------------------------------------|-------------------------------------|
-  | Positions         | $\mathcal{N}(\mu,\sigma^2_t dt \mathbf{I})$, same $\sigma$ both sides | Yes: $\|\mu_\theta-\mu_\mathrm{ref}\|^2/(2\sigma^2 dt)$ |
-  | Node 3-way + sub  | Cat(3) × conditional Cat($\|A\|$)       | Yes: tree-structured categorical    |
-  | Edge sub          | Bernoulli + conditional Cat($\|E\|$)    | Yes                                 |
-  | Charge            | Cat($\|C\|$)                            | Yes                                 |
-  | Insertion gate    | Bernoulli per node                      | Yes                                 |
-  | **GMM**           | Mixture of $K$ components               | **No** (no closed form for GMM KL) |
-  | Ins→existing edge | $(1-\kappa) p_\mathrm{prior} + \kappa\,\pi_\theta$ | Upper bound: $\kappa \cdot \mathrm{KL}(\pi_\theta\,\|\,\pi_\mathrm{ref})$ (prior cancels by convexity) |
-  | Ins→ins edge      | Same mixture form                       | Same bound                          |
+**Logging:** `loss` = PPO + KL; `loss_ppo`, `loss_kl`; `kl/total` =
+unscaled mean k3 (i.e. `loss_kl / β` at fixed β); and `kl/{channel}`
+unscaled.  (β is not baked into the per-channel log keys.)
 
-  For categorical: `(p_theta * (log p_theta - log p_ref)).sum(-1)`
-  per token, then per-graph scatter-sum.  Exact, no sampling noise,
-  no exp-overflow, same per-channel debuggability we already have
-  in `_per_channel_logprob`.
+**Default β in `run_grpo.sh`:** `0.05`.  `run_grpo_slurm.sh` defaults
+`KL_COEF=0` so cluster jobs do not double VRAM until you opt in
+(`KL_COEF=0.05 sbatch ...`).
 
-  For GMM: k1 estimator on the stored `(ins_x, ins_a, ins_c)` samples,
-  i.e. `logp_gmm_theta − logp_gmm_ref`.  Biased under multi-epoch,
-  but GMM is a minor channel (current `lp/gmm ≈ −0.1` vs
-  `lp/edge = −207`), so the bias lives far from where KL needs to be
-  most accurate.
+### Deviations from the earlier (pre-code) “hybrid analytic + k1” spec
 
-- **Why not pure k3** (Schulman's `r − 1 − log r` with $r = \pi_\mathrm{ref}/\pi_\theta$):
-  1. Accuracy where it matters — on the channel that just collapsed
-     (edge), analytic KL is the *exact* quantity in the loss, while
-     k3 is a noisy estimator whose variance grows with policy drift
-     (i.e. worst precisely when KL is largest).
-  2. No exp-overflow.  k3 on edge log-ratios of O(200 nats) requires
-     clamping, same problem we already saw with the PPO ratio.
-  3. Per-token debuggability.  Analytic KL lets us see *which*
-     edges/nodes drift; k3 is scalar per graph.
-  4. Same compute cost — both need one forward pass through the ref.
-
-- **Reference policy:** `copy.deepcopy(module)` at `train()` start,
-  `eval()`, `requires_grad_(False)`.  Keep on GPU (second copy of the
-  backbone — fits on A100-40G at batch 128 with comfortable margin).
-  Frozen for the entire run.
-
-- **Where to evaluate:** compute `preds_ref` at scoring time (one extra
-  forward per `grpo_step`, rollout unchanged).  Cache `logp_ref`
-  per-channel in `StepData` later when we add multi-epoch and the
-  duplicated forward actually starts to matter.
-
-- **Default β:** `0.05`.  Sanity estimate: a single edge drifting
-  from one-hot to uniform-over-5 contributes ~log(5) ≈ 1.6 nats of
-  KL; ~100 triu edges per graph ⇒ full drift ≈ 160 nats per graph
-  per step; at β=0.05 that's −8 nats of loss pressure per step —
-  same order as the `adv × ratio` magnitudes we see in training, so
-  competitive without being dominant.  Expose as CLI flag
-  `--kl_beta`; sweep later.
-
-- **Logging:** add `kl/{pos,node,edge,charge,ins_gate,gmm,ins_e_ext,ins_e_ii}`
-  and `kl/total` to the `info` dict, one entry per channel.
-
-### Cost
-
-- **VRAM:** second module copy.  Baseline run on A100-40G used a
-  fraction of available; two copies still fit.
-- **Time:** ~2× per `grpo_step` (two forwards instead of one during
-  scoring).  Rollout unchanged.  A 50-step test run goes from
-  ~1 min → ~2 min.
-- **Code:** new function `_per_channel_kl(preds_theta, preds_ref, step, cfg, module)`
-  alongside `_per_channel_logprob`.  ~100 lines, mostly mechanical
-  (7 two-liner analytic formulas + one k1 term).
-
-### Implementation checklist
-
-- [ ] `GRPOConfig.kl_beta: float = 0.05`
-- [ ] `train()` creates `ref_module = deepcopy(module).eval().requires_grad_(False)`
-      **after** the checkpoint load, pass into `grpo_step`.
-- [ ] `_forward_preds_ref(ref_module, mol_t, t, cfg)` — same adapter
-      plumbing as `_forward_preds`, `@torch.no_grad()`.
-- [ ] `_per_channel_kl(preds_theta, preds_ref, step, cfg, module)`:
-      returns `(kl_total, kl_breakdown)` with same contract as
-      `_per_channel_logprob`.  Channels per table above.
-- [ ] `grpo_step` assembles loss as
-      `step_loss = ppo_loss + cfg.kl_beta * kl_total.mean()`,
-      divides by `n_steps`, backwards.
-- [ ] CLI `--kl_beta` in `run_grpo.py`.
-- [ ] Log `kl/{channel}` and `kl/total` in the info dict.
-- [ ] `run_grpo.sh` gets `--kl_beta 0.05`.
+- Analytic per-channel + mixture bounds + exact GMM KL would be more
+  precise in principle but is ~3× the code and duplicates every
+  distributional path; the shipped **k3-per-channel** path reuses
+  `_per_channel_logprob` for both models and is easier to keep
+  correct.  We can add analytic `edge` / discrete KL later if
+  `kl/edge` is noisy in wandb.
+- The **position–var at $t\to 1$** issue (huge
+  $\|\Delta\mu\|^2/2\mathrm{var}$ in closed-form Kullback–Leibler) is
+  sidestepped: k3 is evaluated on the **observed** log-prob difference
+  at sampled actions, not on $\Delta\mu/\sigma$.
 
 ### How to tell it's working (predictions for the next run)
 
-On the same recipe (`reward=n_atoms`, `lr=1e-4`, `a_sde=0`, batch 128)
-with `--kl_beta 0.05`, expect:
+On the `n_atoms` recipe with `--kl_coef 0.05`:
 
-1. **`lp/edge` bounded.**  Instead of `−3.7 → −207`, expect drift
-   capped at some steady-state value (guess: `|lp/edge| < 30`).  If
-   `|lp/edge|` still crosses 50, increase β.
-2. **`p_valid ≥ 0.8` throughout training.**  The policy can still
-   reward-hack, but only within the KL ball around `ref` — and
-   `ref` has `p_valid ≈ 1.0`.
-3. **Monotone non-decreasing `reward_ema`** for the first ~20
-   steps.  KL acts as a soft trust region; shouldn't observe the
-   step-6 → step-16 crash.
-4. **`kl/edge` is the dominant channel.**  If some other channel
-   (e.g. positions) dominates, that's a clue the reward is pulling
-   a direction we didn't anticipate.
-5. **`kl/total` grows then plateaus.**  Initial growth = policy
-   learning, plateau = KL penalty balancing reward signal.  If it
-   grows linearly to ∞, β is too small.
+1. **`lp/edge` shouldn’t** reproduce `−3.7 → −207` in &lt;20 steps. If
+   it does, **raise β** (or try `lr/2` first; LR and KL both affect drift).
+2. **`p_valid`** should stay higher than a no-KL run with the same seed.
+3. **`kl/edge` vs `kl/pos`:** the dominant channel in `kl/*` is the
+   one the ref–θ gap is fighting; compare to `signal/*` for the reward.
+4. **`kl/total`:** should rise early then level off, not run away
+  linearly (if it does, β is too small).
 
-### Open questions / things to revisit
+### Open questions (still)
 
-- **Mixture-bound for ins-edge KL:** the convexity bound is tight
-  when $\kappa \to 1$ (data end) but loose at $\kappa \to 0$ (noise
-  end).  Most integration steps live in between.  Check empirically
-  whether ins-edge KL is ever the dominant channel; if yes, replace
-  with an exact mixture-KL derivation (tractable but tedious).
-- **Position KL at $t \to 1$:** `var = σ²_t · dt` goes to `var_floor`
-  (1e-6) at the data end.  Position KL is $\|\Delta\mu\|^2/(2\mathrm{var})$
-  so small drifts blow up.  Same floor applied both sides means the
-  KL is internally consistent but may dominate unnaturally; might
-  need a channel-specific β or a separate clamp.
-- **k1 for GMM** is unbiased only at µ=1.  Once multi-epoch lands
-  (entry 3), either switch to MC from $\pi_\theta$ or accept the
-  bias and log it.
+- If **ins–edge** `kl/ins_e_*` becomes dominant, revisit mixture-KL
+  exacts or a dedicated term.
+- **Multi-epoch** ($\mu>1$): k3 is biased; fix with importance
+  sampling or the analytic per-step KL when that lands.
 
 ---
 

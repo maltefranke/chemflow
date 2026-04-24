@@ -23,6 +23,10 @@ from rdkit import Chem, RDLogger
 # rollouts where intermediate (and some final) molecules are invalid by
 # construction.  The validity flag returned by `mol_is_valid` is the signal
 # we care about; the log lines just obscure `print`-based training metrics.
+try:  # RDKit >= 2020: route C++ logging through Python (then DisableLog works)
+    Chem.WrapLogs()  # type: ignore[attr-defined]
+except AttributeError:
+    pass
 RDLogger.DisableLog("rdApp.*")
 
 

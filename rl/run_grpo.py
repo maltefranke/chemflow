@@ -16,6 +16,7 @@ Any trailing args are Hydra overrides, exactly as in `eval_pretrained_validity.p
 
 import argparse
 import os
+import random
 import sys
 from copy import deepcopy
 
@@ -25,9 +26,25 @@ for _p in [_PROJECT_ROOT, os.path.join(_PROJECT_ROOT, "src")]:
         sys.path.insert(0, _p)
 
 import hydra  # noqa: E402
+import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from hydra import compose, initialize_config_dir  # noqa: E402
 from omegaconf import OmegaConf  # noqa: E402
+
+
+def seed_everything(seed: int) -> None:
+    """Seed python/numpy/torch (CPU+CUDA) for reproducibility.
+
+    We deliberately *do not* set deterministic cuDNN flags: GRPO rollouts
+    already carry big stochastic draws (SDE noise, categorical samples, shuffled
+    dataloader), so exact cross-run reproducibility isn't the goal -- the goal
+    is to make "seed=0" actually mean the same thing every time.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 OmegaConf.register_new_resolver("oc.eval", eval)
 OmegaConf.register_new_resolver("len", lambda x: len(x))
@@ -132,6 +149,16 @@ def main():
     ap.add_argument("--clip_eps", type=float, default=0.2)
     ap.add_argument("--max_grad_norm", type=float, default=1.0,
                     help="Global-norm gradient clip threshold; pass 0 or negative to disable")
+    ap.add_argument("--group_size", type=int, default=1,
+                    help="GRPO group size G: number of rollouts per shared prompt. "
+                         "G=1 recovers batch-relative advantages (the old default). "
+                         "G>1 replicates each prompt G times in-place, so the "
+                         "effective unique-prompt count per update is batch_size // G.")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="Seed for python/numpy/torch RNGs. Does not pin cuDNN.")
+    ap.add_argument("--kl_coef", type=float, default=0.0,
+                    help="β for reverse-KL to frozen ref (k3 per channel). 0 = disabled "
+                         "(no second model copy, no extra forward).")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--log_every", type=int, default=1)
     ap.add_argument(
@@ -141,6 +168,11 @@ def main():
     ap.add_argument("--wandb", action="store_true", help="Log metrics to wandb.")
     ap.add_argument("--wandb_project", default="chemflow-grpo")
     ap.add_argument("--wandb_name", default=None)
+    ap.add_argument(
+        "--wandb_group",
+        default=None,
+        help="Optional W&B run group (sweep / compare runs in the project UI).",
+    )
     ap.add_argument("--save", default=None, help="Optional path to dump final module state_dict")
     ap.add_argument("--save_best", default=None,
                     help="Optional path to save the best (smoothed) reward checkpoint during training")
@@ -151,9 +183,14 @@ def main():
     ap.add_argument("overrides", nargs="*")
     args = ap.parse_args()
 
+    seed_everything(args.seed)
+
     cfg = compose_cfg(args.config_path, args.config_name, overrides=list(args.overrides))
     module, datamodule = build_module_and_datamodule(cfg)
     module = load_ckpt_into_module(module, args.ckpt)
+
+    if args.group_size < 1:
+        raise ValueError(f"--group_size must be >= 1, got {args.group_size}")
 
     grpo_cfg = GRPOConfig(
         sigma_noise=args.sigma_noise,
@@ -161,13 +198,20 @@ def main():
         clip_eps=args.clip_eps,
         num_integration_steps=args.num_steps,
         max_grad_norm=(args.max_grad_norm if args.max_grad_norm and args.max_grad_norm > 0 else None),
+        group_size=args.group_size,
+        kl_coef=args.kl_coef,
     )
 
     dataloader = first_test_dataloader(datamodule)
 
     if args.wandb:
         import wandb
-        wandb.init(project=args.wandb_project, name=args.wandb_name, config=vars(args))
+        w_init = dict(
+            project=args.wandb_project, name=args.wandb_name, config=vars(args)
+        )
+        if args.wandb_group:
+            w_init["group"] = args.wandb_group
+        wandb.init(**w_init)
 
     try:
         train(
