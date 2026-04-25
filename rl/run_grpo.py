@@ -55,7 +55,7 @@ from chemflow.dataset.vocab import setup_token_weights  # noqa: E402
 from chemflow.utils.metrics import init_metrics  # noqa: E402
 from chemflow.utils.utils import init_uniform_prior  # noqa: E402
 
-from rl.grpo import GRPOConfig, train  # noqa: E402
+from rl.grpo import DEFAULT_VAR_FLOOR, GRPOConfig, train  # noqa: E402
 from rl.rewards import REWARDS  # noqa: E402
 
 
@@ -145,6 +145,12 @@ def main():
                     help="Integration steps per rollout; default = module's own setting")
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--a_sde", type=float, default=0.1)
+    ap.add_argument(
+        "--var_floor",
+        type=float,
+        default=DEFAULT_VAR_FLOOR,
+        help="Floor on position Gaussian variance in log-prob (see GRPOConfig.var_floor, DEPARTURES.md).",
+    )
     ap.add_argument("--sigma_noise", type=float, default=0.2)
     ap.add_argument("--clip_eps", type=float, default=0.2)
     ap.add_argument("--max_grad_norm", type=float, default=1.0,
@@ -159,6 +165,13 @@ def main():
     ap.add_argument("--kl_coef", type=float, default=0.0,
                     help="β for reverse-KL to frozen ref (k3 per channel). 0 = disabled "
                          "(no second model copy, no extra forward).")
+    ap.add_argument(
+        "--per_element_logp_mean",
+        action="store_true",
+        help="Use mean within each RL channel before summing channels (positions: per "
+             "Cartesian coord, i.e. denom 3×surviving atoms). May require a larger "
+             "--kl_coef when using ref KL. Default: sum within each channel.",
+    )
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--log_every", type=int, default=1)
     ap.add_argument(
@@ -195,11 +208,13 @@ def main():
     grpo_cfg = GRPOConfig(
         sigma_noise=args.sigma_noise,
         a_sde=args.a_sde,
+        var_floor=args.var_floor,
         clip_eps=args.clip_eps,
         num_integration_steps=args.num_steps,
         max_grad_norm=(args.max_grad_norm if args.max_grad_norm and args.max_grad_norm > 0 else None),
         group_size=args.group_size,
         kl_coef=args.kl_coef,
+        per_element_logp_mean=args.per_element_logp_mean,
     )
 
     dataloader = first_test_dataloader(datamodule)

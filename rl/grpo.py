@@ -70,6 +70,9 @@ import torch
 import torch.nn.functional as F
 from torch.distributions import Categorical, Normal
 
+# Import rewards before any chemflow module that imports RDKit so WrapLogs runs first.
+from rl.rewards import validity_reward  # noqa: F401 (re-exported for callers)
+
 from chemflow.dataset.molecule_data import (
     MoleculeBatch,
     PointCloud,
@@ -79,13 +82,11 @@ from chemflow.dataset.molecule_data import (
 )
 from chemflow.utils.utils import EDGE_ALIGNER
 
-from rl.rewards import validity_reward  # noqa: F401 (re-exported for callers)
-
 
 EPS = 1e-8
 EPS_T = 1e-2
 DEFAULT_CLIP_EPS = 0.2
-DEFAULT_VAR_FLOOR = 1e-6
+DEFAULT_VAR_FLOOR = 1e-3
 DEFAULT_LOG_RATIO_CLAMP = 20.0
 DEFAULT_P_INS_CLAMP = 1.0 - 1e-3
 
@@ -114,6 +115,19 @@ class GRPOConfig:
     # β · (sum of per-channel k3) added to the step loss, k3 = exp(t) - t - 1
     # with t = lp_ref - lp_θ (clamped). 0 disables: no ref model, no extra forward.
     kl_coef: float = 0.0
+    # If True, each channel's log-prob is the mean over its natural units,
+    # then channels are summed into `total` (Flow-GRPO-style resolution scaling).
+    # Details: positions use mean over **3 × surviving atoms** (one factor per
+    # Cartesian coordinate); charge/node/ins_gate/edge/GMM/ins edges use the
+    # counts documented in `_per_channel_logprob`.  Default False keeps sums
+    # (exact factorised joint within each channel).
+    #
+    # KL: `_k3_kl_per_channel` uses the same per-channel breakdown.  With
+    # per-element means, typical |lp_ref − lp_θ| per channel shrinks by about
+    # the number of averaged units (e.g. position ~3 N_surv atoms).  Increase
+    # `kl_coef` when you rely on the ref anchor (often an order of magnitude
+    # or more — tune on validation).
+    per_element_logp_mean: bool = False
     # CFG inputs to feed guided_predict.  Built at rollout time from a batch's
     # (mol_t, mol_1) pair and stashed here so every step + log-prob call shares
     # the exact same conditioning.
@@ -190,6 +204,11 @@ def _scatter_sum(src: torch.Tensor, index: torch.Tensor, dim_size: int) -> torch
     out = src.new_zeros(dim_size)
     out.index_add_(0, index, src)
     return out
+
+
+def _to_per_element_mean(per_graph_sum: torch.Tensor, denom: torch.Tensor) -> torch.Tensor:
+    """`per_graph_sum / max(denom,1)` — safe when denom==0 (numerator is zero there)."""
+    return per_graph_sum / denom.clamp(min=1.0)
 
 
 def _gather_logp(probs: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
@@ -592,6 +611,42 @@ def _per_channel_logprob(
             )
             edge_batch_id_ii = batch_id[step.ins_ii_spawn_src_orig]
             lp_ins_edge_ii = _scatter_sum(lp_per_ii, edge_batch_id_ii, num_graphs)
+
+    if cfg.per_element_logp_mean:
+        dtype = lp_pos.dtype
+        n_nodes = torch.bincount(batch_id, minlength=num_graphs).to(device=device, dtype=dtype)
+        n_surv = _scatter_sum(survive_mask.float(), batch_id, num_graphs).to(dtype=dtype)
+        # `gaussian_logprob_positions` is a sum of one 3D isotropic factor per atom
+        # (−0.5‖x−μ‖²/var − 1.5 log(2πvar)); match Flow-GRPO's per-pixel mean by
+        # normalising with **3 coordinates per surviving atom**.
+        lp_pos = _to_per_element_mean(lp_pos, n_surv * 3.0)
+        lp_node = _to_per_element_mean(lp_node, n_nodes)
+        lp_charge = _to_per_element_mean(lp_charge, n_surv)
+        lp_ins_gate = _to_per_element_mean(lp_ins_gate, n_nodes)
+        assert edge_survive_mask.shape == edge_batch_id.shape, (
+            "edge_survive_mask and edge_batch_id must both be (E_triu,)"
+        )
+        edge_denom = _scatter_sum(edge_survive_mask.float(), edge_batch_id, num_graphs).to(dtype=dtype)
+        lp_edge = _to_per_element_mean(lp_edge, edge_denom)
+        if step.do_ins.any():
+            ins_batch_id = batch_id[step.do_ins]
+            n_ins = torch.bincount(ins_batch_id, minlength=num_graphs).to(device=device, dtype=dtype)
+            lp_gmm = _to_per_element_mean(lp_gmm, n_ins)
+        den_ins_ext = torch.zeros(num_graphs, device=device, dtype=dtype)
+        if step.do_ins.any() and step.ins_edge_spawn_orig_full.numel() > 0:
+            den_ins_ext = _scatter_sum(
+                step.ins_edge_valid_mask.float(),
+                batch_id[step.ins_edge_spawn_orig_full],
+                num_graphs,
+            ).to(dtype=dtype)
+        lp_ins_edge_ext = _to_per_element_mean(lp_ins_edge_ext, den_ins_ext)
+        den_ii = torch.zeros(num_graphs, device=device, dtype=dtype)
+        if step.hat_e_ins_ii.numel() > 0:
+            den_ii = torch.bincount(
+                batch_id[step.ins_ii_spawn_src_orig],
+                minlength=num_graphs,
+            ).to(dtype=dtype)
+        lp_ins_edge_ii = _to_per_element_mean(lp_ins_edge_ii, den_ii)
 
     total = lp_pos + lp_node + lp_edge + lp_charge + lp_ins_gate + lp_gmm + lp_ins_edge_ext + lp_ins_edge_ii
     per_ch = {

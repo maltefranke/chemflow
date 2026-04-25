@@ -275,6 +275,105 @@ On the `n_atoms` recipe with `--kl_coef 0.05`:
 
 ---
 
+## 3. Per-element mean log-prob inside each channel (`per_element_logp_mean`)
+
+Date: 2026-04-24  
+Implemented in: `rl/grpo.py`, `rl/run_grpo.py`.
+
+### Motivation
+
+**Scale across channels.**  Several GRPO ingredients — PPO ratio
+`exp(Δ log π)`, Schulman k3 on `log π_ref − log π_θ`, and
+`log_ratio_clamp` — care about the *magnitude* of log-probability
+differences.  In our factorisation, some channels are written as a
+**sum** over many terms (notably **positions**: one 3D Gaussian
+log-density per *surviving* atom, i.e. three scalar log-densities per
+atom before summing over atoms).  Those sums can be **orders of
+magnitude larger** in absolute value than channels with fewer terms
+(e.g. a handful of discrete choices), even when the *per-unit*
+distributional shift is similar.  That skews which channel “wins” the
+ratio and the KL, and makes tuning `kl_coef` and learning rate more
+opaque.
+
+**Analogy to Flow-GRPO.**  In image / latent Flow-GRPO setups, it is
+common to **average** over spatial or latent dimensions so that the
+objective does not explode with resolution.  Here we do the analogous
+thing **inside each channel**: keep the channel’s internal sum, then
+divide by a **denominator that matches the number of natural scalar
+units** in that channel; **total log-prob** is still the **sum** of
+those per-channel values (we are not averaging *across* unrelated
+channels into one big mean).
+
+**Positions and the factor of 3.**  The position contribution is a
+sum over **3 coordinates × surviving atoms**.  Using only `n_surv`
+as the denominator would yield a **per-atom** mean (still averaging
+over the three coordinates inside each atom’s contribution).  To match
+the “per pixel / per coordinate” picture literally — one divisor per
+scalar Gaussian — the denominator should be **`n_surv × 3`**.  For
+typical small molecules (`n_surv ≈ 18`) that is only a **factor of
+three** vs `n_surv` alone; both tame the worst scaling, but **`n_surv
+× 3`** is the cleaner analogy.
+
+**GMM / insertions.**  The insertion mixture log-prob mixes 3D
+spatial terms with discrete type mass; one could refine denominators
+for sub-parts.  Insertions are **rare** enough that this nuance is
+usually negligible compared to the main graph channels.
+
+### What we implemented
+
+- **`GRPOConfig.per_element_logp_mean: bool = False`** (default off
+  preserves previous behaviour: **sums** within each channel).
+- **`_to_per_element_mean(num, denom)`** — `num / max(denom, 1)` so
+  empty graphs do not divide by zero.
+- When `True`, **`_per_channel_logprob`** normalises each channel’s
+  per-graph sum by the appropriate count:
+  - **positions:** `n_surv * 3`
+  - **node / ins_gate:** `n_nodes`; **charge:** `n_surv`
+  - **edges:** scatter-sum of `edge_survive_mask` per graph (same
+    surviving-edge count used for the edge log-prob sum)
+  - **GMM:** `n_ins`; **ins edges:** unchanged logic with per-graph
+    insertion edge counts
+- **Defensive assert:** `edge_survive_mask.shape == edge_batch_id.shape`
+  so a shape mismatch between mask and batch indices cannot fail
+  silently in the edge denominator.
+- **Docstring note on KL:** **`_k3_kl_per_channel`** calls the same
+  `_per_channel_logprob` for ref and θ.  With per-element means,
+  typical `|lp_ref − lp_θ|` **shrinks** roughly like the number of
+  averaged units in that channel (e.g. position ~`3 N_surv`).  The
+  **effective KL anchor is weaker** for the same numeric `kl_coef`; in
+  practice you often need to **increase `kl_coef`** (sometimes by an
+  order of magnitude — e.g. from `0.05` toward **`0.5–1.0`**) and tune
+  on validation.  We did **not** auto-scale `kl_coef` by molecule
+  size; a comment in config is enough for now.
+
+### Knobs
+
+| Flag / field               | Default | Meaning |
+|----------------------------|---------|---------|
+| `--per_element_logp_mean`  | off     | Per-channel mean over natural units, then sum channels. |
+| `per_element_logp_mean`    | `False` | Same, on `GRPOConfig`. |
+
+### How to tell it's working
+
+1. **`lp/pos`** (and other `lp/*` with many terms) should sit in a
+   **similar numeric ballpark** to sparse channels — not hundreds of
+   times larger in absolute value than `lp/edge` on comparable steps.
+2. **`kl/*`:** if the run looks **under-regularised** (edge or node
+   drift returns) with the **same** `kl_coef` as a sum-based run,
+   **raise `kl_coef`** until `kl/total` and validity look healthy.
+3. **Stress test:** the collapsing recipe discussed elsewhere
+   (`a_sde=0.1`, low `kl_coef`, `lr=1e-4`) is a good check that
+   per-element means plus a **bumped** `kl_coef` restore stability.
+
+### Not yet addressed
+
+- Optional **automatic** `kl_coef × f(N_atoms)` scaling if we want
+  fewer manual retunes across molecule sizes.
+- Logging **pre-clamp** `|lp_new − lp_old|` hit rate against
+  `log_ratio_clamp` for faster diagnosis of ratio saturation.
+
+---
+
 <!-- Next entry template:
 
 ## N. ...

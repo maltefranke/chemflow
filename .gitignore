@@ -168,3 +168,4 @@ wandb/
 .rl_ckpts/
 *.pt
 slurm_logs/
+diagnostics/

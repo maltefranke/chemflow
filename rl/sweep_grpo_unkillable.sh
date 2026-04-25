@@ -7,8 +7,9 @@
 #   Run that on a login/head node. It *submits* N separate jobs; each is rl/run_grpo_slurm.sh
 #   (unkillable + GPU per run_grpo_slurm.sh).
 #
-# Launch a full grid of GRPO jobs: one Slurm job per (a_sde × kl_coef × lr) with GROUP_SIZE=1.
-# Assumes each run is ~40 min; run_grpo_slurm.sh time limit (4h) is plenty.
+# Sparse 10-config sweep (not a full cross-product): ODE baselines, var_floor, lr, a_sde, kl.
+# Each run uses 100 policy updates and 100 integration steps (see run_grpo_slurm.sh, N_UPDATES).
+# Expect ~80 min per run; default SWEEP_TIME 2:00:00 is plenty.
 #
 # W&B: each invocation gets its own *project* (a separate "folder" in the UI) so
 # runs do not mix with ad-hoc chemflow-grpo jobs.  Pass a project name as the
@@ -19,6 +20,11 @@
 #   ./rl/sweep_grpo_unkillable.sh
 #   ./rl/sweep_grpo_unkillable.sh chemflow-grpo-ablate-2026-04-24
 #   SWEEP_STAMP=manual001 ./rl/sweep_grpo_unkillable.sh
+#
+# One-off job (e.g. `--per_element_logp_mean`) in the *same* W&B project as an
+# existing sweep stamp — see `rl/submit_grpo_elementmean_slurm.sh` or set
+# `GRPO_WANDB_PROJECT` / `GRPO_WANDB_GROUP` and `PER_ELEMENT_LOGP_MEAN=1`
+# before `sbatch rl/run_grpo_slurm.sh`.
 #
 # Dry run (print sbatch lines only, do not submit):
 #   DRY_RUN=1 ./rl/sweep_grpo_unkillable.sh
@@ -43,22 +49,25 @@ GRPO_WANDB_PROJECT="${1:-${GRPO_WANDB_PROJECT:-chemflow-grpo-sweep-${STAMP}}}"
 GRPO_WANDB_GROUP="${GRPO_WANDB_GROUP:-$STAMP}"
 export GRPO_WANDB_PROJECT GRPO_WANDB_GROUP
 
-# Grid — edit to ablate (3 × 3 × 2 = 18 jobs with defaults below).
-A_SDE_LIST=(0 0.05 0.1)
-KL_COEF_LIST=(0.01 0.05 0.1)
-LR_LIST=(3e-5 1e-4)
+# Columns: A_SDE  KL_COEF  LR  VAR_FLOOR
+# — no full cross-product: a_sde=0 rows omit redundant var_floor pairs; no kl=0.01; lr uses 1e-4/3e-4 not 3e-5.
+CONFIGS=(
+  "0     0.05 1e-4 1e-3"   # ODE baseline (replication)
+  "0     0.05 3e-4 1e-3"   # ODE, faster lr
+  "0.05  0.05 1e-4 1e-3"   # low noise + default floor
+  "0.05  0.05 1e-4 1e-2"   # low noise + aggressive floor
+  "0.05  0.05 3e-4 1e-3"   # low noise + fast lr
+  "0.1   0.05 1e-4 1e-3"   # best-like (confirm at 100 updates)
+  "0.1   0.05 1e-4 1e-2"   # aggressive floor
+  "0.1   0.05 3e-4 1e-3"   # fast lr
+  "0.1   0.05 3e-4 1e-2"   # fast + aggressive floor
+  "0.1   0.1  3e-4 1e-3"   # higher KL at fast lr
+)
+
 SEED="${SEED:-0}"
 GROUP_SIZE="${GROUP_SIZE:-1}"
 SWEEP_TIME="${SWEEP_TIME:-2:00:00}"
-
-n_jobs=0
-for A_SDE in "${A_SDE_LIST[@]}"; do
-  for KL_COEF in "${KL_COEF_LIST[@]}"; do
-    for LR in "${LR_LIST[@]}"; do
-      n_jobs=$((n_jobs + 1))
-    done
-  done
-done
+n_jobs="${#CONFIGS[@]}"
 
 echo "Submitting ${n_jobs} jobs to partition unkillable (from ${SLURM_SCRIPT})"
 echo "  W&B project: ${GRPO_WANDB_PROJECT}"
@@ -67,23 +76,20 @@ echo
 
 submit_one() {
   # Unique Slurm name (no dots: partition/job tools tolerate alnum+_-)
-  local j="a${A_SDE}_k${KL_COEF}_lr${LR}"
+  local j="a${A_SDE}_k${KL_COEF}_lr${LR}_vf${VAR_FLOOR}"
   j="${j//./p}"
   if [[ -n "${DRY_RUN:-}" ]]; then
     echo "DRY: sbatch -t ${SWEEP_TIME} -J grpo-${j} --export=ALL ${SLURM_SCRIPT}"
     return 0
   fi
-  export A_SDE KL_COEF LR SEED GROUP_SIZE
+  export A_SDE KL_COEF LR VAR_FLOOR SEED GROUP_SIZE
   # Pass full env to the job; keep GRPO_WANDB_* from this script.
   sbatch -t "${SWEEP_TIME}" -J "grpo-${j}" --export=ALL "${SLURM_SCRIPT}"
 }
 
-for A_SDE in "${A_SDE_LIST[@]}"; do
-  for KL_COEF in "${KL_COEF_LIST[@]}"; do
-    for LR in "${LR_LIST[@]}"; do
-      submit_one
-    done
-  done
+for cfg in "${CONFIGS[@]}"; do
+  read -r A_SDE KL_COEF LR VAR_FLOOR <<< "$cfg"
+  submit_one
 done
 
 if [[ -n "${DRY_RUN:-}" ]]; then
