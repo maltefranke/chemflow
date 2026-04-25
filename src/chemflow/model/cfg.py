@@ -102,10 +102,45 @@ class CFGAdapter:
             return y
         return None
 
-    def extract_target_n_atoms(self, mols) -> torch.Tensor | None:
+    def extract_target_n_atoms(
+        self,
+        mols,
+        ins_targets=None,
+    ) -> torch.Tensor | None:
+        """Per-graph target atom count for ``n_atoms`` conditioning.
+
+        During training ``mols`` is ``target_state`` — the OT-aligned target
+        after filtering to nodes that exist at time ``t`` (i.e. ``sub``,
+        ``keep_del`` and ``keep_ins``).  ``keep_del`` nodes are padded
+        (``is_auxiliary=True``) because they were matched to dummies on the
+        target side and will be deleted before reaching ``mol_1``.  The real
+        final atom count is therefore
+
+            ``(~target_state.is_auxiliary).sum()``      (sub + keep_ins)
+            ``+ future_ins_nodes.num_nodes``            (remaining insertions)
+
+        which differs from ``mol_t``'s current node count and is what the
+        model actually needs to condition on.  When ``ins_targets`` is not
+        provided (e.g. inference, where ``mols`` already holds the final
+        target) we fall back to the straight bincount.
+        """
         if not self._has_natoms_cfg:
             return None
-        return torch.bincount(mols.batch)
+        device = mols.batch.device
+        num_graphs = mols.num_graphs
+        if ins_targets is not None and hasattr(mols, "is_auxiliary"):
+            is_real = (~mols.is_auxiliary).view(-1).to(torch.long)
+            real_per_graph = torch.zeros(num_graphs, dtype=torch.long, device=device)
+            real_per_graph.scatter_add_(0, mols.batch, is_real)
+            ins_batch = getattr(ins_targets, "batch", None)
+            if ins_batch is not None and ins_batch.numel() > 0:
+                ins_per_graph = torch.bincount(ins_batch, minlength=num_graphs)
+            else:
+                ins_per_graph = torch.zeros(
+                    num_graphs, dtype=torch.long, device=device
+                )
+            return real_per_graph + ins_per_graph
+        return torch.bincount(mols.batch, minlength=num_graphs)
 
     def extract_target_mw(
         self, mols, batch: torch.Tensor | None = None
@@ -177,7 +212,12 @@ class CFGAdapter:
         return guided
 
     def get_training_inputs(
-        self, mols_t, mols_1, device: torch.device, training: bool
+        self,
+        mols_t,
+        mols_1,
+        device: torch.device,
+        training: bool,
+        ins_targets=None,
     ) -> dict:
         """Build the ``cfg_inputs`` dict for a training forward pass."""
         bs = mols_t.num_graphs
@@ -189,7 +229,7 @@ class CFGAdapter:
                 device,
                 training,
             ),
-            "target_n_atoms": self.extract_target_n_atoms(mols_1),
+            "target_n_atoms": self.extract_target_n_atoms(mols_1, ins_targets),
             "natoms_drop_mask": self._sample_drop_mask(
                 self.natoms_cfg_dropout_prob,
                 bs,
@@ -229,6 +269,53 @@ class CFGAdapter:
         All model calls return raw logits (no activations).  CFG is applied on
         the raw outputs, then activations are applied once at the end.
         """
+        target_n_atoms = cfg_inputs.get("target_n_atoms")
+        target_mw = cfg_inputs.get("target_mw")
+        properties = cfg_inputs.get("properties")
+
+        use_natoms = self.should_use_natoms_cfg(target_n_atoms)
+        use_mw = self.should_use_mw_cfg(target_mw)
+        use_prop = self.should_use_property_cfg(properties)
+
+        # At guidance_scale == 1 the linear interpolation
+        #     guided = uncond + 1 * (cond - uncond) = cond
+        # collapses to the conditional pass for every linear-key head, so
+        # running the uncond forward is pure overhead.  When every active
+        # signal has a unit scale we can replicate the general path's final
+        # output with a single model call and skip the uncond pass entirely.
+        # Semantics below mirror the sequential loop: the *last* active
+        # signal's conditional inputs determine the forward (property cond
+        # uses the full cfg_inputs, mw / natoms cond use the isolated
+        # signal only).
+        scales_all_unit = (
+            (not use_natoms or self.natoms_cfg_guidance_scale == 1.0)
+            and (not use_mw or self.mw_cfg_guidance_scale == 1.0)
+            and (not use_prop or self.cfg_guidance_scale == 1.0)
+        )
+        if scales_all_unit:
+            if use_prop:
+                active_cfg_inputs = cfg_inputs
+            elif use_mw:
+                active_cfg_inputs = {
+                    **self._uncond_cfg_inputs(),
+                    "target_mw": target_mw,
+                }
+            elif use_natoms:
+                active_cfg_inputs = {
+                    **self._uncond_cfg_inputs(),
+                    "target_n_atoms": target_n_atoms,
+                }
+            else:
+                active_cfg_inputs = self._uncond_cfg_inputs()
+            preds = model(
+                mol_t,
+                t.view(-1, 1),
+                prev_outs=prev_preds,
+                cfg_inputs=active_cfg_inputs,
+            )
+            model.apply_activations(preds)
+            return preds
+
         uncond = self._uncond_cfg_inputs()
 
         preds = model(
@@ -238,11 +325,7 @@ class CFGAdapter:
             cfg_inputs=uncond,
         )
 
-        target_n_atoms = cfg_inputs.get("target_n_atoms")
-        target_mw = cfg_inputs.get("target_mw")
-        properties = cfg_inputs.get("properties")
-
-        if self.should_use_natoms_cfg(target_n_atoms):
+        if use_natoms:
             cond = {**uncond, "target_n_atoms": target_n_atoms}
             preds_cond = model(
                 mol_t,
@@ -256,7 +339,7 @@ class CFGAdapter:
                 self.natoms_cfg_guidance_scale,
             )
 
-        if self.should_use_mw_cfg(target_mw):
+        if use_mw:
             cond = {**uncond, "target_mw": target_mw}
             preds_cond = model(
                 mol_t,
@@ -270,7 +353,7 @@ class CFGAdapter:
                 self.mw_cfg_guidance_scale,
             )
 
-        if self.should_use_property_cfg(properties):
+        if use_prop:
             preds_cond = model(
                 mol_t,
                 t.view(-1, 1),
@@ -377,8 +460,7 @@ class UnifiedCFGEmbedding(nn.Module):
         property_hidden_dim: int = 128,
         # N-atoms conditioning
         use_natoms: bool = False,
-        natoms_sinusoidal_dim: int = 64,
-        natoms_max_period: float = 100.0,
+        natoms_encoder: nn.Module | None = None,
         # MW conditioning
         use_mw: bool = False,
         mw_sinusoidal_dim: int = 64,
@@ -404,13 +486,21 @@ class UnifiedCFGEmbedding(nn.Module):
         self.natoms_encoder = None
         self._natoms_null = None
         if use_natoms:
-            self.natoms_encoder = CountEmbedding(
-                embedding_dim=natoms_sinusoidal_dim,
-                out_dim=natoms_sinusoidal_dim,
-                max_period=natoms_max_period,
-            )
-            self._natoms_null = nn.Parameter(torch.randn(natoms_sinusoidal_dim) * 0.02)
-            internal_dim += natoms_sinusoidal_dim
+            if natoms_encoder is None:
+                raise ValueError(
+                    "use_natoms=True requires a `natoms_encoder` module "
+                    "(provide it as a Hydra _target_ sub-block)."
+                )
+            if not hasattr(natoms_encoder, "out_dim"):
+                raise AttributeError(
+                    f"natoms_encoder {type(natoms_encoder).__name__} must "
+                    "expose an `out_dim` attribute so the null embedding "
+                    "can be sized."
+                )
+            self.natoms_encoder = natoms_encoder
+            natoms_dim = int(natoms_encoder.out_dim)
+            self._natoms_null = nn.Parameter(torch.randn(natoms_dim) * 0.02)
+            internal_dim += natoms_dim
 
         self.mw_encoder = None
         self._mw_null = None

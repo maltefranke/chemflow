@@ -12,7 +12,12 @@ from tqdm import tqdm
 
 from chemflow.dataset.molecule_data import MoleculeData
 from chemflow.dataset.vocab import Distributions, Vocab
-from chemflow.utils.rdkit import BOND_IDX_MAP, mol_is_valid, sanitize_mol_correctly, smiles_from_mol
+from chemflow.utils.rdkit_utils import (
+    BOND_IDX_MAP,
+    mol_is_valid,
+    sanitize_mol_correctly,
+    smiles_from_mol,
+)
 from chemflow.utils.utils import (
     edge_types_to_symmetric,
     token_to_index,
@@ -24,7 +29,7 @@ PICKLE_PROTOCOL = 4
 # 128 GiB virtual address reservation for the LMDB file. This is NOT disk
 # usage — the file grows sparsely with actual data. Large enough to hold the
 # full processed GEOM train split with headroom.
-LMDB_MAP_SIZE = 128 * (1024 ** 3)
+LMDB_MAP_SIZE = 128 * (1024**3)
 
 # Reserved metadata key for entry count. Integer data keys are 8-byte
 # big-endian, so this textual key cannot collide with them.
@@ -322,9 +327,7 @@ class GEOM(Dataset):
         del raw_data
 
         print(f"Total conformers to process: {len(all_conformers)}")
-        n_written, n_failed = process_conformers_to_lmdb(
-            all_conformers, self.lmdb_path
-        )
+        n_written, n_failed = process_conformers_to_lmdb(all_conformers, self.lmdb_path)
         print(f"Successfully processed: {n_written} molecules")
         print(f"Failed: {n_failed} molecules")
         del all_conformers
@@ -333,9 +336,7 @@ class GEOM(Dataset):
 
     def _write_smiles_sidecar(self) -> None:
         """Build the unique-SMILES sidecar by reading the LMDB env once."""
-        smiles_path = os.path.join(
-            self.processed_dir, f"{self.split}_smiles.txt"
-        )
+        smiles_path = os.path.join(self.processed_dir, f"{self.split}_smiles.txt")
         unique: set[str] = set()
         env = open_read_env(self.lmdb_path)
         try:
@@ -350,9 +351,7 @@ class GEOM(Dataset):
             f.write("\n".join(sorted(unique)))
 
     def get_all_smiles(self) -> list[str]:
-        smiles_path = os.path.join(
-            self.processed_dir, f"{self.split}_smiles.txt"
-        )
+        smiles_path = os.path.join(self.processed_dir, f"{self.split}_smiles.txt")
         with open(smiles_path) as f:
             return f.read().splitlines()
 

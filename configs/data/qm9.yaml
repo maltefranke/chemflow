@@ -8,6 +8,9 @@ optimal_transport: "equivariant"
 ins_noise_scale: 0.25
 move_noise_scale: 0.2
 
+# QM9 contains only neutral molecules; charged species are treated as invalid.
+allow_charged: false
+
 
 # Preprocessing configuration - computes tokens from data and distributions from training dataset only
 preprocessing:
@@ -73,13 +76,13 @@ datamodule:
   interpolator: ${data.interpolator}
 
   num_workers:
-    train: 10
-    val: 10
-    test: 10
-    predict: 10
+    train: 4
+    val: 0
+    test: 0
+    predict: 0
 
   batch_size:
-    train: 304
+    train: 256
     val: 128
     test: 32
 

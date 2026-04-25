@@ -76,6 +76,10 @@ def setup(cfg: DictConfig):
         type_loss_token_weights=tw.type_loss_token_weights,
     )
 
+    # Whether charged molecules are considered valid for this dataset.
+    # Defaults to False (e.g. QM9) if the data config does not set it.
+    allow_charged = bool(cfg.data.get("allow_charged", False))
+
     # Build metrics (including novelty against the training set)
     train_smiles = datamodule.train_dataset.base_dataset.get_all_smiles()
     metrics, stability_metrics, distribution_metrics = init_metrics(
@@ -87,6 +91,7 @@ def setup(cfg: DictConfig):
         atom_tokens=list(vocab.atom_tokens),
         edge_tokens=list(vocab.edge_tokens),
         charge_tokens=list(vocab.charge_tokens),
+        allow_charged=allow_charged,
     )
 
     # Instantiate module
@@ -102,6 +107,7 @@ def setup(cfg: DictConfig):
         metrics=metrics,
         stability_metrics=stability_metrics,
         distribution_metrics=distribution_metrics,
+        allow_charged=allow_charged,
     )
 
     # module.compile()

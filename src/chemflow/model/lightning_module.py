@@ -31,7 +31,7 @@ from chemflow.model.learnable_loss import UnifiedWeightedLoss
 from chemflow.utils.loss_weighing import (
     InverseSquaredTimeLossWeighting,
 )
-from chemflow.utils import rdkit as chemflowRD
+from chemflow.utils import rdkit_utils as chemflowRD
 from chemflow.utils.lr_schedulers import EMADecayScheduler
 
 
@@ -95,6 +95,7 @@ class LightningModuleRates(pl.LightningModule):
         ema_decay_scheduler: EMADecayScheduler | DictConfig | None = None,
         use_ema_for_eval: bool = True,
         use_time_weights: bool = False,
+        allow_charged: bool = False,
     ):
         super().__init__()
 
@@ -106,6 +107,10 @@ class LightningModuleRates(pl.LightningModule):
         self.loss_weight_distributions = loss_weight_distributions
 
         self.ins_noise_scale = ins_noise_scale
+
+        # Whether charged species are considered chemically valid for the dataset
+        # (e.g. QM9 contains only neutral molecules; GEOM contains charged ones).
+        self.allow_charged = allow_charged
 
         # setup ema scheduler
         self.ema_decay = float(ema_decay)
@@ -246,7 +251,11 @@ class LightningModuleRates(pl.LightningModule):
         is_random_self_conditioning = (torch.rand(1) > 0.5).item()
 
         cfg_inputs = self.cfg_adapter.get_training_inputs(
-            mols_t, mols_1, self.device, self.training
+            mols_t,
+            mols_1,
+            self.device,
+            self.training,
+            ins_targets=ins_targets,
         )
 
         preds = self.model(
@@ -682,9 +691,7 @@ class LightningModuleRates(pl.LightningModule):
                 if self.trainer.is_global_zero and hasattr(self.logger, "log_image"):
                     figures = build_marginal_plots(self.distribution_metrics)
                     for name, fig in figures.items():
-                        self.logger.log_image(
-                            key=f"val/marginals/{name}", images=[fig]
-                        )
+                        self.logger.log_image(key=f"val/marginals/{name}", images=[fig])
                     if figures:
                         import matplotlib.pyplot as plt
 
@@ -721,7 +728,9 @@ class LightningModuleRates(pl.LightningModule):
                 mol_is_valid.append(False)
                 continue
             try:
-                mol_is_valid.append(chemflowRD.mol_is_valid(mol))
+                mol_is_valid.append(
+                    chemflowRD.mol_is_valid(mol, allow_charged=self.allow_charged)
+                )
             except Exception as e:
                 print(f"Error checking validity of molecule: {e}")
                 mol_is_valid.append(False)

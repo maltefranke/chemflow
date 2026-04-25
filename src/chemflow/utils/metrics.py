@@ -10,7 +10,7 @@ from rdkit import Chem, RDLogger
 from torchmetrics import Metric
 from torchmetrics import MetricCollection
 
-from chemflow.utils import rdkit as chemflowRD
+from chemflow.utils import rdkit_utils as chemflowRD
 from chemflow.utils.utils import token_to_index
 
 from posebusters import PoseBusters
@@ -19,7 +19,7 @@ import faulthandler
 
 faulthandler.enable()
 
-# Silence RDKit warnings here too (in addition to chemflow.utils.rdkit) because
+# Silence RDKit warnings here too (in addition to chemflow.utils.rdkit_utils) because
 # this module may be imported first from some code paths.
 RDLogger.DisableLog("rdApp.*")
 
@@ -45,7 +45,11 @@ _RD_POOL_MAX_WORKERS = int(os.environ.get("CHEMFLOW_RD_POOL_WORKERS", "4"))
 def _get_rdkit_pool() -> ProcessPoolExecutor:
     global _RD_POOL
     if _RD_POOL is None:
-        affinity = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
+        affinity = (
+            len(os.sched_getaffinity(0))
+            if hasattr(os, "sched_getaffinity")
+            else os.cpu_count() or 1
+        )
         # Leave at least half the cores for DataLoader workers + rendezvous.
         n = max(1, min(_RD_POOL_MAX_WORKERS, affinity // 2))
         _RD_POOL = ProcessPoolExecutor(
@@ -505,13 +509,18 @@ class ChargeTypeDistributionMetric(GenerativeMetric):
 
 
 class Validity(GenerativeMetric):
-    def __init__(self, **kwargs):
+    def __init__(self, allow_charged: bool = False, **kwargs):
         super().__init__(**kwargs)
+        self.allow_charged = allow_charged
         self.add_state("valid", default=torch.tensor(0), dist_reduce_fx="sum")
         self.add_state("total", default=torch.tensor(0), dist_reduce_fx="sum")
 
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
-        is_valid = [chemflowRD.mol_is_valid(mol) for mol in mols if mol is not None]
+        is_valid = [
+            chemflowRD.mol_is_valid(mol, allow_charged=self.allow_charged)
+            for mol in mols
+            if mol is not None
+        ]
         self.valid += sum(is_valid)
         self.total += len(mols)
 
@@ -599,7 +608,9 @@ class EnergyValidity(GenerativeMetric):
 
         non_none = [m for m in mols if m is not None]
         if self.optimise:
-            non_none = [m for m in _pool_map(_rd_optimise_mol, non_none) if m is not None]
+            non_none = [
+                m for m in _pool_map(_rd_optimise_mol, non_none) if m is not None
+            ]
 
         energies = _pool_map(_rd_calc_energy, non_none)
         valid_energies = [e for e in energies if _is_valid_float(e)]
@@ -635,7 +646,9 @@ class AverageEnergy(GenerativeMetric):
     def update(self, mols: list[Chem.rdchem.Mol]) -> None:
         non_none = [m for m in mols if m is not None]
         if self.optimise:
-            non_none = [m for m in _pool_map(_rd_optimise_mol, non_none) if m is not None]
+            non_none = [
+                m for m in _pool_map(_rd_optimise_mol, non_none) if m is not None
+            ]
 
         energy_fn = _rd_calc_energy_per_atom if self.per_atom else _rd_calc_energy
         energies = _pool_map(energy_fn, non_none)
@@ -762,10 +775,11 @@ def init_metrics(
     atom_tokens: list[str] | None = None,
     edge_tokens: list[str] | None = None,
     charge_tokens: list[str] | None = None,
+    allow_charged: bool = False,
 ):
 
     metrics = {
-        "validity": Validity(),
+        "validity": Validity(allow_charged=allow_charged),
         "uniqueness": Uniqueness(),
         **({"novelty": Novelty(train_smiles)} if train_smiles is not None else {}),
         "energy-validity": EnergyValidity(),
@@ -809,9 +823,7 @@ def init_metrics(
 
     metrics = MetricCollection(metrics, compute_groups=False)
     stability_metrics = MetricCollection(stability_metrics, compute_groups=False)
-    distribution_metrics = MetricCollection(
-        distribution_metrics, compute_groups=False
-    )
+    distribution_metrics = MetricCollection(distribution_metrics, compute_groups=False)
 
     return metrics, stability_metrics, distribution_metrics
 
@@ -904,7 +916,10 @@ def build_marginal_plots(distribution_metrics: MetricCollection) -> dict:
         if n_total is None:
             return False
         try:
-            return float(n_total.item() if isinstance(n_total, torch.Tensor) else n_total) > 0.0
+            return (
+                float(n_total.item() if isinstance(n_total, torch.Tensor) else n_total)
+                > 0.0
+            )
         except Exception:
             return False
 

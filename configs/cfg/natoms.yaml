@@ -21,6 +21,16 @@ cfg:
   use_natoms: true
   natoms_dropout_prob: 0.0
   natoms_guidance_scale: 1.0
+  # Encoder used by UnifiedCFGEmbedding to embed the target n_atoms scalar
+  # before CFG null-mixing.  Must expose an `out_dim` attribute.
+  # Swap `_target_` to `chemflow.model.embedding.ExtrapolatableCountEmbedding`
+  # (and provide its args) for a representation that extrapolates to counts
+  # just outside the training support.
+  natoms_encoder:
+    _target_: chemflow.model.embedding.CountEmbedding
+    embedding_dim: 64
+    out_dim: 64
+    max_period: 100.0
   # MW conditioning
   use_mw: false
   mw_dropout_prob: 0.0
@@ -32,6 +42,7 @@ cfg:
     num_properties: ${cfg.cfg.num_properties}
     property_hidden_dim: ${cfg.cfg.property_hidden_dim}
     use_natoms: ${cfg.cfg.use_natoms}
+    natoms_encoder: ${cfg.cfg.natoms_encoder}
     use_mw: ${cfg.cfg.use_mw}
 
 cfg_embedding: ${if:${cfg.do_cfg}, ${cfg.cfg.embedding}, null}
