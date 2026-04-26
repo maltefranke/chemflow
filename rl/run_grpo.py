@@ -160,6 +160,13 @@ def main():
                          "G=1 recovers batch-relative advantages (the old default). "
                          "G>1 replicates each prompt G times in-place, so the "
                          "effective unique-prompt count per update is batch_size // G.")
+    ap.add_argument(
+        "--update_passes",
+        type=int,
+        default=1,
+        help="Number of PPO-style optimization passes over one sampled trajectory "
+             "(importance ratios always use rollout lp_old).",
+    )
     ap.add_argument("--seed", type=int, default=0,
                     help="Seed for python/numpy/torch RNGs. Does not pin cuDNN.")
     ap.add_argument("--kl_coef", type=float, default=0.0,
@@ -204,6 +211,8 @@ def main():
 
     if args.group_size < 1:
         raise ValueError(f"--group_size must be >= 1, got {args.group_size}")
+    if args.update_passes < 1:
+        raise ValueError(f"--update_passes must be >= 1, got {args.update_passes}")
 
     grpo_cfg = GRPOConfig(
         sigma_noise=args.sigma_noise,
@@ -213,6 +222,7 @@ def main():
         num_integration_steps=args.num_steps,
         max_grad_norm=(args.max_grad_norm if args.max_grad_norm and args.max_grad_norm > 0 else None),
         group_size=args.group_size,
+        update_passes=args.update_passes,
         kl_coef=args.kl_coef,
         per_element_logp_mean=args.per_element_logp_mean,
     )

@@ -66,6 +66,7 @@ CONFIGS=(
 
 SEED="${SEED:-0}"
 GROUP_SIZE="${GROUP_SIZE:-1}"
+UPDATE_PASSES="${UPDATE_PASSES:-1}"
 SWEEP_TIME="${SWEEP_TIME:-2:00:00}"
 n_jobs="${#CONFIGS[@]}"
 
@@ -82,7 +83,7 @@ submit_one() {
     echo "DRY: sbatch -t ${SWEEP_TIME} -J grpo-${j} --export=ALL ${SLURM_SCRIPT}"
     return 0
   fi
-  export A_SDE KL_COEF LR VAR_FLOOR SEED GROUP_SIZE
+  export A_SDE KL_COEF LR VAR_FLOOR SEED GROUP_SIZE UPDATE_PASSES
   # Pass full env to the job; keep GRPO_WANDB_* from this script.
   sbatch -t "${SWEEP_TIME}" -J "grpo-${j}" --export=ALL "${SLURM_SCRIPT}"
 }

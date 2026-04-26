@@ -115,6 +115,10 @@ class GRPOConfig:
     # β · (sum of per-channel k3) added to the step loss, k3 = exp(t) - t - 1
     # with t = lp_ref - lp_θ (clamped). 0 disables: no ref model, no extra forward.
     kl_coef: float = 0.0
+    # PPO-style number of optimization passes over one sampled trajectory.
+    # 1 = legacy behavior (single pass). >1 reuses rollout data via clipped
+    # importance ratios exp(log π_θ(a) - log π_old(a)).
+    update_passes: int = 1
     # If True, each channel's log-prob is the mean over its natural units,
     # then channels are summed into `total` (Flow-GRPO-style resolution scaling).
     # Details: positions use mean over **3 × surviving atoms** (one factor per
@@ -1104,10 +1108,12 @@ def grpo_step(
     This cancels between-prompt reward heterogeneity from the advantage,
     leaving only the contribution of the stochastic rollout choices.
 
-    Note on diagnostics (mu = 1 inner epoch):
-        * `ratio ≡ 1` within this call because `lp_new` and `lp_old` are both
-          evaluated under theta_old -- so `ratio_*` would be uninformative and
-          we don't log it.
+    Note on diagnostics:
+        * With `cfg.update_passes == 1` (legacy), `ratio ≡ 1` within this call
+          because `lp_new` and `lp_old` are both evaluated under theta_old, so
+          ratio metrics carry little information.
+        * With `cfg.update_passes > 1`, later passes use the same `lp_old` but
+          updated θ, so ratio drift reflects policy movement.
         * `signal/{channel}` = mean over steps of `mean_batch(adv * lp_channel)`.
           This is the policy-gradient "learning signal" per channel: its sign
           and magnitude tell us whether that channel's log-prob correlates
@@ -1121,6 +1127,9 @@ def grpo_step(
           `β · mean(sum_c k3_c)` to the loss (Schulman k3 on per-channel
           log-prob ratios).  Logged as `kl/total` and `kl/{channel}`.
     """
+    if cfg.update_passes < 1:
+        raise ValueError(f"cfg.update_passes must be >= 1, got {cfg.update_passes}")
+
     batch = _replicate_batch_for_groups(batch, cfg.group_size)
     trajectory = rollout_trajectory(module, batch, cfg)
     reward_tensor, reward_aux = reward_fn(module, trajectory)
@@ -1143,79 +1152,92 @@ def grpo_step(
     else:
         adv = (r - r.mean()) / (r.std() + 1e-6)
 
-    optimizer.zero_grad(set_to_none=True)
+    n_passes = cfg.update_passes
     loss_ppo_sum = 0.0
     loss_kl_sum = 0.0
     n_steps = len(trajectory.steps)
     use_kl = cfg.kl_coef > 0.0 and ref_module is not None
 
-    # Per-channel accumulators (averaged over steps at the end).
+    # Per-channel accumulators (averaged over steps and passes at the end).
     lp_mean: dict[str, float] = {}
     adv_signal: dict[str, float] = {}
     kl_mean: dict[str, float] = {}
+    grad_norm_pre_sum = 0.0
+    grad_norm_post_sum = 0.0
 
-    for step in trajectory.steps:
-        lp_new, breakdown = _step_logprob_with_grad(
-            module, step, cfg, detach_breakdown=not use_kl,
-        )
-        # DEPARTURES.md §A: clamp log-ratio before exp.
-        log_ratio = (lp_new - step.logp_old).clamp(
-            -cfg.log_ratio_clamp, cfg.log_ratio_clamp,
-        )
-        ratio = torch.exp(log_ratio)
-        clipped = torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps)
-        ppo_term = -torch.minimum(ratio * adv, clipped * adv).mean()
-        step_loss = ppo_term
-
-        if use_kl:
-            with torch.inference_mode():
+    ref_breakdowns: list[dict[str, torch.Tensor]] | None = None
+    if use_kl:
+        ref_breakdowns = []
+        with torch.inference_mode():
+            for step in trajectory.steps:
                 _, breakdown_ref = _step_logprob_with_grad(
                     ref_module, step, cfg, detach_breakdown=True,
                 )
-            kl_total, kl_by_ch = _k3_kl_per_channel(
-                breakdown, breakdown_ref, cfg,
+                ref_breakdowns.append(breakdown_ref)
+
+    for _ in range(n_passes):
+        optimizer.zero_grad(set_to_none=True)
+        for step_idx, step in enumerate(trajectory.steps):
+            lp_new, breakdown = _step_logprob_with_grad(
+                module, step, cfg, detach_breakdown=not use_kl,
             )
-            step_loss = step_loss + cfg.kl_coef * kl_total.mean()
-            loss_kl_sum += float((cfg.kl_coef * kl_total.mean()).item())
-            for name, kch in kl_by_ch.items():
-                kl_mean[name] = kl_mean.get(name, 0.0) + float(kch.mean()) / n_steps
-
-        (step_loss / n_steps).backward()
-        loss_ppo_sum += float(ppo_term.item())
-
-        for name, lp_ch in breakdown.items():
-            lp_mean[name] = lp_mean.get(name, 0.0) + float(lp_ch.detach().mean()) / n_steps
-            adv_signal[name] = adv_signal.get(name, 0.0) + float(
-                (adv * lp_ch.detach()).mean(),
-            ) / n_steps
-
-    # Gradient norm BEFORE clipping: the raw magnitude of the policy nudge.
-    # We use clip_grad_norm_ (which also returns the pre-clip total norm) when
-    # `cfg.max_grad_norm is not None`, and fall back to a manual sum otherwise.
-    if cfg.max_grad_norm is not None:
-        grad_norm_pre = float(
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in module.parameters() if p.requires_grad],
-                max_norm=cfg.max_grad_norm,
+            # DEPARTURES.md §A: clamp log-ratio before exp.
+            log_ratio = (lp_new - step.logp_old).clamp(
+                -cfg.log_ratio_clamp, cfg.log_ratio_clamp,
             )
-        )
-        grad_norm_post = min(grad_norm_pre, float(cfg.max_grad_norm))
-    else:
-        grad_sq = 0.0
-        for p in module.parameters():
-            if p.grad is not None:
-                grad_sq += float(p.grad.pow(2).sum())
-        grad_norm_pre = grad_sq ** 0.5
-        grad_norm_post = grad_norm_pre
+            ratio = torch.exp(log_ratio)
+            clipped = torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps)
+            ppo_term = -torch.minimum(ratio * adv, clipped * adv).mean()
+            step_loss = ppo_term
 
-    optimizer.step()
+            if use_kl:
+                breakdown_ref = ref_breakdowns[step_idx]
+                kl_total, kl_by_ch = _k3_kl_per_channel(
+                    breakdown, breakdown_ref, cfg,
+                )
+                step_loss = step_loss + cfg.kl_coef * kl_total.mean()
+                loss_kl_sum += float((cfg.kl_coef * kl_total.detach().mean()).item())
+                for name, kch in kl_by_ch.items():
+                    kl_mean[name] = kl_mean.get(name, 0.0) + float(kch.detach().mean()) / (n_steps * n_passes)
 
-    loss_total = (loss_ppo_sum + loss_kl_sum) / n_steps
+            (step_loss / n_steps).backward()
+            loss_ppo_sum += float(ppo_term.item())
+
+            for name, lp_ch in breakdown.items():
+                lp_mean[name] = lp_mean.get(name, 0.0) + float(lp_ch.detach().mean()) / (n_steps * n_passes)
+                adv_signal[name] = adv_signal.get(name, 0.0) + float(
+                    (adv * lp_ch.detach()).mean(),
+                ) / (n_steps * n_passes)
+
+        # Gradient norm BEFORE clipping: the raw magnitude of one optimizer update.
+        # With multi-pass updates, we average these norms across passes.
+        if cfg.max_grad_norm is not None:
+            grad_norm_pre = float(
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in module.parameters() if p.requires_grad],
+                    max_norm=cfg.max_grad_norm,
+                )
+            )
+            grad_norm_post = min(grad_norm_pre, float(cfg.max_grad_norm))
+        else:
+            grad_sq = 0.0
+            for p in module.parameters():
+                if p.grad is not None:
+                    grad_sq += float(p.grad.pow(2).sum())
+            grad_norm_pre = grad_sq ** 0.5
+            grad_norm_post = grad_norm_pre
+
+        grad_norm_pre_sum += grad_norm_pre
+        grad_norm_post_sum += grad_norm_post
+        optimizer.step()
+
+    loss_total = (loss_ppo_sum + loss_kl_sum) / (n_steps * n_passes)
     out: dict = {
         "loss": loss_total,
-        "loss_ppo": loss_ppo_sum / n_steps,
-        "grad_norm": grad_norm_pre,
-        "grad_norm_post_clip": grad_norm_post,
+        "loss_ppo": loss_ppo_sum / (n_steps * n_passes),
+        "grad_norm": grad_norm_pre_sum / n_passes,
+        "grad_norm_post_clip": grad_norm_post_sum / n_passes,
+        "update_passes": n_passes,
         "reward_mean": float(r.mean()),
         "reward_std": float(r.std()),
         "reward_min": float(r.min()),
@@ -1227,9 +1249,9 @@ def grpo_step(
         **reward_aux,
     }
     if use_kl:
-        out["loss_kl"] = loss_kl_sum / n_steps
+        out["loss_kl"] = loss_kl_sum / (n_steps * n_passes)
         # Unscaled k3: same as (step loss KL term) / β, i.e. mean_batch(sum_c k3_c) averaged over time.
-        out["kl/total"] = (loss_kl_sum / n_steps) / cfg.kl_coef
+        out["kl/total"] = (loss_kl_sum / (n_steps * n_passes)) / cfg.kl_coef
         out.update({f"kl/{k}": v for k, v in kl_mean.items()})
     return out
 

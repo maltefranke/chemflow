@@ -10,7 +10,8 @@
 #SBATCH --error=slurm_logs/grpo_%j.err
 
 # SLURM wrapper for `rl/run_grpo.sh`.  Parameterises `a_sde`, `SEED`, `GROUP_SIZE`,
-# `KL_COEF` (0 = no KL), `LR`, `VAR_FLOOR` (position log-prob variance floor), optional
+# `KL_COEF` (0 = no KL), `LR`, `VAR_FLOOR` (position log-prob variance floor),
+# `UPDATE_PASSES` (PPO-style passes over sampled trajectory), optional
 # `PER_ELEMENT_LOGP_MEAN`, and W&B overrides
 # `GRPO_WANDB_PROJECT` / `GRPO_WANDB_GROUP` (same env vars as `sweep_grpo_unkillable.sh`).
 #
@@ -24,7 +25,7 @@
 #
 #   GROUP_SIZE=1 is recommended for stable batch-normalized advantages (see grpo.py).
 #
-# Default matches the last KL run tag shape: seed0, a_sde=0.1, g1, kl=0.05, lr=1e-4.
+# Default matches the last KL run tag shape: seed0, a_sde=0.1, g1, mu4, kl=0.05, lr=1e-4.
 #
 # Policy updates: N_UPDATES (default 100; matches sweep_grpo_unkillable.sh). Other
 # hyperparameters align with rl/run_grpo.sh (lr from env, reward=n_atoms,
@@ -37,15 +38,16 @@ cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
 mkdir -p slurm_logs .rl_ckpts
 
-A_SDE="${A_SDE:-0}"
+A_SDE="${A_SDE:-0.05}"
 SEED="${SEED:-0}"
 GROUP_SIZE="${GROUP_SIZE:-1}"
-KL_COEF="${KL_COEF:-0}"
+KL_COEF="${KL_COEF:-0.05}"
 LR="${LR:-1e-4}"
 # Position log-prob variance floor (matches grpo.GRPOConfig.var_floor / DEFAULT_VAR_FLOOR).
-VAR_FLOOR="${VAR_FLOOR:-1e-3}"
+VAR_FLOOR="${VAR_FLOOR:-1e-2}"
 N_UPDATES="${N_UPDATES:-100}"
 PER_ELEMENT_LOGP_MEAN="${PER_ELEMENT_LOGP_MEAN:-0}"
+UPDATE_PASSES="${UPDATE_PASSES:-4}"
 ELEM_SUFFIX=""
 PER_ELEM_FLAG=()
 if [[ "$PER_ELEMENT_LOGP_MEAN" =~ ^(1|true|yes|on)$ ]]; then
@@ -53,13 +55,13 @@ if [[ "$PER_ELEMENT_LOGP_MEAN" =~ ^(1|true|yes|on)$ ]]; then
   PER_ELEM_FLAG=(--per_element_logp_mean)
 fi
 
-RUN_TAG="phase2-natoms-seed${SEED}_alpha${A_SDE}_g${GROUP_SIZE}_kl${KL_COEF}_lr${LR}_vf${VAR_FLOOR}${ELEM_SUFFIX}"
-CKPT_TAG="seed${SEED}_alpha${A_SDE}_g${GROUP_SIZE}_kl${KL_COEF}_lr${LR}_vf${VAR_FLOOR}${ELEM_SUFFIX}"
+RUN_TAG="phase2-natoms-seed${SEED}_alpha${A_SDE}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}_vf${VAR_FLOOR}${ELEM_SUFFIX}"
+CKPT_TAG="seed${SEED}_alpha${A_SDE}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}_vf${VAR_FLOOR}${ELEM_SUFFIX}"
 
-GRPO_WANDB_PROJECT="${GRPO_WANDB_PROJECT:-chemflow-grpo}"
+GRPO_WANDB_PROJECT="${GRPO_WANDB_PROJECT:-chemflow-grpo-sweep-20260424_111439}"
 GRPO_WANDB_GROUP="${GRPO_WANDB_GROUP:-}"
 
-echo "host=$(hostname)  gpus=${CUDA_VISIBLE_DEVICES:-unset}  a_sde=${A_SDE}  seed=${SEED}  group_size=${GROUP_SIZE}  kl_coef=${KL_COEF}  lr=${LR}  var_floor=${VAR_FLOOR}  n_updates=${N_UPDATES}  per_element_logp_mean=${PER_ELEMENT_LOGP_MEAN}  run=${RUN_TAG}  wandb_project=${GRPO_WANDB_PROJECT}  wandb_group=${GRPO_WANDB_GROUP:-<none>}"
+echo "host=$(hostname)  gpus=${CUDA_VISIBLE_DEVICES:-unset}  a_sde=${A_SDE}  seed=${SEED}  group_size=${GROUP_SIZE}  update_passes=${UPDATE_PASSES}  kl_coef=${KL_COEF}  lr=${LR}  var_floor=${VAR_FLOOR}  n_updates=${N_UPDATES}  per_element_logp_mean=${PER_ELEMENT_LOGP_MEAN}  run=${RUN_TAG}  wandb_project=${GRPO_WANDB_PROJECT}  wandb_group=${GRPO_WANDB_GROUP:-<none>}"
 nvidia-smi -L || true
 
 WANDB_EXTR=()
@@ -72,7 +74,7 @@ uv run --env-file .env python -m rl.run_grpo \
     --n_updates "$N_UPDATES" --num_steps 100 --a_sde "$A_SDE" --lr "$LR" \
     --var_floor "$VAR_FLOOR" \
     --max_grad_norm 1.0 \
-    --seed "$SEED" --group_size "$GROUP_SIZE" --kl_coef "$KL_COEF" \
+    --seed "$SEED" --group_size "$GROUP_SIZE" --update_passes "$UPDATE_PASSES" --kl_coef "$KL_COEF" \
     "${PER_ELEM_FLAG[@]}" \
     --reward n_atoms \
     --wandb --wandb_project "$GRPO_WANDB_PROJECT" --wandb_name "$RUN_TAG" \
