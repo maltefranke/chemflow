@@ -7,7 +7,7 @@
 #   Run that on a login/head node. It *submits* N separate jobs; each is rl/run_grpo_slurm.sh
 #   (unkillable + GPU per run_grpo_slurm.sh).
 #
-# Sparse 10-config sweep (not a full cross-product): ODE baselines, var_floor, lr, a_sde, kl.
+# Sparse sweep (not a full cross-product): sigma_explore, lr, kl.
 # Each run uses 100 policy updates and 100 integration steps (see run_grpo_slurm.sh, N_UPDATES).
 # Expect ~80 min per run; default SWEEP_TIME 2:00:00 is plenty.
 #
@@ -49,19 +49,18 @@ GRPO_WANDB_PROJECT="${1:-${GRPO_WANDB_PROJECT:-chemflow-grpo-sweep-${STAMP}}}"
 GRPO_WANDB_GROUP="${GRPO_WANDB_GROUP:-$STAMP}"
 export GRPO_WANDB_PROJECT GRPO_WANDB_GROUP
 
-# Columns: A_SDE  KL_COEF  LR  VAR_FLOOR
-# — no full cross-product: a_sde=0 rows omit redundant var_floor pairs; no kl=0.01; lr uses 1e-4/3e-4 not 3e-5.
+# Columns: SIGMA_EXPLORE  KL_COEF  LR
 CONFIGS=(
-  "0     0.05 1e-4 1e-3"   # ODE baseline (replication)
-  "0     0.05 3e-4 1e-3"   # ODE, faster lr
-  "0.05  0.05 1e-4 1e-3"   # low noise + default floor
-  "0.05  0.05 1e-4 1e-2"   # low noise + aggressive floor
-  "0.05  0.05 3e-4 1e-3"   # low noise + fast lr
-  "0.1   0.05 1e-4 1e-3"   # best-like (confirm at 100 updates)
-  "0.1   0.05 1e-4 1e-2"   # aggressive floor
-  "0.1   0.05 3e-4 1e-3"   # fast lr
-  "0.1   0.05 3e-4 1e-2"   # fast + aggressive floor
-  "0.1   0.1  3e-4 1e-3"   # higher KL at fast lr
+  "0.01 0.05 1e-4"   # very low exploration
+  "0.01 0.05 3e-4"
+  "0.05 0.05 1e-4"
+  "0.05 0.05 3e-4"
+  "0.05 0.1  1e-4"
+  "0.05 0.1  3e-4"
+  "0.1  0.05 1e-4"
+  "0.1  0.05 3e-4"
+  "0.1  0.1  1e-4"
+  "0.1  0.1  3e-4"
 )
 
 SEED="${SEED:-0}"
@@ -77,19 +76,19 @@ echo
 
 submit_one() {
   # Unique Slurm name (no dots: partition/job tools tolerate alnum+_-)
-  local j="a${A_SDE}_k${KL_COEF}_lr${LR}_vf${VAR_FLOOR}"
+  local j="s${SIGMA_EXPLORE}_k${KL_COEF}_lr${LR}"
   j="${j//./p}"
   if [[ -n "${DRY_RUN:-}" ]]; then
     echo "DRY: sbatch -t ${SWEEP_TIME} -J grpo-${j} --export=ALL ${SLURM_SCRIPT}"
     return 0
   fi
-  export A_SDE KL_COEF LR VAR_FLOOR SEED GROUP_SIZE UPDATE_PASSES
+  export SIGMA_EXPLORE KL_COEF LR SEED GROUP_SIZE UPDATE_PASSES
   # Pass full env to the job; keep GRPO_WANDB_* from this script.
   sbatch -t "${SWEEP_TIME}" -J "grpo-${j}" --export=ALL "${SLURM_SCRIPT}"
 }
 
 for cfg in "${CONFIGS[@]}"; do
-  read -r A_SDE KL_COEF LR VAR_FLOOR <<< "$cfg"
+  read -r SIGMA_EXPLORE KL_COEF LR <<< "$cfg"
   submit_one
 done
 

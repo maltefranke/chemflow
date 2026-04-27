@@ -3,7 +3,7 @@
 Scope
 -----
 Per-step policy covers every channel in `integrator.integrate_step_gnn`:
-    * positions                    - SDE; log-prob restricted to survivors
+    * positions                    - N(x+ v dt, σ² I); log-prob restricted to survivors
     * atom-type 3-way action       - noop / sub (+target) / del
     * edge-type substitution       - upper-tri Bernoulli + categorical target,
                                      log-prob restricted to surviving edges
@@ -27,11 +27,7 @@ The overleaf is written in the opposite convention (x_0 data, x_1 noise).
 Translation:
     t_user         <-> 1 - t_code
     (1 - t_user)   <-> t_code
-    v_theta (both) == hat x_data - hat x_noise          (same sign here)
-    sigma_t^2      (user) = a^2 t/(1-t)   ->  (code) a^2 (1-t)/t
-After translating, the forward-time SDE is
-    dx = [v - (sigma_t^2/2) * (x_t - t v) / ((1-t) + sigma_noise^2)] dt + sigma_t dw
-so the score-correction sign is minus (same object, forward time).
+    v_theta (code) = (x1_pred - x_t) / (1 - t)   (same FM velocity as `integrate_step_gnn`).
 
 Explicit differences vs. `sample()`
 -----------------------------------
@@ -41,10 +37,10 @@ Explicit differences vs. `sample()`
       `SelfConditioningResidualLayer` is never imported.  So
       self-conditioning is effectively dead code in the base repo; passing
       `prev_preds` is a no-op.  Documented in DEPARTURES.md §2.
-    * Positions evolve as an SDE, not a deterministic ODE: with `a_sde > 0`
-      the Gaussian transition gives a well-defined policy for positions.
-      Setting `a_sde = 0` collapses the SDE to the same Euler step
-      `integrate_step_gnn` takes (still well-defined through `var_floor`).
+    * Positions use ReinFlow-style exploration: discrete-time kernel
+      π(x_{t+dt} | x_t) = N(x_t + v_θ dt, σ² I) with fixed σ (`sigma_explore`).
+      Log-probs match the sampler exactly (policy gradient for any discrete-time
+      Markov process with tractable Gaussian densities).
 
 Safeguards (replicated from `integrate_step_gnn`)
 -------------------------------------------------
@@ -86,7 +82,6 @@ from chemflow.utils.utils import EDGE_ALIGNER
 EPS = 1e-8
 EPS_T = 1e-2
 DEFAULT_CLIP_EPS = 0.2
-DEFAULT_VAR_FLOOR = 1e-3
 DEFAULT_LOG_RATIO_CLAMP = 20.0
 DEFAULT_P_INS_CLAMP = 1.0 - 1e-3
 
@@ -98,11 +93,9 @@ DEFAULT_P_INS_CLAMP = 1.0 - 1e-3
 
 @dataclass
 class GRPOConfig:
-    sigma_noise: float = 0.2       # must match Interpolator.move_noise_scale used at training
-    a_sde: float = 0.1             # SDE noise coefficient; sigma_t^2 = a^2 (1-t)/t
+    sigma_explore: float = 0.05    # per-coordinate std for N(x_t + v_θ dt, σ² I) position kernel
     clip_eps: float = DEFAULT_CLIP_EPS
     eps_t: float = EPS_T
-    var_floor: float = DEFAULT_VAR_FLOOR           # floor on position Gaussian variance (see DEPARTURES.md §B)
     log_ratio_clamp: float = DEFAULT_LOG_RATIO_CLAMP  # clamp |lp_new - lp_old| before exp (see §A)
     p_ins_clamp: float = DEFAULT_P_INS_CLAMP       # overleaf §4.1: `min(p_ins, 1-eps)` (see §4)
     num_integration_steps: int | None = None       # None -> module's default
@@ -233,50 +226,36 @@ def _extract_triu(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Position SDE (code convention)
+# Position kernel (fixed-Gaussian exploration)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def position_policy_moments(
+def position_explore_mean(
     x_t: torch.Tensor,      # (N, 3)
     x1_pred: torch.Tensor,  # (N, 3)
     t_node: torch.Tensor,   # (N,)
     dt: float,
-    sigma_noise: float,
-    a_sde: float,
     eps_t: float = EPS_T,
-):
-    """Return (mu, sigma_t^2) for the Euler-Maruyama Gaussian step at time t.
-
-    mu_i    = x_{i,t} + dt * [v_i - (sigma_t^2 / 2) * (x_{i,t} - t v_i) / ((1-t)+sigma_noise^2)]
-    var_i   = sigma_t^2 * dt  (isotropic on R^3)
-    v_i     = (x1_pred_i - x_{i,t}) / (1 - t)      (code convention)
-    """
-    t = t_node.clamp(min=eps_t, max=1.0 - 1e-6).unsqueeze(-1)  # (N, 1)
+) -> torch.Tensor:
+    """Mean of π(x_{t+dt}|x_t) = N(x_t + v_θ dt, σ² I); v_θ matches FM velocity."""
+    t = t_node.clamp(min=eps_t, max=1.0 - 1e-6).unsqueeze(-1)
     one_minus_t = 1.0 - t
-    sigma_n2 = sigma_noise ** 2
-
-    v = (x1_pred - x_t) / one_minus_t
-    score = -(x_t - t * v) / (one_minus_t + sigma_n2)
-    sigma_t2 = (a_sde ** 2) * one_minus_t / t
-    mu = x_t + dt * (v + 0.5 * sigma_t2 * score)
-    return mu, sigma_t2.squeeze(-1)
+    v_theta = (x1_pred - x_t) / one_minus_t
+    return x_t + v_theta * dt
 
 
 def gaussian_logprob_positions(
     x_next: torch.Tensor,    # (N, 3)
     mu: torch.Tensor,        # (N, 3)
-    sigma_t2: torch.Tensor,  # (N,)
-    dt: float,
+    var: float,              # per-coordinate variance (σ²); isotropic on R^3
     batch_id: torch.Tensor,  # (N,)
     num_graphs: int,
     survive_mask: torch.Tensor | None = None,  # (N,) bool
-    var_floor: float = DEFAULT_VAR_FLOOR,
 ) -> torch.Tensor:
     """Per-graph sum of Gaussian log-densities, restricted to `survive_mask`."""
-    var = (sigma_t2 * dt).clamp_min(var_floor)
     sq = ((x_next - mu) ** 2).sum(-1)
-    logp_node = -0.5 * sq / var - 1.5 * torch.log(2 * math.pi * var)
+    log_2pi_var = math.log(2 * math.pi * var)
+    logp_node = -0.5 * sq / var - 1.5 * log_2pi_var
     if survive_mask is not None:
         logp_node = torch.where(survive_mask, logp_node, torch.zeros_like(logp_node))
     return _scatter_sum(logp_node, batch_id, num_graphs)
@@ -473,12 +452,11 @@ def _per_channel_logprob(
     # ─── Positions ──────────────────────────────────────────────────────
     x1_pred = preds["pos_head"]
     t_node = t[batch_id]
-    mu, sigma_t2 = position_policy_moments(
-        mol_t.x, x1_pred, t_node, dt, cfg.sigma_noise, cfg.a_sde, cfg.eps_t,
-    )
+    mu = position_explore_mean(mol_t.x, x1_pred, t_node, dt, cfg.eps_t)
+    var = cfg.sigma_explore**2
     lp_pos = gaussian_logprob_positions(
-        step.x_next, mu, sigma_t2, dt, batch_id, num_graphs,
-        survive_mask=survive_mask, var_floor=cfg.var_floor,
+        step.x_next, mu, var, batch_id, num_graphs,
+        survive_mask=survive_mask,
     )
 
     # ─── Atom sub / del 3-way ───────────────────────────────────────────
@@ -707,7 +685,7 @@ def _apply_underflow_safeguard(
 
 @torch.no_grad()
 def _rollout_step(module, mol_t, t: torch.Tensor, dt: float, cfg: GRPOConfig):
-    """Sample one full SDE + discrete + insertion step from theta_old."""
+    """Sample one full position-explore + discrete + insertion step from theta_old."""
     integrator = module.integrator
     preds = _forward_preds(module, mol_t, t, cfg)
 
@@ -718,14 +696,12 @@ def _rollout_step(module, mol_t, t: torch.Tensor, dt: float, cfg: GRPOConfig):
     n_atoms_strategy = getattr(module, "n_atoms_strategy", "fixed")
     prior_edge_probs = integrator._cat_edge.probs.to(device)
 
-    # ─── Positions (SDE) ────────────────────────────────────────────────
+    # ─── Positions (fixed-Gaussian exploration) ──────────────────────────
     x1_pred = preds["pos_head"]
     t_node = t[batch_id]
-    mu, sigma_t2 = position_policy_moments(
-        mol_t.x, x1_pred, t_node, dt, cfg.sigma_noise, cfg.a_sde, cfg.eps_t,
-    )
+    mu = position_explore_mean(mol_t.x, x1_pred, t_node, dt, cfg.eps_t)
     noise_pos = torch.randn_like(mol_t.x)
-    x_next = mu + torch.sqrt(sigma_t2.unsqueeze(-1) * dt) * noise_pos
+    x_next = mu + cfg.sigma_explore * noise_pos
 
     # ─── Categorical predictions (shared across rollout + scoring) ─────
     atom_probs = F.softmax(preds["atom_type_head"], dim=-1)

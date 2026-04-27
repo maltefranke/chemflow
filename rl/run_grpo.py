@@ -36,7 +36,7 @@ def seed_everything(seed: int) -> None:
     """Seed python/numpy/torch (CPU+CUDA) for reproducibility.
 
     We deliberately *do not* set deterministic cuDNN flags: GRPO rollouts
-    already carry big stochastic draws (SDE noise, categorical samples, shuffled
+    already carry big stochastic draws (exploration noise, categorical samples, shuffled
     dataloader), so exact cross-run reproducibility isn't the goal -- the goal
     is to make "seed=0" actually mean the same thing every time.
     """
@@ -55,7 +55,7 @@ from chemflow.dataset.vocab import setup_token_weights  # noqa: E402
 from chemflow.utils.metrics import init_metrics  # noqa: E402
 from chemflow.utils.utils import init_uniform_prior  # noqa: E402
 
-from rl.grpo import DEFAULT_VAR_FLOOR, GRPOConfig, train  # noqa: E402
+from rl.grpo import GRPOConfig, train  # noqa: E402
 from rl.rewards import REWARDS  # noqa: E402
 
 
@@ -144,14 +144,12 @@ def main():
     ap.add_argument("--num_steps", type=int, default=None,
                     help="Integration steps per rollout; default = module's own setting")
     ap.add_argument("--lr", type=float, default=1e-5)
-    ap.add_argument("--a_sde", type=float, default=0.1)
     ap.add_argument(
-        "--var_floor",
+        "--sigma_explore",
         type=float,
-        default=DEFAULT_VAR_FLOOR,
-        help="Floor on position Gaussian variance in log-prob (see GRPOConfig.var_floor, DEPARTURES.md).",
+        default=0.05,
+        help="Per-coordinate std σ for position kernel N(x+v·dt, σ² I) (see GRPOConfig.sigma_explore).",
     )
-    ap.add_argument("--sigma_noise", type=float, default=0.2)
     ap.add_argument("--clip_eps", type=float, default=0.2)
     ap.add_argument("--max_grad_norm", type=float, default=1.0,
                     help="Global-norm gradient clip threshold; pass 0 or negative to disable")
@@ -208,6 +206,7 @@ def main():
     cfg = compose_cfg(args.config_path, args.config_name, overrides=list(args.overrides))
     module, datamodule = build_module_and_datamodule(cfg)
     module = load_ckpt_into_module(module, args.ckpt)
+    module.integrator.max_atoms = 60
 
     if args.group_size < 1:
         raise ValueError(f"--group_size must be >= 1, got {args.group_size}")
@@ -215,9 +214,7 @@ def main():
         raise ValueError(f"--update_passes must be >= 1, got {args.update_passes}")
 
     grpo_cfg = GRPOConfig(
-        sigma_noise=args.sigma_noise,
-        a_sde=args.a_sde,
-        var_floor=args.var_floor,
+        sigma_explore=args.sigma_explore,
         clip_eps=args.clip_eps,
         num_integration_steps=args.num_steps,
         max_grad_norm=(args.max_grad_norm if args.max_grad_norm and args.max_grad_norm > 0 else None),
