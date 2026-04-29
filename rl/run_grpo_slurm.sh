@@ -1,18 +1,19 @@
 #!/bin/bash
-#SBATCH -J grpo-natoms
+#SBATCH -J grpo-rl
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:a100l:1
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=32G
 #SBATCH --partition=unkillable
-#SBATCH --time=4:00:00
+#SBATCH --time=6:00:00
 #SBATCH --output=slurm_logs/grpo_%j.out
 #SBATCH --error=slurm_logs/grpo_%j.err
 
 # SLURM wrapper for `rl/run_grpo.sh`.  Parameterises `SIGMA_EXPLORE` (position
 # kernel std σ), `SEED`, `GROUP_SIZE`, `KL_COEF` (0 = no KL), `LR`,
-# `UPDATE_PASSES` (PPO-style passes over sampled trajectory), optional
-# `PER_ELEMENT_LOGP_MEAN`, and W&B overrides
+# `UPDATE_PASSES` (PPO-style passes over sampled trajectory), `REWARD`
+# (`shape`, `n_atoms`, …; see rl/rewards.py), `KL_OMIT_POS` (omit KL on position
+# channel vs full KL), optional `PER_ELEMENT_LOGP_MEAN`, and W&B overrides
 # `GRPO_WANDB_PROJECT` / `GRPO_WANDB_GROUP` (same env vars as `sweep_grpo_unkillable.sh`).
 #
 # Examples:
@@ -24,11 +25,14 @@
 #
 #   GROUP_SIZE=1 is recommended for stable batch-normalized advantages (see grpo.py).
 #
-# Default: seed0, sigma_explore=0.05, g1, mu4, kl=0.05, lr=1e-4.
+# Default: reward=n_atoms, seed0, sigma_explore=0.05, g1, mu2 (UPDATE_PASSES),
+#          kl=0.05, lr=1e-4, KL_OMIT_POS=1 (--kl_omit_pos: no KL on `pos` channel).
 #
-# Policy updates: N_UPDATES (default 100; matches sweep_grpo_unkillable.sh). Other
-# hyperparameters align with rl/run_grpo.sh (lr from env, reward=n_atoms,
-# max_grad_norm 1.0, batch 128) unless you override here.
+# Policy updates: N_UPDATES (default 400). Other hyperparameters align with
+# rl/run_grpo.sh (lr from env, max_grad_norm 1.0, batch 128) unless overridden.
+#
+# Run / checkpoint tags include REWARD (short slug) and omit-pos-KL marker
+# (omitposkl vs fullposkl) so different reward / KL setups do not collide.
 
 set -euo pipefail
 
@@ -40,11 +44,25 @@ mkdir -p slurm_logs .rl_ckpts
 SIGMA_EXPLORE="${SIGMA_EXPLORE:-0.05}"
 SEED="${SEED:-0}"
 GROUP_SIZE="${GROUP_SIZE:-1}"
-KL_COEF="${KL_COEF:-0.00}"
+KL_COEF="${KL_COEF:-0.05}"
 LR="${LR:-1e-4}"
-N_UPDATES="${N_UPDATES:-100}"
+N_UPDATES="${N_UPDATES:-400}"
 PER_ELEMENT_LOGP_MEAN="${PER_ELEMENT_LOGP_MEAN:-0}"
 UPDATE_PASSES="${UPDATE_PASSES:-2}"
+REWARD="${REWARD:-n_atoms}"
+# Filename-safe short name (n_atoms → natoms).
+REWARD_SLUG="${REWARD//_/}"
+
+KL_OMIT_POS="${KL_OMIT_POS:-1}"
+KL_OMIT_FLAG=()
+KL_OMIT_SUFFIX=""
+if [[ "$KL_OMIT_POS" =~ ^(1|true|yes|on)$ ]]; then
+  KL_OMIT_FLAG=(--kl_omit_pos)
+  KL_OMIT_SUFFIX="omitposkl"
+else
+  KL_OMIT_SUFFIX="fullposkl"
+fi
+
 ELEM_SUFFIX=""
 PER_ELEM_FLAG=()
 if [[ "$PER_ELEMENT_LOGP_MEAN" =~ ^(1|true|yes|on)$ ]]; then
@@ -53,13 +71,13 @@ if [[ "$PER_ELEMENT_LOGP_MEAN" =~ ^(1|true|yes|on)$ ]]; then
 fi
 
 SIG_TAG="${SIGMA_EXPLORE//./p}"
-RUN_TAG="phase2-natoms-seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}"
-CKPT_TAG="seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_maxa60"
+RUN_TAG="phase2-${REWARD_SLUG}-seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_${KL_OMIT_SUFFIX}"
+CKPT_TAG="${REWARD_SLUG}_seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_maxa60_${KL_OMIT_SUFFIX}"
 
 GRPO_WANDB_PROJECT="${GRPO_WANDB_PROJECT:-chemflow-grpo-sweep-20260424_111439}"
 GRPO_WANDB_GROUP="${GRPO_WANDB_GROUP:-}"
 
-echo "host=$(hostname)  gpus=${CUDA_VISIBLE_DEVICES:-unset}  sigma_explore=${SIGMA_EXPLORE}  seed=${SEED}  group_size=${GROUP_SIZE}  update_passes=${UPDATE_PASSES}  kl_coef=${KL_COEF}  lr=${LR}  n_updates=${N_UPDATES}  per_element_logp_mean=${PER_ELEMENT_LOGP_MEAN}  run=${RUN_TAG}  wandb_project=${GRPO_WANDB_PROJECT}  wandb_group=${GRPO_WANDB_GROUP:-<none>}"
+echo "host=$(hostname)  gpus=${CUDA_VISIBLE_DEVICES:-unset}  reward=${REWARD}  sigma_explore=${SIGMA_EXPLORE}  seed=${SEED}  group_size=${GROUP_SIZE}  update_passes=${UPDATE_PASSES}  kl_coef=${KL_COEF}  kl_omit_pos=${KL_OMIT_POS}  lr=${LR}  n_updates=${N_UPDATES}  per_element_logp_mean=${PER_ELEMENT_LOGP_MEAN}  run=${RUN_TAG}  wandb_project=${GRPO_WANDB_PROJECT}  wandb_group=${GRPO_WANDB_GROUP:-<none>}"
 nvidia-smi -L || true
 
 WANDB_EXTR=()
@@ -73,11 +91,12 @@ uv run --env-file .env python -m rl.run_grpo \
     --max_grad_norm 1.0 \
     --seed "$SEED" --group_size "$GROUP_SIZE" --update_passes "$UPDATE_PASSES" --kl_coef "$KL_COEF" \
     "${PER_ELEM_FLAG[@]}" \
-    --reward n_atoms \
+    --reward "$REWARD" \
+    "${KL_OMIT_FLAG[@]}" \
     --wandb --wandb_project "$GRPO_WANDB_PROJECT" --wandb_name "$RUN_TAG" \
     "${WANDB_EXTR[@]}" \
-    --save ".rl_ckpts/grpo_natoms_${CKPT_TAG}.pt" \
-    --save_best ".rl_ckpts/grpo_natoms_${CKPT_TAG}_best.pt" \
+    --save ".rl_ckpts/grpo_${CKPT_TAG}.pt" \
+    --save_best ".rl_ckpts/grpo_${CKPT_TAG}_best.pt" \
     data.datamodule.batch_size.test=128
 
 echo "done: ${RUN_TAG}"

@@ -3,17 +3,22 @@
 
 Run from repository root::
 
-    python -m rl.experiments.compare_pretrained_rl_atoms
+    python -m rl.experiments.natoms.compare_pretrained_rl_atoms
+
+Or::
+
+    python rl/experiments/natoms/compare_pretrained_rl_atoms.py
 
 Uses the same Hydra stack and checkpoint loading as ``rl/eval_pretrained_validity.py``.
 Trailing CLI args are forwarded as Hydra overrides (must match how the RL run was trained).
 
-Outputs (under ``rl/experiments/`` by default):
+Outputs go under ``<out_dir>/<checkpoint_stem>/`` where ``checkpoint_stem`` is the RL
+checkpoint filename without extension (from ``--rl_ckpt`` or the default from ``main()``):
 
 * ``atom_hist_pretrained_vs_rl.png`` — grouped bar chart (grey = base trained, blue = RL);
   **only RDKit-valid** molecules enter the histogram (invalid samples are excluded).
-* ``rl_valid_trajectories.pt`` — **only** this torch file: full generation trajectories for
-  **RDKit-valid RL** samples whose final frame has at least ``--min_atoms`` atoms (default 32).
+* ``rl_valid_trajectories.pt`` — full generation trajectories for **RDKit-valid RL** samples
+  whose final frame has at least ``--min_atoms`` atoms (default 32).
 
 Atom count convention: we report ``rd.GetNumAtoms()`` on the RDKit mol built from the
 final trajectory frame via ``MoleculeData.to_rdkit_mol`` — the *same* quantity used by
@@ -30,7 +35,7 @@ import os
 import sys
 from typing import Any
 
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 for _p in [_PROJECT_ROOT, os.path.join(_PROJECT_ROOT, "src")]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -120,7 +125,7 @@ def main(default_rl_ckpt_name: str = "grpo_best.pt"):
     ap.add_argument(
         "--out_dir",
         default=os.path.join(os.path.dirname(__file__)),
-        help="Directory for the figure and rl_valid_trajectories.pt",
+        help="Base directory; outputs go in <out_dir>/<RL_ckpt_basename_without_ext>/",
     )
     ap.add_argument(
         "--min_atoms",
@@ -131,7 +136,7 @@ def main(default_rl_ckpt_name: str = "grpo_best.pt"):
     ap.add_argument(
         "--trajectories_out",
         default=None,
-        help="Path for rl trajectory .pt (default: <out_dir>/rl_valid_trajectories.pt)",
+        help="Override path for trajectory .pt (default: <out_dir>/<ckpt_stem>/rl_valid_trajectories.pt)",
     )
     ap.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. data.n_atoms_strategy=fixed")
     args = ap.parse_args()
@@ -139,7 +144,9 @@ def main(default_rl_ckpt_name: str = "grpo_best.pt"):
     print("pretrained ckpt:", os.path.abspath(args.pretrained_ckpt))
     print("RL ckpt:        ", os.path.abspath(rl_ckpt))
 
-    os.makedirs(args.out_dir, exist_ok=True)
+    ckpt_stem = os.path.splitext(os.path.basename(rl_ckpt))[0]
+    run_dir = os.path.join(args.out_dir, ckpt_stem)
+    os.makedirs(run_dir, exist_ok=True)
     cfg = compose_cfg(args.config_path, args.config_name, overrides=list(args.overrides))
 
     # --- Pretrained ---
@@ -196,7 +203,7 @@ def main(default_rl_ckpt_name: str = "grpo_best.pt"):
         bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
     )
     fig.tight_layout()
-    fig_path = os.path.join(args.out_dir, "atom_hist_pretrained_vs_rl_alpha01.png")
+    fig_path = os.path.join(run_dir, "atom_hist_pretrained_vs_rl.png")
     fig.savefig(fig_path, dpi=150)
     plt.close(fig)
     print("saved figure:", fig_path)
@@ -206,7 +213,7 @@ def main(default_rl_ckpt_name: str = "grpo_best.pt"):
         if n_at >= args.min_atoms:
             traj_records.append({"final_n_atoms": n_at, "trajectory": traj})
 
-    traj_path = args.trajectories_out or os.path.join(args.out_dir, "rl_valid_trajectories_alpha01.pt")
+    traj_path = args.trajectories_out or os.path.join(run_dir, "rl_valid_trajectories.pt")
     torch.save(
         {
             "rl_ckpt": rl_ckpt,
@@ -227,4 +234,4 @@ def main(default_rl_ckpt_name: str = "grpo_best.pt"):
 
 
 if __name__ == "__main__":
-    main(default_rl_ckpt_name="grpo_natoms_seed0_alpha0.1_best.pt")
+    main(default_rl_ckpt_name="grpo_natoms_seed0_sig0p05_g1_mu2_kl0.05_lr1e-4_maxa60_omitposkl_best.pt")

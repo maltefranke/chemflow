@@ -171,6 +171,11 @@ def main():
                     help="β for reverse-KL to frozen ref (k3 per channel). 0 = disabled "
                          "(no second model copy, no extra forward).")
     ap.add_argument(
+        "--kl_omit_pos",
+        action="store_true",
+        help="Exclude the position channel from the k3 KL term (other channels unchanged).",
+    )
+    ap.add_argument(
         "--per_element_logp_mean",
         action="store_true",
         help="Use mean within each RL channel before summing channels (positions: per "
@@ -221,6 +226,7 @@ def main():
         group_size=args.group_size,
         update_passes=args.update_passes,
         kl_coef=args.kl_coef,
+        kl_omit_pos=args.kl_omit_pos,
         per_element_logp_mean=args.per_element_logp_mean,
     )
 

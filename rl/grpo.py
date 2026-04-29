@@ -108,6 +108,9 @@ class GRPOConfig:
     # β · (sum of per-channel k3) added to the step loss, k3 = exp(t) - t - 1
     # with t = lp_ref - lp_θ (clamped). 0 disables: no ref model, no extra forward.
     kl_coef: float = 0.0
+    # If True, the `pos` channel is skipped in the k3 sum (GRPO still uses full
+    # joint log-prob for the clipped surrogate; only the KL anchor omits positions).
+    kl_omit_pos: bool = False
     # PPO-style number of optimization passes over one sampled trajectory.
     # 1 = legacy behavior (single pass). >1 reuses rollout data via clipped
     # importance ratios exp(log π_θ(a) - log π_old(a)).
@@ -1051,6 +1054,8 @@ def _k3_kl_per_channel(
     for name, lp_t in breakdown_theta.items():
         lp_r = breakdown_ref.get(name)
         if lp_r is None:
+            continue
+        if cfg.kl_omit_pos and name == "pos":
             continue
         t = (lp_r - lp_t).clamp(
             -cfg.log_ratio_clamp, cfg.log_ratio_clamp,
