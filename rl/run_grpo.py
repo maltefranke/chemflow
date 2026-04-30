@@ -56,7 +56,7 @@ from chemflow.utils.metrics import init_metrics  # noqa: E402
 from chemflow.utils.utils import init_uniform_prior  # noqa: E402
 
 from rl.grpo import GRPOConfig, train  # noqa: E402
-from rl.rewards import REWARDS  # noqa: E402
+from rl.rewards import REWARDS, scaffold_diversity_wrapper  # noqa: E402
 
 
 def compose_cfg(config_path: str, config_name: str, overrides: list[str]):
@@ -186,7 +186,46 @@ def main():
     ap.add_argument("--log_every", type=int, default=1)
     ap.add_argument(
         "--reward", default="validity", choices=sorted(REWARDS),
-        help="Reward name (see rl/rewards.py::REWARDS).",
+        help="Reward name (see rl/rewards.py::REWARDS). "
+             "Combine with --scaffold_diversity for scaffold/SMILES bucket gating.",
+    )
+    ap.add_argument(
+        "--scaffold_diversity",
+        action="store_true",
+        help="Wrap the chosen reward with REINVENT-style occurrence bucketing "
+             "(see --scaffold_diversity_key).",
+    )
+    ap.add_argument(
+        "--scaffold_bucket_size",
+        type=int,
+        default=10,
+        help="With --scaffold_diversity: max occurrences per scaffold before penalty.",
+    )
+    ap.add_argument(
+        "--scaffold_penalty",
+        type=float,
+        default=0.0,
+        help="With --scaffold_diversity: multiply reward when bucket is full (0 = hard zero).",
+    )
+    ap.add_argument(
+        "--scaffold_window_batches",
+        type=int,
+        default=-1,
+        help="With --scaffold_diversity: rolling memory length in batches (-1 = full run).",
+    )
+    ap.add_argument(
+        "--scaffold_labeled",
+        action="store_true",
+        help="With --scaffold_diversity and --scaffold_diversity_key murcko: "
+             "labeled Murcko scaffold; default is generic carbon skeleton "
+             "(MakeScaffoldGeneric). Ignored for canonical_smiles.",
+    )
+    ap.add_argument(
+        "--scaffold_diversity_key",
+        default="murcko",
+        choices=("murcko", "canonical_smiles"),
+        help="With --scaffold_diversity: bucket identity per molecule — Bemis–Murcko "
+             "scaffold (murcko) or full canonical SMILES (canonical_smiles).",
     )
     ap.add_argument("--wandb", action="store_true", help="Log metrics to wandb.")
     ap.add_argument("--wandb_project", default="chemflow-grpo")
@@ -241,6 +280,27 @@ def main():
             w_init["group"] = args.wandb_group
         wandb.init(**w_init)
 
+    reward_fn = REWARDS[args.reward]
+    if args.scaffold_diversity:
+        if args.scaffold_bucket_size < 1:
+            raise ValueError(
+                f"--scaffold_bucket_size must be >= 1, got {args.scaffold_bucket_size}",
+            )
+        scaffold_window = None if args.scaffold_window_batches < 0 else args.scaffold_window_batches
+        if scaffold_window is not None and scaffold_window < 1:
+            raise ValueError(
+                f"--scaffold_window_batches must be >= 1 or -1 (full run), got "
+                f"{args.scaffold_window_batches}",
+            )
+        reward_fn = scaffold_diversity_wrapper(
+            reward_fn,
+            bucket_size=args.scaffold_bucket_size,
+            penalty=args.scaffold_penalty,
+            generic_scaffold=not args.scaffold_labeled,
+            diversity_bucket=args.scaffold_diversity_key,
+            window_batches=scaffold_window,
+        )
+
     try:
         train(
             module,
@@ -250,7 +310,7 @@ def main():
             lr=args.lr,
             device=args.device,
             log_every=args.log_every,
-            reward_fn=REWARDS[args.reward],
+            reward_fn=reward_fn,
             best_save_path=args.save_best,
             best_ema_beta=args.best_ema_beta,
             best_warmup_steps=args.best_warmup_steps,

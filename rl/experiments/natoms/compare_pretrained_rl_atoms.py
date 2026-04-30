@@ -234,4 +234,4 @@ def main(default_rl_ckpt_name: str = "grpo_best.pt"):
 
 
 if __name__ == "__main__":
-    main(default_rl_ckpt_name="grpo_natoms_seed0_sig0p05_g1_mu2_kl0.05_lr1e-4_maxa60_omitposkl_best.pt")
+    main(default_rl_ckpt_name="grpo_natoms_seed0_sig0p05_g1_mu2_kl0.02_lr1e-4_maxa60_omitposkl_scaff_b10_p0p5_w100_canonsmi_best.pt")

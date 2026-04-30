@@ -169,3 +169,5 @@ wandb/
 *.pt
 slurm_logs/
 diagnostics/
+rl/notes/
+*.png

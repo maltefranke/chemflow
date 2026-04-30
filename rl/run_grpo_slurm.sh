@@ -12,8 +12,12 @@
 # SLURM wrapper for `rl/run_grpo.sh`.  Parameterises `SIGMA_EXPLORE` (position
 # kernel std σ), `SEED`, `GROUP_SIZE`, `KL_COEF` (0 = no KL), `LR`,
 # `UPDATE_PASSES` (PPO-style passes over sampled trajectory), `REWARD`
-# (`shape`, `n_atoms`, …; see rl/rewards.py), `KL_OMIT_POS` (omit KL on position
-# channel vs full KL), optional `PER_ELEMENT_LOGP_MEAN`, and W&B overrides
+# (`shape`, `n_atoms`, …; see rl/rewards.py), optional diversity bucketing
+# (`SCAFFOLD_DIVERSITY`, `SCAFFOLD_DIVERSITY_KEY` murcko or canonical_smiles,
+# `SCAFFOLD_BUCKET_SIZE`, `SCAFFOLD_PENALTY`, `SCAFFOLD_WINDOW_BATCHES`,
+# `SCAFFOLD_LABELED`; maps to `rl.run_grpo --scaffold_*`),
+# `KL_OMIT_POS` (omit KL on position channel vs full KL), optional
+# `PER_ELEMENT_LOGP_MEAN`, and W&B overrides
 # `GRPO_WANDB_PROJECT` / `GRPO_WANDB_GROUP` (same env vars as `sweep_grpo_unkillable.sh`).
 #
 # Examples:
@@ -24,6 +28,10 @@
 #     PER_ELEMENT_LOGP_MEAN=1 SIGMA_EXPLORE=0.05 KL_COEF=0.05 sbatch rl/run_grpo_slurm.sh
 #
 #   GROUP_SIZE=1 is recommended for stable batch-normalized advantages (see grpo.py).
+#
+#   Scaffold / SMILES diversity on top of REWARD (e.g. n_atoms):
+#     SCAFFOLD_DIVERSITY=1 SCAFFOLD_BUCKET_SIZE=10 sbatch rl/run_grpo_slurm.sh
+#     SCAFFOLD_DIVERSITY_KEY=canonical_smiles sbatch rl/run_grpo_slurm.sh  # bucket by full SMILES
 #
 # Default: reward=n_atoms, seed0, sigma_explore=0.05, g1, mu2 (UPDATE_PASSES),
 #          kl=0.05, lr=1e-4, KL_OMIT_POS=1 (--kl_omit_pos: no KL on `pos` channel).
@@ -44,14 +52,45 @@ mkdir -p slurm_logs .rl_ckpts
 SIGMA_EXPLORE="${SIGMA_EXPLORE:-0.05}"
 SEED="${SEED:-0}"
 GROUP_SIZE="${GROUP_SIZE:-1}"
-KL_COEF="${KL_COEF:-0.05}"
+KL_COEF="${KL_COEF:-0.02}"
 LR="${LR:-1e-4}"
-N_UPDATES="${N_UPDATES:-400}"
+N_UPDATES="${N_UPDATES:-100}"
 PER_ELEMENT_LOGP_MEAN="${PER_ELEMENT_LOGP_MEAN:-0}"
 UPDATE_PASSES="${UPDATE_PASSES:-2}"
 REWARD="${REWARD:-n_atoms}"
 # Filename-safe short name (n_atoms → natoms).
 REWARD_SLUG="${REWARD//_/}"
+
+# Murcko scaffold bucket (REINVENT-style); off unless SCAFFOLD_DIVERSITY is truthy.
+SCAFFOLD_DIVERSITY="${SCAFFOLD_DIVERSITY:-1}"
+SCAFFOLD_BUCKET_SIZE="${SCAFFOLD_BUCKET_SIZE:-10}"
+SCAFFOLD_PENALTY="${SCAFFOLD_PENALTY:-0.5}"
+SCAFFOLD_WINDOW_BATCHES="${SCAFFOLD_WINDOW_BATCHES:-50}"
+SCAFFOLD_LABELED="${SCAFFOLD_LABELED:-0}"
+# murcko (default) | canonical_smiles — passed as --scaffold_diversity_key
+SCAFFOLD_DIVERSITY_KEY="${SCAFFOLD_DIVERSITY_KEY:-canonical_smiles}"
+
+SCAFFOLD_FLAG=()
+SCAFFOLD_SUFFIX=""
+if [[ "$SCAFFOLD_DIVERSITY" =~ ^(1|true|yes|on)$ ]]; then
+  PEN_TAG="${SCAFFOLD_PENALTY//./p}"
+  WIN_TAG="${SCAFFOLD_WINDOW_BATCHES//-/m}"
+  SCAFFOLD_SUFFIX="_scaff_b${SCAFFOLD_BUCKET_SIZE}_p${PEN_TAG}_w${WIN_TAG}"
+  SCAFFOLD_FLAG=(
+    --scaffold_diversity
+    --scaffold_diversity_key "$SCAFFOLD_DIVERSITY_KEY"
+    --scaffold_bucket_size "$SCAFFOLD_BUCKET_SIZE"
+    --scaffold_penalty "$SCAFFOLD_PENALTY"
+    --scaffold_window_batches "$SCAFFOLD_WINDOW_BATCHES"
+  )
+  if [[ "$SCAFFOLD_DIVERSITY_KEY" == "canonical_smiles" ]]; then
+    SCAFFOLD_SUFFIX+="_canonsmi"
+  fi
+  if [[ "$SCAFFOLD_LABELED" =~ ^(1|true|yes|on)$ ]]; then
+    SCAFFOLD_FLAG+=(--scaffold_labeled)
+    SCAFFOLD_SUFFIX+="_labeled"
+  fi
+fi
 
 KL_OMIT_POS="${KL_OMIT_POS:-1}"
 KL_OMIT_FLAG=()
@@ -71,13 +110,13 @@ if [[ "$PER_ELEMENT_LOGP_MEAN" =~ ^(1|true|yes|on)$ ]]; then
 fi
 
 SIG_TAG="${SIGMA_EXPLORE//./p}"
-RUN_TAG="phase2-${REWARD_SLUG}-seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_${KL_OMIT_SUFFIX}"
-CKPT_TAG="${REWARD_SLUG}_seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_maxa60_${KL_OMIT_SUFFIX}"
+RUN_TAG="phase2-${REWARD_SLUG}-seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_${KL_OMIT_SUFFIX}${SCAFFOLD_SUFFIX}"
+CKPT_TAG="${REWARD_SLUG}_seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_maxa60_${KL_OMIT_SUFFIX}${SCAFFOLD_SUFFIX}"
 
-GRPO_WANDB_PROJECT="${GRPO_WANDB_PROJECT:-chemflow-grpo-sweep-20260424_111439}"
+GRPO_WANDB_PROJECT="${GRPO_WANDB_PROJECT:-chemflow-grpo-shape_rew}"
 GRPO_WANDB_GROUP="${GRPO_WANDB_GROUP:-}"
 
-echo "host=$(hostname)  gpus=${CUDA_VISIBLE_DEVICES:-unset}  reward=${REWARD}  sigma_explore=${SIGMA_EXPLORE}  seed=${SEED}  group_size=${GROUP_SIZE}  update_passes=${UPDATE_PASSES}  kl_coef=${KL_COEF}  kl_omit_pos=${KL_OMIT_POS}  lr=${LR}  n_updates=${N_UPDATES}  per_element_logp_mean=${PER_ELEMENT_LOGP_MEAN}  run=${RUN_TAG}  wandb_project=${GRPO_WANDB_PROJECT}  wandb_group=${GRPO_WANDB_GROUP:-<none>}"
+echo "host=$(hostname)  gpus=${CUDA_VISIBLE_DEVICES:-unset}  reward=${REWARD}  scaffold_diversity=${SCAFFOLD_DIVERSITY}  scaffold_diversity_key=${SCAFFOLD_DIVERSITY_KEY}  scaffold_bucket_size=${SCAFFOLD_BUCKET_SIZE}  scaffold_penalty=${SCAFFOLD_PENALTY}  scaffold_window_batches=${SCAFFOLD_WINDOW_BATCHES}  scaffold_labeled=${SCAFFOLD_LABELED}  sigma_explore=${SIGMA_EXPLORE}  seed=${SEED}  group_size=${GROUP_SIZE}  update_passes=${UPDATE_PASSES}  kl_coef=${KL_COEF}  kl_omit_pos=${KL_OMIT_POS}  lr=${LR}  n_updates=${N_UPDATES}  per_element_logp_mean=${PER_ELEMENT_LOGP_MEAN}  run=${RUN_TAG}  wandb_project=${GRPO_WANDB_PROJECT}  wandb_group=${GRPO_WANDB_GROUP:-<none>}"
 nvidia-smi -L || true
 
 WANDB_EXTR=()
@@ -92,6 +131,7 @@ uv run --env-file .env python -m rl.run_grpo \
     --seed "$SEED" --group_size "$GROUP_SIZE" --update_passes "$UPDATE_PASSES" --kl_coef "$KL_COEF" \
     "${PER_ELEM_FLAG[@]}" \
     --reward "$REWARD" \
+    "${SCAFFOLD_FLAG[@]}" \
     "${KL_OMIT_FLAG[@]}" \
     --wandb --wandb_project "$GRPO_WANDB_PROJECT" --wandb_name "$RUN_TAG" \
     "${WANDB_EXTR[@]}" \

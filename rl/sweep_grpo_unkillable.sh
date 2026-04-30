@@ -1,38 +1,27 @@
 #!/usr/bin/env bash
 #
 # WRONG:  sbatch rl/sweep_grpo_unkillable.sh
-#   This file has no #SBATCH lines. Slurm will use the default queue (e.g. long-cpu, GPU=0).
+# RIGHT:  ./rl/sweep_grpo_unkillable.sh    (from repo root; submits jobs via rl/run_grpo_slurm.sh)
 #
-# RIGHT:  ./rl/sweep_grpo_unkillable.sh
-#   Run that on a login/head node. It *submits* N separate jobs; each is rl/run_grpo_slurm.sh
-#   (unkillable + GPU per run_grpo_slurm.sh).
+# Minimal GRPO group-size (G) × exploration noise (σ) sweep — scaffold diversity OFF so reward
+# variance is not altered by scaffold penalties (which would confound reading G’s effect).
+# Per-element log-prob mean is OFF unless β has been calibrated for it.
 #
-# Sparse sweep (not a full cross-product): sigma_explore, lr, kl.
-# Each run uses 100 policy updates and 100 integration steps (see run_grpo_slurm.sh, N_UPDATES).
-# Expect ~80 min per run; default SWEEP_TIME 2:00:00 is plenty.
+# Base (fixed): reward=n_atoms, β=KL_COEF=0.05, lr=1e-4, kl_omit_pos=ON (same recipe as your
+#              stable runs — not swept; only G and SIGMA_EXPLORE vary), update_passes=2,
+#              N_UPDATES=50.
 #
-# W&B: each invocation gets its own *project* (a separate "folder" in the UI) so
-# runs do not mix with ad-hoc chemflow-grpo jobs.  Pass a project name as the
-# first argument, or set GRPO_WANDB_PROJECT / SWEEP_STAMP in the environment.
-# All runs in the sweep also share a W&B *group* (same STAMP) for table filters.
+# Primary diagnostic on W&B for G>1: compare reward_within_std vs reward_between_std. If
+# reward_within_std is tiny (≪ reward_between_std, e.g. <10%), within-group signal is weak —
+# G>1 mostly burns compute relative to usable gradient signal.
 #
-# Usage (from the repository root, where `sbatch` and `.env` live):
-#   ./rl/sweep_grpo_unkillable.sh
-#   ./rl/sweep_grpo_unkillable.sh chemflow-grpo-ablate-2026-04-24
-#   SWEEP_STAMP=manual001 ./rl/sweep_grpo_unkillable.sh
-#
-# One-off job (e.g. `--per_element_logp_mean`) in the *same* W&B project as an
-# existing sweep stamp — see `rl/submit_grpo_elementmean_slurm.sh` or set
-# `GRPO_WANDB_PROJECT` / `GRPO_WANDB_GROUP` and `PER_ELEMENT_LOGP_MEAN=1`
-# before `sbatch rl/run_grpo_slurm.sh`.
-#
-# Dry run (print sbatch lines only, do not submit):
-#   DRY_RUN=1 ./rl/sweep_grpo_unkillable.sh
-#   SWEEP_TIME=1:30:00 ./rl/sweep_grpo_unkillable.sh   # per-job time limit (default 2:00:00)
+# Usage:
+#   ./rl/sweep_grpo_unkillable.sh                              # default W&B project: chemflow-grpo-g-only-<stamp>
+#   ./rl/sweep_grpo_unkillable.sh chemflow-grpo-g-only-manual001
+#   SWEEP_STAMP=my001 DRY_RUN=1 ./rl/sweep_grpo_unkillable.sh
 #
 set -euo pipefail
 
-# Catches mistaken `sbatch rl/sweep_grpo_unkillable.sh` (default job name = script basename).
 if [[ -n "${SLURM_JOB_ID:-}" && "${SLURM_JOB_NAME:-}" == "sweep_grpo_unkillable.sh" ]]; then
   echo "error: do not sbatch this file — it is not a GPU batch script (no #SBATCH)." >&2
   echo "  run from repo root:  ./rl/sweep_grpo_unkillable.sh" >&2
@@ -45,55 +34,57 @@ mkdir -p slurm_logs
 
 SLURM_SCRIPT="${REPO_ROOT}/rl/run_grpo_slurm.sh"
 STAMP="${SWEEP_STAMP:-$(date +%Y%m%d_%H%M%S)}"
-GRPO_WANDB_PROJECT="${1:-${GRPO_WANDB_PROJECT:-chemflow-grpo-sweep-${STAMP}}}"
+# Dedicated project keeps G-vs-σ runs separate from scaffold / KL sweeps.
+GRPO_WANDB_PROJECT="${1:-${GRPO_WANDB_PROJECT:-chemflow-grpo-g-only-${STAMP}}}"
 GRPO_WANDB_GROUP="${GRPO_WANDB_GROUP:-$STAMP}"
 export GRPO_WANDB_PROJECT GRPO_WANDB_GROUP
 
-# Columns: SIGMA_EXPLORE  KL_COEF  LR
+# Columns: GROUP_SIZE  SIGMA_EXPLORE — minimal four corners (baseline + three G/noise contrasts).
 CONFIGS=(
-  "0.01 0.05 1e-4"   # very low exploration
-  "0.01 0.05 3e-4"
-  "0.05 0.05 1e-4"
-  "0.05 0.05 3e-4"
-  "0.05 0.1  1e-4"
-  "0.05 0.1  3e-4"
-  "0.1  0.05 1e-4"
-  "0.1  0.05 3e-4"
-  "0.1  0.1  1e-4"
-  "0.1  0.1  3e-4"
+  "1 0.05"
+  "4 0.05"
+  "4 0.10"  
+  "2 0.10"
 )
 
 SEED="${SEED:-0}"
-GROUP_SIZE="${GROUP_SIZE:-1}"
-UPDATE_PASSES="${UPDATE_PASSES:-1}"
+KL_COEF="${KL_COEF:-0.05}"
+LR="${LR:-1e-4}"
+UPDATE_PASSES="${UPDATE_PASSES:-2}"
+N_UPDATES="${N_UPDATES:-50}"
+SCAFFOLD_DIVERSITY="${SCAFFOLD_DIVERSITY:-0}"
+PER_ELEMENT_LOGP_MEAN="${PER_ELEMENT_LOGP_MEAN:-0}"
+# Explicit: run_grpo_slurm.sh also defaults to 1; set here so the sweep is self-contained.
+KL_OMIT_POS="${KL_OMIT_POS:-1}"
 SWEEP_TIME="${SWEEP_TIME:-2:00:00}"
 n_jobs="${#CONFIGS[@]}"
 
-echo "Submitting ${n_jobs} jobs to partition unkillable (from ${SLURM_SCRIPT})"
+echo "Submitting ${n_jobs} jobs (G × σ sweep, scaffold OFF, no per-element)"
 echo "  W&B project: ${GRPO_WANDB_PROJECT}"
 echo "  W&B group:   ${GRPO_WANDB_GROUP}"
+echo "  Fixed: kl=${KL_COEF} lr=${LR} mu=${UPDATE_PASSES} n_updates=${N_UPDATES} kl_omit_pos=${KL_OMIT_POS} seed=${SEED}"
 echo
 
 submit_one() {
-  # Unique Slurm name (no dots: partition/job tools tolerate alnum+_-)
-  local j="s${SIGMA_EXPLORE}_k${KL_COEF}_lr${LR}"
+  local j="g${GROUP_SIZE}_sig${SIGMA_EXPLORE}_kl${KL_COEF}_lr${LR}"
   j="${j//./p}"
   if [[ -n "${DRY_RUN:-}" ]]; then
     echo "DRY: sbatch -t ${SWEEP_TIME} -J grpo-${j} --export=ALL ${SLURM_SCRIPT}"
     return 0
   fi
-  export SIGMA_EXPLORE KL_COEF LR SEED GROUP_SIZE UPDATE_PASSES
-  # Pass full env to the job; keep GRPO_WANDB_* from this script.
+  export SIGMA_EXPLORE GROUP_SIZE KL_COEF LR SEED UPDATE_PASSES N_UPDATES \
+    SCAFFOLD_DIVERSITY PER_ELEMENT_LOGP_MEAN KL_OMIT_POS
   sbatch -t "${SWEEP_TIME}" -J "grpo-${j}" --export=ALL "${SLURM_SCRIPT}"
 }
 
 for cfg in "${CONFIGS[@]}"; do
-  read -r SIGMA_EXPLORE KL_COEF LR <<< "$cfg"
+  read -r GROUP_SIZE SIGMA_EXPLORE <<< "$cfg"
   submit_one
 done
 
 if [[ -n "${DRY_RUN:-}" ]]; then
   echo "DRY_RUN: no jobs were submitted."
 else
-  echo "Done. Check: squeue -u \"\$USER\"  and  https://wandb.ai/<entity>/${GRPO_WANDB_PROJECT}"
+  echo "Done. Compare reward_within_std vs reward_between_std on G>1 runs."
+  echo "  squeue -u \"\$USER\"    https://wandb.ai/<entity>/${GRPO_WANDB_PROJECT}"
 fi
