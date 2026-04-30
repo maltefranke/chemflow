@@ -39,8 +39,8 @@ TARGET_MWS = [100.0, 110.0, 125.0]
 MW_GUIDANCE_SCALES = [0.75, 0.9, 1.1, 1.25]
 
 PROPERTY_GUIDANCE_SCALES = [0.0, 0.5, 1.0, 2.0, 5.0]
-PROP_COLLECT_N_BATCHES = 5   # batches used to derive target-value percentiles
-PROP_EVAL_N_BATCHES = 4      # batches per (target_val, scale) cell
+PROP_COLLECT_N_BATCHES = 5  # batches used to derive target-value percentiles
+PROP_EVAL_N_BATCHES = 4  # batches per (target_val, scale) cell
 
 PLOT_N_MOLS = 500
 PREDICT_BATCH_SIZE = 128
@@ -103,7 +103,7 @@ def _run_property_guidance_eval(
 ) -> tuple[int, int]:
     """Custom predict loop that overrides ``mol_t.y`` with a fixed target
     property value and returns (n_valid, n_total)."""
-    from chemflow.utils import rdkit as chemflowRD
+    from chemflow.utils import rdkit_utils as chemflowRD
 
     n_valid_total = 0
     n_total = 0
@@ -141,7 +141,10 @@ def _run_property_guidance_eval(
                 n_total += 1
                 if rdkit_mol is not None:
                     try:
-                        if chemflowRD.mol_is_valid(rdkit_mol):
+                        if chemflowRD.mol_is_valid(
+                            rdkit_mol,
+                            allow_charged=getattr(module, "allow_charged", False),
+                        ):
                             n_valid_total += 1
                     except Exception:
                         pass
@@ -718,6 +721,7 @@ def eval_cfg(cfg: DictConfig):
     )
 
     # ── model setup ──
+    allow_charged = bool(cfg.data.get("allow_charged", False))
     module = hydra.utils.instantiate(
         cfg.model.module,
         _recursive_=False,
@@ -726,6 +730,7 @@ def eval_cfg(cfg: DictConfig):
         atom_type_weights=atom_type_weights,
         edge_token_weights=edge_token_weights,
         charge_token_weights=charge_token_weights,
+        allow_charged=allow_charged,
     )
 
     ckpt_path = "/capstor/store/cscs/swissai/a131/frankem/chemflow/logs/wandb/poisson_cfg/chemflow/fy8p6jss/checkpoints/epoch=499-step=9500.ckpt"

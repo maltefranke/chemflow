@@ -126,6 +126,9 @@ class CountEmbedding(nn.Module):
         if out_dim is None:
             out_dim = embedding_dim
 
+        self.embedding_dim = embedding_dim
+        self.out_dim = out_dim
+
         self.encoder = SinusoidalEncoding(embedding_dim, max_period)
 
         # Optional: A small MLP to adapt the fixed features to the task
@@ -142,6 +145,105 @@ class CountEmbedding(nn.Module):
 
         x_enc = self.encoder(counts)
         return self.projection(x_enc)
+
+
+class ExtrapolatableCountEmbedding(nn.Module):
+    """Count embedding designed to extrapolate slightly outside the training range.
+
+    The standard :class:`CountEmbedding` concatenates sinusoidal features whose
+    shortest period is ``2π`` (the geometric series of frequencies starts at
+    ``freq=1``).  For small integer counts (e.g. QM9 with counts in ``[3, 29]``)
+    this produces aliased, non-monotonic features: neighbouring counts map to
+    unrelated sin/cos patterns, and counts just outside the training support
+    land on patterns the downstream linear projection has never seen — so it
+    cannot extrapolate.
+
+    This module fixes both issues:
+
+    * It uses a **low-frequency** Fourier basis whose shortest period is larger
+      than the expected training support (``min_period``), so every dimension
+      varies smoothly over the training range and its immediate neighbourhood.
+    * It concatenates a **raw normalised scalar** ``count / max_count``, giving
+      the MLP a strictly linear (monotonic, unbounded) axis to extrapolate
+      along — the Fourier basis only contributes local precision within range.
+
+    With defaults tuned for QM9 (``min_period=64``, ``max_period=512``,
+    ``max_count=32``), counts in ``[0, 32]`` map to half a period at most on
+    any Fourier component, and ``count=30`` — just outside the training
+    support — produces an embedding that is a smooth continuation of the
+    ``count=29`` embedding rather than a novel aliased fingerprint.
+
+    Input:  Long / Float Tensor ``[Batch]`` or ``[Batch, 1]``.
+    Output: Float Tensor ``[Batch, out_dim]``.
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        out_dim: int = None,
+        min_period: float = 64.0,
+        max_period: float = 512.0,
+        max_count: float = 32.0,
+    ):
+        super().__init__()
+        if out_dim is None:
+            out_dim = embedding_dim
+        if embedding_dim % 2 != 0:
+            raise ValueError(
+                f"embedding_dim {embedding_dim} must be even (sin/cos pairs)."
+            )
+        if min_period <= 0 or max_period < min_period:
+            raise ValueError(
+                f"Expected 0 < min_period <= max_period, got "
+                f"min_period={min_period}, max_period={max_period}."
+            )
+        if max_count <= 0:
+            raise ValueError(f"max_count must be > 0, got {max_count}.")
+
+        self.embedding_dim = embedding_dim
+        self.out_dim = out_dim
+        self.min_period = float(min_period)
+        self.max_period = float(max_period)
+        self.max_count = float(max_count)
+
+        # Log-spaced periods in [min_period, max_period].  Highest frequency
+        # has the *shortest* period (= min_period), ensuring every component
+        # stays in a monotonic half-cycle across [0, max_count].
+        half_dim = embedding_dim // 2
+        if half_dim == 1:
+            periods = torch.tensor([min_period], dtype=torch.float32)
+        else:
+            log_pmin = math.log(min_period)
+            log_pmax = math.log(max_period)
+            periods = torch.exp(torch.linspace(log_pmin, log_pmax, half_dim))
+        self.register_buffer("freqs", 2 * math.pi / periods)
+
+        # MLP takes [fourier_features, raw_scalar] and mixes them.  The raw
+        # scalar is the path responsible for linear extrapolation.
+        self.projection = nn.Sequential(
+            nn.Linear(embedding_dim + 1, out_dim),
+            nn.SiLU(),
+            nn.Linear(out_dim, out_dim),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, counts: torch.Tensor) -> torch.Tensor:
+        if counts.ndim == 1:
+            counts = counts.unsqueeze(-1)
+
+        x = counts.float()
+        args = x * self.freqs.unsqueeze(0)
+        fourier = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        scalar = x / self.max_count
+        return self.projection(torch.cat([fourier, scalar], dim=-1))
 
 
 class TimeEmbedding(nn.Module):

@@ -47,7 +47,6 @@ class FlowMatchingDatasetWrapper(Dataset):
             self._n_atoms_min = max(int(nonzero_idx[0].item()) - 5, 3)
             self._n_atoms_max = int(nonzero_idx[-1].item()) + 5
 
-
     def _get_n_atoms(self, target):
         if self.n_atoms_strategy == "fixed":
             return target.num_nodes
@@ -57,7 +56,9 @@ class FlowMatchingDatasetWrapper(Dataset):
         elif self.n_atoms_strategy == "median":
             return self._median_n_atoms
         elif self.n_atoms_strategy == "uniform":
-            return int(torch.randint(self._n_atoms_min, self._n_atoms_max + 1, (1,)).item())
+            return int(
+                torch.randint(self._n_atoms_min, self._n_atoms_max + 1, (1,)).item()
+            )
         else:
             return None
 
