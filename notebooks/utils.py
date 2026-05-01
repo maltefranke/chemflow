@@ -7,7 +7,7 @@ from chemflow.utils.utils import EdgeAligner
 import py3Dmol
 from rdkit import Chem
 
-from chemflow.utils.rdkit import IDX_BOND_MAP as bond_mapping
+from chemflow.utils.rdkit_utils import IDX_BOND_MAP as bond_mapping
 
 _KEKULIZE_EXCEPTIONS = tuple(
     exc
@@ -140,6 +140,52 @@ def visualize_single_mol(mol_data, width=800, height=400):
     view.addModel(mol_block, "sdf")
 
     # Styling
+    view.setStyle({"stick": {"radius": 0.15}, "sphere": {"scale": 0.2}})
+    view.zoomTo()
+
+    return view
+
+
+def visualize_mols_side_by_side(mol_data_list, width=800, height=400, gap=4.0):
+    """
+    One static py3Dmol scene with multiple molecules laid out along +X (no animation).
+
+    Args:
+        mol_data_list: List of dicts in the same format as ``process_mol`` / ``visualize_single_mol``.
+        gap: Extra spacing (Angstrom) between molecular bounding boxes along X.
+    """
+    if not mol_data_list:
+        raise ValueError("mol_data_list is empty")
+
+    view = py3Dmol.view(width=width, height=height)
+    x_cursor = 0.0
+
+    for mol_data in mol_data_list:
+        xs = [float(p[0]) for p in mol_data["pos"]]
+        x_min, x_max = min(xs), max(xs)
+        width_mol = max(x_max - x_min, 1e-3)
+        dx = x_cursor - x_min
+
+        mol = Chem.RWMol()
+
+        for i, symbol in enumerate(mol_data["atoms"]):
+            atom = Chem.Atom(symbol)
+            atom.SetFormalCharge(int(mol_data["charges"][i]))
+            mol.AddAtom(atom)
+
+        for (src, dst), b_type in zip(mol_data["edges"], mol_data["edge_types"]):
+            rdkit_type = bond_mapping.get(b_type, Chem.BondType.SINGLE)
+            mol.AddBond(int(src), int(dst), rdkit_type)
+
+        conf = Chem.Conformer(len(mol_data["atoms"]))
+        for i, (x, y, z) in enumerate(mol_data["pos"]):
+            conf.SetAtomPosition(i, (float(x) + dx, float(y), float(z)))
+        mol.AddConformer(conf)
+
+        mol_block = _mol_to_mol_block_with_single_bond_fallback(mol)
+        view.addModel(mol_block, "sdf")
+        x_cursor += width_mol + gap
+
     view.setStyle({"stick": {"radius": 0.15}, "sphere": {"scale": 0.2}})
     view.zoomTo()
 

@@ -25,7 +25,7 @@ from torch_geometric.data import InMemoryDataset, download_url, extract_zip
 
 from chemflow.dataset.molecule_data import MoleculeData
 from chemflow.dataset.vocab import Vocab, Distributions
-from chemflow.utils.rdkit import mol_is_valid, sanitize_mol_correctly, BOND_IDX_MAP, smiles_from_mol
+from chemflow.utils.rdkit_utils import mol_is_valid, sanitize_mol_correctly, BOND_IDX_MAP, smiles_from_mol
 from scipy.spatial.transform import Rotation
 
 # Maps QM9 property names to their column index in the y tensor after

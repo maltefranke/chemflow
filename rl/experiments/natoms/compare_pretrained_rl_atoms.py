@@ -10,6 +10,8 @@ Or::
     python rl/experiments/natoms/compare_pretrained_rl_atoms.py
 
 Uses the same Hydra stack and checkpoint loading as ``rl/eval_pretrained_validity.py``.
+After each load we set ``module.integrator.max_atoms`` (default ``60``, same as ``rl/run_grpo.py``)
+so insertion overflow matches GRPO inference; pass ``--max_atoms`` to match your RL job.
 Trailing CLI args are forwarded as Hydra overrides (must match how the RL run was trained).
 
 Outputs go under ``<out_dir>/<checkpoint_stem>/`` where ``checkpoint_stem`` is the RL
@@ -67,8 +69,9 @@ def _final_n_atoms(traj: list[Any], vocab) -> int:
     return int(rd.GetNumAtoms()) if rd is not None else 0
 
 
-def _gather_predict_outputs(module, datamodule, cfg, ckpt_path: str, n_mols: int):
+def _gather_predict_outputs(module, datamodule, cfg, ckpt_path: str, n_mols: int, *, max_atoms: int):
     module = load_ckpt_into_module(module, ckpt_path)
+    module.integrator.max_atoms = max_atoms
     bs = int(cfg.data.datamodule.batch_size.test)
     cfg.trainer.trainer.limit_predict_batches = int(math.ceil(n_mols / max(bs, 1)))
     # Match `rl/eval_pretrained_validity.py` (Hydra trainer block includes accelerator/strategy).
@@ -138,11 +141,18 @@ def main(default_rl_ckpt_name: str = "grpo_best.pt"):
         default=None,
         help="Override path for trajectory .pt (default: <out_dir>/<ckpt_stem>/rl_valid_trajectories.pt)",
     )
+    ap.add_argument(
+        "--max_atoms",
+        type=int,
+        default=60,
+        help="integrator.max_atoms after ckpt load (must match RL training; run_grpo uses 60)",
+    )
     ap.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. data.n_atoms_strategy=fixed")
     args = ap.parse_args()
     rl_ckpt = args.rl_ckpt or _default_rl_ckpt(default_rl_ckpt_name)
     print("pretrained ckpt:", os.path.abspath(args.pretrained_ckpt))
     print("RL ckpt:        ", os.path.abspath(rl_ckpt))
+    print("integrator max_atoms:", args.max_atoms)
 
     ckpt_stem = os.path.splitext(os.path.basename(rl_ckpt))[0]
     run_dir = os.path.join(args.out_dir, ckpt_stem)
@@ -152,12 +162,14 @@ def main(default_rl_ckpt_name: str = "grpo_best.pt"):
     # --- Pretrained ---
     module_pt, dm = build_module_and_datamodule(cfg)
     print("loading pretrained ckpt:", os.path.abspath(args.pretrained_ckpt))
-    out_pt = _gather_predict_outputs(module_pt, dm, cfg, args.pretrained_ckpt, args.n_mols)
+    out_pt = _gather_predict_outputs(
+        module_pt, dm, cfg, args.pretrained_ckpt, args.n_mols, max_atoms=args.max_atoms
+    )
 
     # --- RL (fresh module so weights are not mixed) ---
     module_rl, dm_rl = build_module_and_datamodule(cfg)
     print("loading RL ckpt:", os.path.abspath(rl_ckpt))
-    out_rl = _gather_predict_outputs(module_rl, dm_rl, cfg, rl_ckpt, args.n_mols)
+    out_rl = _gather_predict_outputs(module_rl, dm_rl, cfg, rl_ckpt, args.n_mols, max_atoms=args.max_atoms)
 
     # --- Histogram: valid molecules only (same bin edges for both) ---
     valid_n_pt = [_final_n_atoms(t, module_pt.vocab) for t in out_pt["valid_mols"]]
@@ -220,6 +232,7 @@ def main(default_rl_ckpt_name: str = "grpo_best.pt"):
             "pretrained_ckpt": args.pretrained_ckpt,
             "n_mols_requested": args.n_mols,
             "min_atoms": args.min_atoms,
+            "integrator_max_atoms": args.max_atoms,
             "rl_validity": out_rl["validity"],
             "n_saved": len(traj_records),
             "records": traj_records,
@@ -234,4 +247,4 @@ def main(default_rl_ckpt_name: str = "grpo_best.pt"):
 
 
 if __name__ == "__main__":
-    main(default_rl_ckpt_name="grpo_natoms_seed0_sig0p05_g1_mu2_kl0.02_lr1e-4_maxa60_omitposkl_scaff_b10_p0p5_w100_canonsmi_best.pt")
+    main(default_rl_ckpt_name="grpo_natoms_seed0_sig0p05_g8_mu2_kl0.02_lr1e-4_maxa60_omitposkl_scaff_b10_p0p5_w50_canonsmi_best.pt")

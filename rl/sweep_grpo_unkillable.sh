@@ -3,22 +3,22 @@
 # WRONG:  sbatch rl/sweep_grpo_unkillable.sh
 # RIGHT:  ./rl/sweep_grpo_unkillable.sh    (from repo root; submits jobs via rl/run_grpo_slurm.sh)
 #
-# Minimal GRPO group-size (G) × exploration noise (σ) sweep — scaffold diversity OFF so reward
-# variance is not altered by scaffold penalties (which would confound reading G’s effect).
-# Per-element log-prob mean is OFF unless β has been calibrated for it.
+# Four-run batch: tighten around g8 vs g4 winners (canonical_smiles scaffold diversity on).
 #
-# Base (fixed): reward=n_atoms, β=KL_COEF=0.05, lr=1e-4, kl_omit_pos=ON (same recipe as your
-#              stable runs — not swept; only G and SIGMA_EXPLORE vary), update_passes=2,
-#              N_UPDATES=50.
+#   A — g8, kl=0.02, σ=0.05   official g8 comparison
+#   B — g8, kl=0.03, σ=0.05   safer KL (regularization vs late validity crash)
+#   C — g4, kl=0.03, σ=0.05   current-best analogue + safer KL
+#   D — g4, kl=0.02, σ=0.03   lower exploration vs late invalidity spike
 #
-# Primary diagnostic on W&B for G>1: compare reward_within_std vs reward_between_std. If
-# reward_within_std is tiny (≪ reward_between_std, e.g. <10%), within-group signal is weak —
-# G>1 mostly burns compute relative to usable gradient signal.
+# Fixed across runs: LR=1e-4, UPDATE_PASSES=2, N_UPDATES=200,
+# scaffold_b10_p0.5_w50 canonical_smiles, KL_OMIT_POS=1 unless overridden by env.
 #
 # Usage:
-#   ./rl/sweep_grpo_unkillable.sh                              # default W&B project: chemflow-grpo-g-only-<stamp>
-#   ./rl/sweep_grpo_unkillable.sh chemflow-grpo-g-only-manual001
+#   ./rl/sweep_grpo_unkillable.sh
+#   ./rl/sweep_grpo_unkillable.sh chemflow-grpo-other-project   # override W&B project
 #   SWEEP_STAMP=my001 DRY_RUN=1 ./rl/sweep_grpo_unkillable.sh
+#
+# Default W&B project matches rl/run_grpo_slurm.sh (change both if you retarget logs).
 #
 set -euo pipefail
 
@@ -34,35 +34,48 @@ mkdir -p slurm_logs
 
 SLURM_SCRIPT="${REPO_ROOT}/rl/run_grpo_slurm.sh"
 STAMP="${SWEEP_STAMP:-$(date +%Y%m%d_%H%M%S)}"
-# Dedicated project keeps G-vs-σ runs separate from scaffold / KL sweeps.
-GRPO_WANDB_PROJECT="${1:-${GRPO_WANDB_PROJECT:-chemflow-grpo-g-only-${STAMP}}}"
+# Same fallback as rl/run_grpo_slurm.sh GRPO_WANDB_PROJECT
+GRPO_WANDB_PROJECT="${1:-${GRPO_WANDB_PROJECT:-chemflow-grpo-sweep-20260424_111439}}"
 GRPO_WANDB_GROUP="${GRPO_WANDB_GROUP:-$STAMP}"
 export GRPO_WANDB_PROJECT GRPO_WANDB_GROUP
 
-# Columns: GROUP_SIZE  SIGMA_EXPLORE — minimal four corners (baseline + three G/noise contrasts).
+# Columns: GROUP_SIZE  KL_COEF  SIGMA_EXPLORE (see header for A–D labels).
 CONFIGS=(
-  "1 0.05"
-  "4 0.05"
-  "4 0.10"  
-  "2 0.10"
+  "# A official g8"
+  "8 0.02 0.05"
+  "# B safer g8"
+  "8 0.03 0.05"
+  "# C safer g4"
+  "4 0.03 0.05"
+  "# D lower-noise g4"
+  "4 0.02 0.03"
 )
-
+ 
 SEED="${SEED:-0}"
-KL_COEF="${KL_COEF:-0.05}"
 LR="${LR:-1e-4}"
 UPDATE_PASSES="${UPDATE_PASSES:-2}"
-N_UPDATES="${N_UPDATES:-50}"
-SCAFFOLD_DIVERSITY="${SCAFFOLD_DIVERSITY:-0}"
+N_UPDATES="${N_UPDATES:-200}"
+SCAFFOLD_DIVERSITY="${SCAFFOLD_DIVERSITY:-1}"
+SCAFFOLD_DIVERSITY_KEY="${SCAFFOLD_DIVERSITY_KEY:-canonical_smiles}"
+SCAFFOLD_BUCKET_SIZE="${SCAFFOLD_BUCKET_SIZE:-10}"
+SCAFFOLD_PENALTY="${SCAFFOLD_PENALTY:-0.5}"
+SCAFFOLD_WINDOW_BATCHES="${SCAFFOLD_WINDOW_BATCHES:-50}"
 PER_ELEMENT_LOGP_MEAN="${PER_ELEMENT_LOGP_MEAN:-0}"
-# Explicit: run_grpo_slurm.sh also defaults to 1; set here so the sweep is self-contained.
 KL_OMIT_POS="${KL_OMIT_POS:-1}"
-SWEEP_TIME="${SWEEP_TIME:-2:00:00}"
-n_jobs="${#CONFIGS[@]}"
+SWEEP_TIME="${SWEEP_TIME:-6:00:00}"
 
-echo "Submitting ${n_jobs} jobs (G × σ sweep, scaffold OFF, no per-element)"
+# Count non-comment configs.
+n_jobs=0
+for cfg in "${CONFIGS[@]}"; do
+  [[ "$cfg" =~ ^# ]] && continue
+  n_jobs=$((n_jobs + 1))
+done
+
+echo "Submitting ${n_jobs} jobs (g × kl × σ, scaffold canonical_smiles b${SCAFFOLD_BUCKET_SIZE})"
 echo "  W&B project: ${GRPO_WANDB_PROJECT}"
 echo "  W&B group:   ${GRPO_WANDB_GROUP}"
-echo "  Fixed: kl=${KL_COEF} lr=${LR} mu=${UPDATE_PASSES} n_updates=${N_UPDATES} kl_omit_pos=${KL_OMIT_POS} seed=${SEED}"
+echo "  Fixed: lr=${LR} mu=${UPDATE_PASSES} n_updates=${N_UPDATES} kl_omit_pos=${KL_OMIT_POS} seed=${SEED}"
+echo "  Scaffold: penalty=${SCAFFOLD_PENALTY} window_batches=${SCAFFOLD_WINDOW_BATCHES}"
 echo
 
 submit_one() {
@@ -73,18 +86,22 @@ submit_one() {
     return 0
   fi
   export SIGMA_EXPLORE GROUP_SIZE KL_COEF LR SEED UPDATE_PASSES N_UPDATES \
-    SCAFFOLD_DIVERSITY PER_ELEMENT_LOGP_MEAN KL_OMIT_POS
+    SCAFFOLD_DIVERSITY SCAFFOLD_DIVERSITY_KEY SCAFFOLD_BUCKET_SIZE SCAFFOLD_PENALTY \
+    SCAFFOLD_WINDOW_BATCHES PER_ELEMENT_LOGP_MEAN KL_OMIT_POS
   sbatch -t "${SWEEP_TIME}" -J "grpo-${j}" --export=ALL "${SLURM_SCRIPT}"
 }
 
 for cfg in "${CONFIGS[@]}"; do
-  read -r GROUP_SIZE SIGMA_EXPLORE <<< "$cfg"
+  if [[ "$cfg" =~ ^# ]]; then
+    continue
+  fi
+  read -r GROUP_SIZE KL_COEF SIGMA_EXPLORE <<< "$cfg"
   submit_one
 done
 
 if [[ -n "${DRY_RUN:-}" ]]; then
   echo "DRY_RUN: no jobs were submitted."
 else
-  echo "Done. Compare reward_within_std vs reward_between_std on G>1 runs."
+  echo "Done. Compare runs A–D on W&B (${GRPO_WANDB_PROJECT})."
   echo "  squeue -u \"\$USER\"    https://wandb.ai/<entity>/${GRPO_WANDB_PROJECT}"
 fi

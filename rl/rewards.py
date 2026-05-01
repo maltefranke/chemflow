@@ -40,7 +40,7 @@ def _iter_valid_mols(
     module, trajectory,
 ) -> Iterator[tuple[Optional[Chem.Mol], bool]]:
     """Yield (rdkit_mol_or_None, is_valid) for each graph in `mol_final`."""
-    from chemflow.utils import rdkit as chemflowRD  # noqa: N812
+    from chemflow.utils import rdkit_utils as chemflowRD  # noqa: N812
 
     v = module.vocab
     for mol_i in trajectory.mol_final.to_data_list():
