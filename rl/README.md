@@ -50,6 +50,7 @@ Built-in rewards gate on RDKit validity (invalid samples get zero reward). `--sc
 | `--config_path`, `--config_name` | Hydra (`configs` / `default` by default). |
 | `--n_updates` | Policy gradient steps. |
 | `--num_steps` | Integration steps per rollout (`None` = module default). |
+| `--max_atoms` | Maximum atoms allowed by the variable-atom integrator. |
 | `--lr` | Optimizer learning rate. |
 | `--sigma_explore` | Position kernel std σ for `N(x+v·dt, σ²I)`. |
 | `--clip_eps` | Clip range on probability ratios. |
@@ -72,7 +73,7 @@ Built-in rewards gate on RDKit validity (invalid samples get zero reward). `--sc
 | `--best_ema_beta`, `--best_warmup_steps` | EMA and warmup for `--save_best`. |
 | trailing `overrides` | Hydra (e.g. `data.datamodule.batch_size.test=128`). |
 
-After load, `run_grpo` sets `module.integrator.max_atoms = 60`.
+After load, `run_grpo` sets `module.integrator.max_atoms` from `--max_atoms` (default `60`).
 
 ### Slurm: `run_grpo_slurm.sh` (environment variables)
 
@@ -80,7 +81,7 @@ Export or prefix before `sbatch rl/run_grpo_slurm.sh` (see script for defaults):
 
 | Variable | Role |
 |----------|------|
-| `SIGMA_EXPLORE`, `SEED`, `LR`, `N_UPDATES` | Noise, reproducibility, learning rate, number of GRPO updates. |
+| `SIGMA_EXPLORE`, `SEED`, `LR`, `N_UPDATES`, `MAX_ATOMS` | Noise, reproducibility, learning rate, number of GRPO updates, atom cap. |
 | `GROUP_SIZE`, `UPDATE_PASSES`, `KL_COEF`, `KL_OMIT_POS` | Group advantage normalization, multi-pass optimization, KL strength, KL on positions or not. |
 | `PER_ELEMENT_LOGP_MEAN` | Truthy → `--per_element_logp_mean`. |
 | `REWARD` | Maps to `--reward`. |

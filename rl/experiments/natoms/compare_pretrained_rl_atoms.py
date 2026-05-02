@@ -46,6 +46,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pytorch_lightning as pl
 import torch
+from matplotlib.ticker import MaxNLocator
 from omegaconf import OmegaConf
 
 from rl.eval_pretrained_validity import (
@@ -144,8 +145,8 @@ def main(default_rl_ckpt_name: str = "grpo_best.pt"):
     ap.add_argument(
         "--max_atoms",
         type=int,
-        default=60,
-        help="integrator.max_atoms after ckpt load (must match RL training; run_grpo uses 60)",
+        default=100,
+        help="integrator.max_atoms after ckpt load (must match the RL run's --max_atoms)",
     )
     ap.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. data.n_atoms_strategy=fixed")
     args = ap.parse_args()
@@ -188,14 +189,17 @@ def main(default_rl_ckpt_name: str = "grpo_best.pt"):
         hist_pt, _ = np.histogram(valid_n_pt, bins=bins)
         hist_rl, _ = np.histogram(valid_n_rl, bins=bins)
         centers = np.arange(n_min, n_max + 1)
-    x = np.arange(len(centers))
+    x = centers.astype(float)
     w = 0.36
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    # Keep one bar per integer atom count, but avoid one tick label per bar when the
+    # valid molecules span a large atom-count range.
+    fig_width = min(max(10.0, 0.18 * len(centers)), 16.0)
+    fig, ax = plt.subplots(figsize=(fig_width, 5))
     ax.bar(x - w / 2, hist_pt, width=w, color="#9e9e9e", label="base trained", align="center")
     ax.bar(x + w / 2, hist_rl, width=w, color="#1f77b4", label="RL finetuned", align="center")
-    ax.set_xticks(x)
-    ax.set_xticklabels([str(int(c)) for c in centers])
+    ax.set_xlim(float(centers[0]) - 1.0, float(centers[-1]) + 1.0)
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=14, integer=True))
     ax.set_xlabel("Number of atoms (final frame)")
     ax.set_ylabel("Count (valid only)")
     ax.set_title(
@@ -247,4 +251,4 @@ def main(default_rl_ckpt_name: str = "grpo_best.pt"):
 
 
 if __name__ == "__main__":
-    main(default_rl_ckpt_name="grpo_natoms_seed0_sig0p05_g8_mu2_kl0.02_lr1e-4_maxa60_omitposkl_scaff_b10_p0p5_w50_canonsmi_best.pt")
+    main(default_rl_ckpt_name="grpo_natoms_seed0_sig0p05_g8_mu2_kl0.02_lr1e-4_maxa100-continue3-omitposkl_scaff_b10_p0p5_w50_canonsmi_best.pt")

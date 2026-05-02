@@ -177,4 +177,5 @@ rl/experiments/shape/grpo_*/
 # Loose PNGs beside notebooks (preferred: write under grpo_* only)
 rl/experiments/natoms/*.png
 rl/experiments/shape/*.png
-*.png
+
+.codex

@@ -55,6 +55,7 @@ SEED="${SEED:-0}"
 LR="${LR:-1e-4}"
 UPDATE_PASSES="${UPDATE_PASSES:-2}"
 N_UPDATES="${N_UPDATES:-200}"
+MAX_ATOMS="${MAX_ATOMS:-60}"
 SCAFFOLD_DIVERSITY="${SCAFFOLD_DIVERSITY:-1}"
 SCAFFOLD_DIVERSITY_KEY="${SCAFFOLD_DIVERSITY_KEY:-canonical_smiles}"
 SCAFFOLD_BUCKET_SIZE="${SCAFFOLD_BUCKET_SIZE:-10}"
@@ -74,7 +75,7 @@ done
 echo "Submitting ${n_jobs} jobs (g × kl × σ, scaffold canonical_smiles b${SCAFFOLD_BUCKET_SIZE})"
 echo "  W&B project: ${GRPO_WANDB_PROJECT}"
 echo "  W&B group:   ${GRPO_WANDB_GROUP}"
-echo "  Fixed: lr=${LR} mu=${UPDATE_PASSES} n_updates=${N_UPDATES} kl_omit_pos=${KL_OMIT_POS} seed=${SEED}"
+echo "  Fixed: lr=${LR} mu=${UPDATE_PASSES} n_updates=${N_UPDATES} max_atoms=${MAX_ATOMS} kl_omit_pos=${KL_OMIT_POS} seed=${SEED}"
 echo "  Scaffold: penalty=${SCAFFOLD_PENALTY} window_batches=${SCAFFOLD_WINDOW_BATCHES}"
 echo
 
@@ -86,6 +87,7 @@ submit_one() {
     return 0
   fi
   export SIGMA_EXPLORE GROUP_SIZE KL_COEF LR SEED UPDATE_PASSES N_UPDATES \
+    MAX_ATOMS \
     SCAFFOLD_DIVERSITY SCAFFOLD_DIVERSITY_KEY SCAFFOLD_BUCKET_SIZE SCAFFOLD_PENALTY \
     SCAFFOLD_WINDOW_BATCHES PER_ELEMENT_LOGP_MEAN KL_OMIT_POS
   sbatch -t "${SWEEP_TIME}" -J "grpo-${j}" --export=ALL "${SLURM_SCRIPT}"

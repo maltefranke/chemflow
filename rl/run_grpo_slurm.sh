@@ -11,7 +11,7 @@
 
 # SLURM wrapper for `rl/run_grpo.sh`.  Parameterises `SIGMA_EXPLORE` (position
 # kernel std σ), `SEED`, `GROUP_SIZE`, `KL_COEF` (0 = no KL), `LR`,
-# `UPDATE_PASSES` (PPO-style passes over sampled trajectory), `REWARD`
+# `UPDATE_PASSES` (PPO-style passes over sampled trajectory), `MAX_ATOMS`, `REWARD`
 # (`shape`, `n_atoms`, …; see rl/rewards.py), optional diversity bucketing
 # (`SCAFFOLD_DIVERSITY`, `SCAFFOLD_DIVERSITY_KEY` murcko or canonical_smiles,
 # `SCAFFOLD_BUCKET_SIZE`, `SCAFFOLD_PENALTY`, `SCAFFOLD_WINDOW_BATCHES`,
@@ -55,9 +55,10 @@ GROUP_SIZE="${GROUP_SIZE:-8}"
 KL_COEF="${KL_COEF:-0.02}"
 LR="${LR:-1e-4}"
 N_UPDATES="${N_UPDATES:-200}"
+MAX_ATOMS="${MAX_ATOMS:-100}"
 PER_ELEMENT_LOGP_MEAN="${PER_ELEMENT_LOGP_MEAN:-0}"
 UPDATE_PASSES="${UPDATE_PASSES:-2}"
-REWARD="${REWARD:-n_atoms}"
+REWARD="${REWARD:-shape}"
 # Filename-safe short name (n_atoms → natoms).
 REWARD_SLUG="${REWARD//_/}"
 
@@ -110,13 +111,13 @@ if [[ "$PER_ELEMENT_LOGP_MEAN" =~ ^(1|true|yes|on)$ ]]; then
 fi
 
 SIG_TAG="${SIGMA_EXPLORE//./p}"
-RUN_TAG="phase2-${REWARD_SLUG}-seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_${KL_OMIT_SUFFIX}${SCAFFOLD_SUFFIX}"
-CKPT_TAG="${REWARD_SLUG}_seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_maxa60-continue_${KL_OMIT_SUFFIX}${SCAFFOLD_SUFFIX}"
+RUN_TAG="${REWARD_SLUG}-seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_maxa${MAX_ATOMS}_${KL_OMIT_SUFFIX}${SCAFFOLD_SUFFIX}"
+CKPT_TAG="${REWARD_SLUG}_seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_maxa${MAX_ATOMS}-${KL_OMIT_SUFFIX}${SCAFFOLD_SUFFIX}"
 
-GRPO_WANDB_PROJECT="${GRPO_WANDB_PROJECT:-chemflow-grpo-sweep-20260424_111439}"
+GRPO_WANDB_PROJECT="${GRPO_WANDB_PROJECT:-chemflow-grpo-shape_rew}"
 GRPO_WANDB_GROUP="${GRPO_WANDB_GROUP:-}"
 
-echo "host=$(hostname)  gpus=${CUDA_VISIBLE_DEVICES:-unset}  reward=${REWARD}  scaffold_diversity=${SCAFFOLD_DIVERSITY}  scaffold_diversity_key=${SCAFFOLD_DIVERSITY_KEY}  scaffold_bucket_size=${SCAFFOLD_BUCKET_SIZE}  scaffold_penalty=${SCAFFOLD_PENALTY}  scaffold_window_batches=${SCAFFOLD_WINDOW_BATCHES}  scaffold_labeled=${SCAFFOLD_LABELED}  sigma_explore=${SIGMA_EXPLORE}  seed=${SEED}  group_size=${GROUP_SIZE}  update_passes=${UPDATE_PASSES}  kl_coef=${KL_COEF}  kl_omit_pos=${KL_OMIT_POS}  lr=${LR}  n_updates=${N_UPDATES}  per_element_logp_mean=${PER_ELEMENT_LOGP_MEAN}  run=${RUN_TAG}  wandb_project=${GRPO_WANDB_PROJECT}  wandb_group=${GRPO_WANDB_GROUP:-<none>}"
+echo "host=$(hostname)  gpus=${CUDA_VISIBLE_DEVICES:-unset}  reward=${REWARD}  scaffold_diversity=${SCAFFOLD_DIVERSITY}  scaffold_diversity_key=${SCAFFOLD_DIVERSITY_KEY}  scaffold_bucket_size=${SCAFFOLD_BUCKET_SIZE}  scaffold_penalty=${SCAFFOLD_PENALTY}  scaffold_window_batches=${SCAFFOLD_WINDOW_BATCHES}  scaffold_labeled=${SCAFFOLD_LABELED}  sigma_explore=${SIGMA_EXPLORE}  seed=${SEED}  group_size=${GROUP_SIZE}  update_passes=${UPDATE_PASSES}  kl_coef=${KL_COEF}  kl_omit_pos=${KL_OMIT_POS}  lr=${LR}  n_updates=${N_UPDATES}  max_atoms=${MAX_ATOMS}  per_element_logp_mean=${PER_ELEMENT_LOGP_MEAN}  run=${RUN_TAG}  wandb_project=${GRPO_WANDB_PROJECT}  wandb_group=${GRPO_WANDB_GROUP:-<none>}"
 nvidia-smi -L || true
 
 WANDB_EXTR=()
@@ -125,8 +126,8 @@ if [[ -n "$GRPO_WANDB_GROUP" ]]; then
 fi
 
 uv run --env-file .env python -m rl.run_grpo \
-    --ckpt .rl_ckpts/grpo_natoms_seed0_sig0p05_g8_mu2_kl0.02_lr1e-4_maxa60_omitposkl_scaff_b10_p0p5_w50_canonsmi.pt \
-    --n_updates "$N_UPDATES" --num_steps 100 --sigma_explore "$SIGMA_EXPLORE" --lr "$LR" \
+    --ckpt .pretrained_model/epoch=499-step=48500.ckpt \
+    --n_updates "$N_UPDATES" --num_steps 100 --max_atoms "$MAX_ATOMS" --sigma_explore "$SIGMA_EXPLORE" --lr "$LR" \
     --max_grad_norm 1.0 \
     --seed "$SEED" --group_size "$GROUP_SIZE" --update_passes "$UPDATE_PASSES" --kl_coef "$KL_COEF" \
     "${PER_ELEM_FLAG[@]}" \

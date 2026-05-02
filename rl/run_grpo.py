@@ -143,6 +143,12 @@ def main():
     ap.add_argument("--n_updates", type=int, default=100)
     ap.add_argument("--num_steps", type=int, default=None,
                     help="Integration steps per rollout; default = module's own setting")
+    ap.add_argument(
+        "--max_atoms",
+        type=int,
+        default=60,
+        help="Maximum atoms allowed by the variable-atom integrator during GRPO.",
+    )
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument(
         "--sigma_explore",
@@ -250,7 +256,7 @@ def main():
     cfg = compose_cfg(args.config_path, args.config_name, overrides=list(args.overrides))
     module, datamodule = build_module_and_datamodule(cfg)
     module = load_ckpt_into_module(module, args.ckpt)
-    module.integrator.max_atoms = 60
+    module.integrator.max_atoms = args.max_atoms
 
     if args.group_size < 1:
         raise ValueError(f"--group_size must be >= 1, got {args.group_size}")
