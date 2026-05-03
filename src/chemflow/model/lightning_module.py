@@ -92,6 +92,7 @@ class LightningModuleRates(pl.LightningModule):
         use_ema_for_eval: bool = True,
         use_time_weights: bool = False,
         exclude_scaffold_from_sub_loss: bool = False,
+        exclude_scaffold_from_x_loss: bool = False,
     ):
         super().__init__()
 
@@ -113,6 +114,7 @@ class LightningModuleRates(pl.LightningModule):
         self.gmm_params = gmm_params
         self.n_atoms_strategy = n_atoms_strategy
         self.exclude_scaffold_from_sub_loss = exclude_scaffold_from_sub_loss
+        self.exclude_scaffold_from_x_loss = exclude_scaffold_from_x_loss
         self.time_dist = hydra.utils.instantiate(time_dist)
 
         self.integrator = hydra.utils.instantiate(
@@ -547,18 +549,21 @@ class LightningModuleRates(pl.LightningModule):
         # 4. Calculate the flow matching loss
         # Only compute the loss for nodes that are not to be deleted
         # NOTE Edge case all deletes would lead to unused params error, but is highly unlikely
+        _x_mask = non_del_mask
+        if self.exclude_scaffold_from_x_loss and _scaffold_mask is not None:
+            _x_mask = _x_mask & ~_scaffold_mask.bool()
+
         x_loss = F.mse_loss(
-            x_pred[non_del_mask], mols_1.x[non_del_mask], reduction="none"
+            x_pred[_x_mask], mols_1.x[_x_mask], reduction="none"
         )
         x_loss = unsorted_segment_mean(
-            x_loss, mols_t.batch[non_del_mask], mols_t.num_graphs
+            x_loss, mols_t.batch[_x_mask], mols_t.num_graphs
         )
         # Keep only graphs that have at least one node contributing to x_loss
-        # (i.e., at least one node that is not marked for deletion).
         x_batch_mask = torch.zeros(
             mols_t.num_graphs, dtype=torch.bool, device=self.device
         )
-        x_batch_mask[mols_t.batch[non_del_mask]] = True
+        x_batch_mask[mols_t.batch[_x_mask]] = True
 
         if not x_batch_mask.any():
             x_loss = 0.0 * sum(p.sum() for p in self.model.pos_head.parameters())

@@ -3,7 +3,7 @@
 #SBATCH --job-name=chemflow-rates
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=10
-#SBATCH --time=24:00:00
+#SBATCH --time=96:00:00
 #SBATCH --mem-per-cpu=4GB
 #SBATCH --gpus=rtx_4090:4
 ##SBATCH --gpus=rtx_2080_ti:1
@@ -14,4 +14,4 @@ cd /cluster/project/jorner/schmiste/flexflow/chemflow
 source .env
 source .venv/bin/activate
 
-uv run --active --env-file .env run.py data=qm9_scaffold trainer.trainer.max_epochs=900 model.integrator.num_integration_steps=300 model.integrator.time_strategy=log model=semla # model=transformer dit logging.offline=true
+uv run --active --env-file .env run.py data=qm9_scaffold_growth trainer.trainer.max_epochs=3000 model.integrator.num_integration_steps=300 model.integrator.time_strategy=log model=semla # model=transformer dit logging.offline=true

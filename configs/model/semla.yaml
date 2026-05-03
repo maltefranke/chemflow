@@ -102,7 +102,8 @@ module:
 
   # Loss component weights
   use_learnable_loss_weights: false
-  exclude_scaffold_from_sub_loss: false
+  exclude_scaffold_from_sub_loss: true
+  exclude_scaffold_from_x_loss: true
   
   
   loss_weights:
