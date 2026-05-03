@@ -7,6 +7,7 @@ from concurrent.futures import ProcessPoolExecutor
 import torch
 import pandas as pd
 from rdkit import Chem, RDLogger
+from rdkit.Chem import AllChem
 from torchmetrics import Metric
 from torchmetrics import MetricCollection
 
@@ -230,6 +231,91 @@ def _is_valid_float(num):
     return num not in [None, float("inf"), float("-inf"), float("nan")]
 
 
+### old semla functions
+def SEMLA_mol_is_valid(mol: Chem.rdchem.Mol, with_hs: bool = True, connected: bool = True) -> bool:
+    """Whether the mol can be sanitised and, optionally, whether it's fully connected
+
+    Args:
+        mol (Chem.Mol): RDKit molecule to check
+        with_hs (bool): Whether to check validity including hydrogens (if they are in the input mol), default True
+        connected (bool): Whether to also assert that the mol must not have disconnected atoms, default True
+
+    Returns:
+        bool: Whether the mol is valid
+    """
+
+    if mol is None:
+        return False
+
+    mol_copy = Chem.Mol(mol)
+    if not with_hs:
+        mol_copy = Chem.RemoveAllHs(mol_copy)
+
+    try:
+        AllChem.SanitizeMol(mol_copy)
+    except Exception:
+        return False
+
+    n_frags = len(AllChem.GetMolFrags(mol_copy))
+    if connected and n_frags != 1:
+        return False
+
+    return True
+
+SEMLA_ALLOWED_VALENCIES = {
+    "H": {0: 1, 1: 0, -1: 0},
+    "C": {0: [3, 4], 1: 3, -1: 3},
+    "N": {0: [2, 3], 1: [2, 3, 4], -1: 2},  # In QM9, N+ seems to be present in the form NH+ and NH2+
+    "O": {0: 2, 1: 3, -1: 1},
+    "F": {0: 1, -1: 0},
+    "B": 3,
+    "Al": 3,
+    "Si": 4,
+    "P": {0: [3, 5], 1: 4},
+    "S": {0: [2, 6], 1: [2, 3], 2: 4, 3: 5, -1: 3},
+    "Cl": 1,
+    "As": 3,
+    "Br": {0: 1, 1: 2},
+    "I": 1,
+    "Hg": [1, 2],
+    "Bi": [3, 5],
+    "Se": [2, 4, 6],
+}
+
+def _SEMLA_is_valid_valence(valence, allowed, charge):
+    if isinstance(allowed, int):
+        valid = allowed == valence
+
+    elif isinstance(allowed, list):
+        valid = valence in allowed
+
+    elif isinstance(allowed, dict):
+        allowed = allowed.get(charge)
+        if allowed is None:
+            return False
+
+        valid = _SEMLA_is_valid_valence(valence, allowed, charge)
+
+    return valid
+
+def SEMLA_calc_atom_stabilities(mol):
+    stabilities = []
+
+    for atom in mol.GetAtoms():
+        atom_type = atom.GetSymbol()
+        valence = atom.GetExplicitValence()
+        charge = atom.GetFormalCharge()
+
+        if atom_type not in SEMLA_ALLOWED_VALENCIES:
+            stabilities.append(False)
+            continue
+
+        allowed = SEMLA_ALLOWED_VALENCIES[atom_type]
+        atom_stable = _SEMLA_is_valid_valence(valence, allowed, charge)
+        stabilities.append(atom_stable)
+
+    return stabilities 
+
 class GenerativeMetric(Metric):
     # TODO add metric attributes - see torchmetrics doc
 
@@ -287,6 +373,77 @@ class MoleculeStability(Metric):
         mol_stables = [sum(atom_stbs) == len(atom_stbs) for atom_stbs in stabilities]
         self.mol_stable += sum(mol_stables)
         self.total += len(mol_stables)
+
+    def compute(self) -> torch.Tensor:
+        return self.mol_stable.float() / self.total
+
+
+class SEMLAValidity(GenerativeMetric):
+    """Validity using SEMLA's sanitisation + connectedness rule (no charge / radical filter)."""
+
+    def __init__(self, with_hs: bool = True, connected: bool = True, **kwargs):
+        super().__init__(**kwargs)
+        self.with_hs = with_hs
+        self.connected = connected
+        self.add_state("valid", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("total", default=torch.tensor(0), dist_reduce_fx="sum")
+
+    def update(self, mols: list[Chem.rdchem.Mol]) -> None:
+        is_valid = [
+            SEMLA_mol_is_valid(mol, with_hs=self.with_hs, connected=self.connected)
+            for mol in mols
+        ]
+        self.valid += sum(is_valid)
+        self.total += len(mols)
+
+    def compute(self) -> torch.Tensor:
+        return self.valid.float() / self.total
+
+
+class SEMLAAtomStability(GenerativeMetric):
+    """Atom-stability using SEMLA's per-element valence table. Takes mols directly."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.add_state("atom_stable", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("total", default=torch.tensor(0), dist_reduce_fx="sum")
+
+    def update(self, mols: list[Chem.rdchem.Mol]) -> None:
+        for mol in mols:
+            if mol is None:
+                continue
+            try:
+                stabilities = SEMLA_calc_atom_stabilities(mol)
+            except Exception:
+                continue
+            self.atom_stable += sum(stabilities)
+            self.total += len(stabilities)
+
+    def compute(self) -> torch.Tensor:
+        return self.atom_stable.float() / self.total
+
+
+class SEMLAMoleculeStability(GenerativeMetric):
+    """Fraction of mols where every atom passes SEMLA's valence check. Takes mols directly."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.add_state("mol_stable", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("total", default=torch.tensor(0), dist_reduce_fx="sum")
+
+    def update(self, mols: list[Chem.rdchem.Mol]) -> None:
+        for mol in mols:
+            if mol is None:
+                self.total += 1
+                continue
+            try:
+                stabilities = SEMLA_calc_atom_stabilities(mol)
+            except Exception:
+                self.total += 1
+                continue
+            if len(stabilities) > 0 and all(stabilities):
+                self.mol_stable += 1
+            self.total += 1
 
     def compute(self) -> torch.Tensor:
         return self.mol_stable.float() / self.total
@@ -780,6 +937,9 @@ def init_metrics(
 
     metrics = {
         "validity": Validity(allow_charged=allow_charged),
+        "semla-validity": SEMLAValidity(),
+        "semla-atom-stability": SEMLAAtomStability(),
+        "semla-molecule-stability": SEMLAMoleculeStability(),
         "uniqueness": Uniqueness(),
         **({"novelty": Novelty(train_smiles)} if train_smiles is not None else {}),
         "energy-validity": EnergyValidity(),

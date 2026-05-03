@@ -6,8 +6,10 @@ from chemflow.utils.utils import EdgeAligner
 
 import py3Dmol
 from rdkit import Chem
+from rdkit.Chem import AllChem
+from rdkit.Chem.Draw import rdMolDraw2D
 
-from chemflow.utils.rdkit import IDX_BOND_MAP as bond_mapping
+from chemflow.utils.rdkit_utils import IDX_BOND_MAP as bond_mapping
 
 _KEKULIZE_EXCEPTIONS = tuple(
     exc
@@ -146,7 +148,39 @@ def visualize_single_mol(mol_data, width=800, height=400):
     return view
 
 
-def visualize_variable_topology(trajectory_frames, width=800, height=400, interval=25):
+def _frame_to_mol(frame):
+    """Build an RDKit RWMol (with 3D conformer) from a single trajectory frame."""
+    mol = Chem.RWMol()
+
+    for i, symbol in enumerate(frame["atoms"]):
+        atom = Chem.Atom(symbol)
+        atom.SetFormalCharge(int(frame["charges"][i]))
+        mol.AddAtom(atom)
+
+    for (src, dst), b_type in zip(frame["edges"], frame["edge_types"]):
+        rdkit_type = bond_mapping.get(b_type, Chem.BondType.SINGLE)
+        mol.AddBond(int(src), int(dst), rdkit_type)
+
+    conf = Chem.Conformer(len(frame["atoms"]))
+    for i, (x, y, z) in enumerate(frame["pos"]):
+        conf.SetAtomPosition(i, (float(x), float(y), float(z)))
+    mol.AddConformer(conf)
+
+    return mol
+
+
+def _frame_to_mol_block(frame):
+    """Build an SDF MolBlock string for a single trajectory frame."""
+    return _mol_to_mol_block_with_single_bond_fallback(_frame_to_mol(frame))
+
+
+def visualize_variable_topology(
+    trajectory_frames,
+    width=800,
+    height=400,
+    interval=25,
+    slider=False,
+):
     """
     Visualizes a trajectory where atom counts and types change.
 
@@ -156,49 +190,90 @@ def visualize_variable_topology(trajectory_frames, width=800, height=400, interv
             - 'pos': List of [x, y, z] coordinates
             - 'edges': List of (start_idx, end_idx) tuples
             - 'edge_types': List of bond orders (1, 2, 1.5, etc.)
+        width (int): Viewer width in pixels.
+        height (int): Viewer height in pixels.
+        interval (int): Animation speed in ms/frame (ignored when slider=True).
+        slider (bool): If True, renders an interactive ipywidgets slider to
+            scrub through frames instead of auto-playing the animation.
+            Returns the resulting ipywidgets widget. Requires ipywidgets and
+            a Jupyter-like frontend.
     """
 
-    combined_sdf_string = ""
+    mol_blocks = [_frame_to_mol_block(frame) for frame in trajectory_frames]
 
-    # 1. Iterate over every frame to build distinct molecules
-    for frame in trajectory_frames:
-        mol = Chem.RWMol()
+    if slider:
+        import json
+        import uuid
 
-        # A. Add Atoms
-        for i, symbol in enumerate(frame["atoms"]):
-            atom = Chem.Atom(symbol)
-            atom.SetFormalCharge(int(frame["charges"][i]))
-            mol.AddAtom(atom)
+        from IPython.display import HTML, display
 
-        # B. Add Bonds
-        # We loop through edges and edge_types simultaneously
-        for (src, dst), b_type in zip(frame["edges"], frame["edge_types"]):
-            rdkit_type = bond_mapping.get(b_type, Chem.BondType.SINGLE)
-            mol.AddBond(int(src), int(dst), rdkit_type)
+        combined_sdf_string = "".join(block + "$$$$\n" for block in mol_blocks)
+        num_frames = len(mol_blocks)
+        uid = uuid.uuid4().hex[:8]
+        sdf_json = json.dumps(combined_sdf_string)
 
-        # C. Set Positions (Conformer)
-        conf = Chem.Conformer(len(frame["atoms"]))
-        for i, (x, y, z) in enumerate(frame["pos"]):
-            conf.SetAtomPosition(i, (float(x), float(y), float(z)))
+        html_str = f"""
+<div style="font-family: sans-serif;">
+  <div id="viewer_{uid}"
+       style="width: {width}px; height: {height}px; position: relative;"></div>
+  <div style="width: {width}px; display: flex; align-items: center; gap: 8px; margin-top: 6px;">
+    <span>Frame:
+      <span id="label_{uid}" style="display:inline-block; min-width: 3em;">0</span>
+      / {max(num_frames - 1, 0)}
+    </span>
+    <input type="range" id="slider_{uid}"
+           min="0" max="{max(num_frames - 1, 0)}" value="0" step="1"
+           style="flex: 1;">
+  </div>
+</div>
+<script>
+(function() {{
+  function initViewer() {{
+    var viewer = $3Dmol.createViewer("viewer_{uid}", {{backgroundColor: "white"}});
+    var sdfData = {sdf_json};
+    viewer.addModelsAsFrames(sdfData, "sdf");
+    viewer.setStyle({{}}, {{stick: {{radius: 0.15}}, sphere: {{scale: 0.2}}}});
+    viewer.zoomTo();
+    viewer.setFrame(0);
+    viewer.render();
+    document.getElementById("slider_{uid}").addEventListener("input", function(e) {{
+      var idx = parseInt(e.target.value);
+      document.getElementById("label_{uid}").textContent = idx;
+      viewer.setFrame(idx);
+      viewer.render();
+    }});
+  }}
+  if (typeof $3Dmol !== "undefined") {{
+    initViewer();
+  }} else {{
+    var s = document.createElement("script");
+    s.src = "https://3Dmol.csb.pitt.edu/build/3Dmol-min.js";
+    s.onload = initViewer;
+    document.head.appendChild(s);
+  }}
+}})();
+</script>
+"""
 
-        mol.AddConformer(conf)
+        class _SliderView:
+            """Thin wrapper so callers can use `.show()` like a py3Dmol view."""
 
-        # D. Convert to SDF Block and append to master string
-        # '$$$$' is the delimiter between molecules in an SDF file
-        mol_block = _mol_to_mol_block_with_single_bond_fallback(mol)
-        combined_sdf_string += mol_block + "$$$$\n"
+            def __init__(self, html_body):
+                self._html = html_body
 
-    # 2. Visualize with py3Dmol
+            def show(self):
+                display(HTML(self._html))
+
+            def _ipython_display_(self):
+                display(HTML(self._html))
+
+        return _SliderView(html_str)
+
+    combined_sdf_string = "".join(block + "$$$$\n" for block in mol_blocks)
+
     view = py3Dmol.view(width=width, height=height)
-
-    # Load the multi-molecule string
     view.addModelsAsFrames(combined_sdf_string, "sdf")
-
-    # 3. Styling
     view.setStyle({"stick": {"radius": 0.15}, "sphere": {"scale": 0.2}})
-
-    # 4. Animation Settings
-    # 'interval' controls speed (ms per frame)
     view.animate({"loop": "forward", "interval": interval})
     view.zoomTo()
 
