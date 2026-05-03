@@ -10,7 +10,7 @@ from rdkit.Chem import RWMol
 from rdkit.Chem.Scaffolds import MurckoScaffold
 from rdkit.Chem import rdFMCS
 
-from chemflow.utils.rdkit import IDX_BOND_MAP
+from chemflow.utils.rdkit_utils import IDX_BOND_MAP
 from chemflow.utils.utils import rigid_alignment
 
 

@@ -16,15 +16,15 @@
 
 set -euo pipefail
 
-cd /cluster/project/krause/frankem/chemflow
+cd /cluster/project/jorner/schmiste/flexflow/chemflow
 
 source .env
 source .venv/bin/activate
 
 # === EDIT ME =============================================================
 # CHECKPOINT="/cluster/project/krause/frankem/chemflow/outputs/geom_e133.ckpt"
-CHECKPOINT="/cluster/project/krause/frankem/chemflow/outputs/qm9/uncond/2026-04-25/h4ldkelz/morph-qm9/h4ldkelz/checkpoints/epoch=1999-step=134600.ckpt"
-OUTPUT_DIR="/cluster/scratch/frankem/morph/qm9/uncond/eval_outputs_10k_100steps_w_semla_metrics/full_metrics_$(date +%Y%m%d_%H%M%S)"
+CHECKPOINT="/cluster/project/jorner/schmiste/flexflow/chemflow/outputs/2026-04-24/09-18-40/logs/chemflow/dn9vgsbs/checkpoints/epoch=1429-step=31460.ckpt"
+OUTPUT_DIR="/cluster/scratch/schmiste/morph/qm9_scaffold/uncond/eval_outputs_10k_100steps_w_semla_metrics/full_metrics_$(date +%Y%m%d_%H%M%S)"
 N_MOLS=10000
 N_SEEDS=3
 SEEDS="42,123,2026"
@@ -40,8 +40,10 @@ uv run --active --env-file .env python eval_scripts/eval_full_metrics.py \
   --n-seeds "${N_SEEDS}" \
   --seeds "${SEEDS}" \
   --predict-batch-size "${PREDICT_BATCH_SIZE}" \
+  --save-trajectories \
+  --save-trajectories-n-max 200 \
   --overrides \
-    data=qm9 \
+    data=qm9_scaffold_growth \
     model=semla \
     integrator.integrator.num_integration_steps=100 \
     #cfg=natoms \

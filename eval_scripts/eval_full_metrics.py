@@ -160,8 +160,14 @@ def _setup_eval_components(cfg, predict_batch_size: int):
 def _load_checkpoint(module, checkpoint_path: Path) -> None:
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = ckpt.get("state_dict", ckpt)
-    clean_state_dict = {k.replace("._orig_mod", ""): v for k, v in state_dict.items()}
-    module.load_state_dict(clean_state_dict)
+    clean_state_dict = {}
+    for k, v in state_dict.items():
+        k = k.replace("._orig_mod", "")
+        # Older checkpoints stored KL dist metrics under "metrics.*" instead of "distribution_metrics.*"
+        if k.startswith("metrics.") and "_dist_kl" in k:
+            k = "distribution_metrics." + k[len("metrics."):]
+        clean_state_dict[k] = v
+    module.load_state_dict(clean_state_dict, strict=False)
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +377,8 @@ def _run_one_seed(
     predict_batch_size: int,
     run_posebusters: bool,
     natoms_traj_path: Path | None = None,
+    traj_dir: Path | None = None,
+    traj_n_max: int | None = None,
 ) -> tuple[dict, int, int]:
     """Generate molecules with ``seed`` and return (metrics, n_total, n_valid).
 
@@ -439,6 +447,20 @@ def _run_one_seed(
         print(
             f"[seed={seed}] saved n_atoms trajectories "
             f"({len(natoms_per_traj)} generations) to: {natoms_traj_path}"
+        )
+
+    if traj_dir is not None:
+        trajs_to_save = all_trajs if traj_n_max is None else all_trajs[:traj_n_max]
+        mask = is_valid_mask[: len(trajs_to_save)]
+        valid_trajs = [t for t, v in zip(trajs_to_save, mask) if v]
+        invalid_trajs = [t for t, v in zip(trajs_to_save, mask) if not v]
+        valid_path = traj_dir / f"trajectories_valid_seed{seed}.pt"
+        invalid_path = traj_dir / f"trajectories_invalid_seed{seed}.pt"
+        torch.save(valid_trajs, valid_path)
+        torch.save(invalid_trajs, invalid_path)
+        print(
+            f"[seed={seed}] saved {len(valid_trajs)} valid + "
+            f"{len(invalid_trajs)} invalid trajectories to: {traj_dir}"
         )
 
     rdkit_mols = _trajectories_to_rdkit(all_trajs, vocab)
@@ -595,6 +617,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Disable PoseBusters checks (faster, less RAM).",
     )
     parser.add_argument(
+        "--save-trajectories",
+        action="store_true",
+        help=(
+            "Save full per-step MoleculeData trajectories, split into valid and "
+            "invalid, to <output-dir>/trajectories_{valid,invalid}_seed{seed}.pt. "
+            "Off by default (can be several hundred MB per seed for 10k mols)."
+        ),
+    )
+    parser.add_argument(
+        "--save-trajectories-n-max",
+        type=int,
+        default=None,
+        help=(
+            "When --save-trajectories is set, cap the total number of saved "
+            "trajectories per seed (default: all). Useful to limit file size."
+        ),
+    )
+    parser.add_argument(
         "--no-save-natoms-trajectories",
         action="store_true",
         help=(
@@ -629,6 +669,9 @@ def main() -> None:
     with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base="1.1"):
         cfg = compose(config_name="default", overrides=args.overrides)
 
+    print("Overrides:", args.overrides)
+    print("Integrator config:\n" + OmegaConf.to_yaml(cfg.integrator))
+
     (
         module,
         test_dl,
@@ -648,6 +691,7 @@ def main() -> None:
             if args.no_save_natoms_trajectories
             else args.output_dir / f"natoms_traj_seed{seed}.pt"
         )
+        traj_dir = args.output_dir if args.save_trajectories else None
         seed_metrics, n_total, n_valid = _run_one_seed(
             seed=seed,
             cfg=cfg,
@@ -662,6 +706,8 @@ def main() -> None:
             predict_batch_size=args.predict_batch_size,
             run_posebusters=not args.no_posebusters,
             natoms_traj_path=natoms_traj_path,
+            traj_dir=traj_dir,
+            traj_n_max=args.save_trajectories_n_max,
         )
         per_seed.append(seed_metrics)
         per_seed_counts.append((n_total, n_valid))

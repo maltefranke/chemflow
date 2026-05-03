@@ -332,3 +332,18 @@ def visualize_variable_topology_slider(trajectory_frames, width=800, height=400)
 """
 
     display(HTML(slider + html))
+
+
+def save_trajectory_to_sdf(trajs, traj_idx, output_path):
+    """Write every frame of trajectory `traj_idx` to a multi-frame SDF file."""
+    frames = trajs[traj_idx]
+    writer = Chem.SDWriter(output_path)
+    for i, frame in enumerate(frames):
+        mol = _frame_to_mol(frame)
+        mol.SetProp("frame_idx", str(i))
+        try:
+            writer.write(mol)
+        except Exception as e:
+            print(f"Frame {i} skipped: {e}")
+    writer.close()
+    print(f"Saved {len(frames)} frames → {output_path}")

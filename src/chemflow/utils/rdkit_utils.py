@@ -264,12 +264,11 @@ def smiles_from_mol(
     if mol is None:
         return None
 
-    if explicit_hs:
-        mol = Chem.AddHs(mol)
-    else:
-        mol = Chem.RemoveHs(mol)
-
     try:
+        if explicit_hs:
+            mol = Chem.AddHs(mol)
+        else:
+            mol = Chem.RemoveHs(mol)
         smiles = Chem.MolToSmiles(mol, canonical=canonical)
     except Exception:
         smiles = None
