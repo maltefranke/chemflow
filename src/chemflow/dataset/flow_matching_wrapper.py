@@ -179,7 +179,9 @@ class FlowMatchingDatasetWrapper(Dataset):
         elif self.n_atoms_strategy == "annealing":
             return self._get_n_atoms_annealed(target)
         elif self.n_atoms_strategy == "uniform":
-            return int(torch.randint(self._n_atoms_min, self._n_atoms_max + 1, (1,)).item())
+            return int(
+                torch.randint(self._n_atoms_min, self._n_atoms_max + 1, (1,)).item()
+            )
         else:
             return None
 

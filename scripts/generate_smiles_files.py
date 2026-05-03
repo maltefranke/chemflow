@@ -16,7 +16,7 @@ from omegaconf import DictConfig, OmegaConf
 from rdkit import Chem
 from tqdm import tqdm
 
-from chemflow.utils.rdkit import smiles_from_mol
+from chemflow.utils.rdkit_utils import smiles_from_mol
 
 OmegaConf.register_new_resolver("oc.eval", eval)
 OmegaConf.register_new_resolver("len", lambda x: len(x))
@@ -32,7 +32,13 @@ def _bytes_to_smiles(b: bytes) -> str:
 def load_smiles_parallel(ds, desc: str) -> list[str]:
     """Load .smiles from dataset items in parallel (I/O bound)."""
     with ThreadPoolExecutor() as pool:
-        raw = list(tqdm(pool.map(lambda i: ds.get(i).smiles, range(len(ds))), total=len(ds), desc=desc))
+        raw = list(
+            tqdm(
+                pool.map(lambda i: ds.get(i).smiles, range(len(ds))),
+                total=len(ds),
+                desc=desc,
+            )
+        )
     return raw
 
 
@@ -52,10 +58,13 @@ def generate_qm9(root: str) -> None:
         ds.load(split)
         raw = load_smiles_parallel(ds, desc=split)
         smiles = [
-            s for s in (
+            s
+            for s in (
                 smiles_from_mol(Chem.MolFromSmiles(smi), canonical=True)
-                for smi in raw if smi
-            ) if s is not None
+                for smi in raw
+                if smi
+            )
+            if s is not None
         ]
         write_smiles_file(smiles, smiles_path)
 
@@ -66,14 +75,16 @@ def generate_geom(root: str) -> None:
     for split in ("train", "val", "test"):
         smiles_path = os.path.join(root, "processed", f"{split}_smiles.txt")
         ds = GEOM(root, split)
-        # _mol_bytes is already in memory; skip Data reconstruction and decode
-        # only the smiles field. pickle.loads is CPU-bound so use processes.
+        # Stream bytes from LMDB (memory-mapped) and decode only the smiles
+        # field in parallel. pickle.loads is CPU-bound, so use processes.
         with ProcessPoolExecutor() as pool:
-            raw = list(tqdm(
-                pool.map(_bytes_to_smiles, ds._mol_bytes, chunksize=512),
-                total=len(ds),
-                desc=split,
-            ))
+            raw = list(
+                tqdm(
+                    pool.map(_bytes_to_smiles, ds.iter_bytes(), chunksize=512),
+                    total=len(ds),
+                    desc=split,
+                )
+            )
         smiles = [s for s in raw if s]
         write_smiles_file(smiles, smiles_path)
 

@@ -1,4 +1,6 @@
 import copy
+from contextlib import ExitStack
+
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
@@ -21,6 +23,7 @@ from chemflow.utils.metrics import (
     MetricCollection,
     calc_posebusters_metrics,
     init_metrics,
+    build_marginal_plots,
 )
 from lightning.pytorch.utilities import grad_norm
 from chemflow.utils.loss_accumulation import LossAccumulator
@@ -28,7 +31,7 @@ from chemflow.model.learnable_loss import UnifiedWeightedLoss
 from chemflow.utils.loss_weighing import (
     InverseSquaredTimeLossWeighting,
 )
-from chemflow.utils import rdkit as chemflowRD
+from chemflow.utils import rdkit_utils as chemflowRD
 from chemflow.utils.lr_schedulers import EMADecayScheduler
 
 
@@ -84,6 +87,7 @@ class LightningModuleRates(pl.LightningModule):
         time_dist: DictConfig,
         metrics: MetricCollection,
         stability_metrics: MetricCollection,
+        distribution_metrics: MetricCollection | None = None,
         n_atoms_strategy: str = "fixed",
         ins_noise_scale: float = 0.5,
         use_learnable_loss_weights: bool = False,
@@ -91,6 +95,7 @@ class LightningModuleRates(pl.LightningModule):
         ema_decay_scheduler: EMADecayScheduler | DictConfig | None = None,
         use_ema_for_eval: bool = True,
         use_time_weights: bool = False,
+        allow_charged: bool = False,
         exclude_scaffold_from_sub_loss: bool = False,
         exclude_scaffold_from_x_loss: bool = False,
     ):
@@ -103,6 +108,10 @@ class LightningModuleRates(pl.LightningModule):
         self.distributions = distributions
         self.loss_weight_distributions = loss_weight_distributions
         self.ins_noise_scale = ins_noise_scale
+
+        # Whether charged species are considered chemically valid for the dataset
+        # (e.g. QM9 contains only neutral molecules; GEOM contains charged ones).
+        self.allow_charged = allow_charged
 
         # setup ema scheduler
         self.ema_decay = float(ema_decay)
@@ -129,6 +138,9 @@ class LightningModuleRates(pl.LightningModule):
         # metrics tracking for validation
         self.metrics = metrics
         self.stability_metrics = stability_metrics
+        # Distribution metrics accumulate over the entire validation epoch so we
+        # can log a single pooled KL and render marginal plots at epoch end.
+        self.distribution_metrics = distribution_metrics
 
         self.cfg_adapter = hydra.utils.instantiate(
             cfg_adapter,
@@ -183,6 +195,7 @@ class LightningModuleRates(pl.LightningModule):
                 "ema_decay_scheduler",
                 "metrics",
                 "stability_metrics",
+                "distribution_metrics",
                 "cfg_adapter",
             ]
         )
@@ -242,7 +255,11 @@ class LightningModuleRates(pl.LightningModule):
         is_random_self_conditioning = (torch.rand(1) > 0.5).item()
 
         cfg_inputs = self.cfg_adapter.get_training_inputs(
-            mols_t, mols_1, self.device, self.training
+            mols_t,
+            mols_1,
+            self.device,
+            self.training,
+            ins_targets=ins_targets,
         )
 
         preds = self.model(
@@ -616,6 +633,12 @@ class LightningModuleRates(pl.LightningModule):
         self.log("loss/train", loss.detach(), prog_bar=True, logger=True)
         return loss
 
+    def on_validation_epoch_start(self):
+        # Distribution metrics accumulate histograms across the epoch; reset them
+        # here so each validation cycle starts from a clean state.
+        if self.distribution_metrics is not None:
+            self.distribution_metrics.reset()
+
     def validation_step(self, batch, batch_idx):
         self.model_ema.eval()
         batched_mols = self.sample(batch, batch_idx, return_traj=False)
@@ -655,9 +678,11 @@ class LightningModuleRates(pl.LightningModule):
             batch_size=n_mols,
         )
 
+        # Accumulate marginal histograms across the epoch without resetting.
+        if self.distribution_metrics is not None:
+            self.distribution_metrics.update(rdkit_mols)
+
         try:
-            # pb_metrics = calc_posebusters_metrics(rdkit_mols)
-            # print(pb_metrics)
             # pb_metrics = calc_posebusters_metrics(rdkit_mols)
             # print(pb_metrics)
             pb_metrics = False
@@ -674,6 +699,48 @@ class LightningModuleRates(pl.LightningModule):
                 logger=True,
                 batch_size=n_mols,
             )
+
+    def on_validation_epoch_end(self):
+        if self.distribution_metrics is None:
+            return
+
+        try:
+            # Pooled (epoch-level) KL scalars. `compute()` handles the DDP
+            # cross-process reduction internally and restores local state on exit.
+            dist_results = self.distribution_metrics.compute()
+            self.log_dict(
+                {
+                    f"val/{key}": (v.detach() if isinstance(v, torch.Tensor) else v)
+                    for key, v in dist_results.items()
+                },
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                sync_dist=False,
+            )
+
+            # Marginal plots. `sync_context()` is DDP-collective so *all* ranks
+            # must enter the block, but only rank 0 reads the synced histograms
+            # and pushes the figures through the logger (which handles step
+            # alignment with the scalars logged above).
+            with ExitStack() as stack:
+                for m in self.distribution_metrics.values():
+                    stack.enter_context(m.sync_context())
+
+                if self.trainer.is_global_zero and hasattr(self.logger, "log_image"):
+                    figures = build_marginal_plots(self.distribution_metrics)
+                    for name, fig in figures.items():
+                        self.logger.log_image(key=f"val/marginals/{name}", images=[fig])
+                    if figures:
+                        import matplotlib.pyplot as plt
+
+                        for fig in figures.values():
+                            plt.close(fig)
+        except Exception as e:
+            print(f"Error in validation-epoch-end distribution logging: {e}")
+        finally:
+            self.distribution_metrics.reset()
 
     def predict_step(self, batch, batch_idx):
         return_traj = bool(getattr(self, "predict_return_traj", True))
@@ -701,7 +768,9 @@ class LightningModuleRates(pl.LightningModule):
                 mol_is_valid.append(False)
                 continue
             try:
-                mol_is_valid.append(chemflowRD.mol_is_valid(mol))
+                mol_is_valid.append(
+                    chemflowRD.mol_is_valid(mol, allow_charged=self.allow_charged)
+                )
             except Exception as e:
                 print(f"Error checking validity of molecule: {e}")
                 mol_is_valid.append(False)

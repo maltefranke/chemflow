@@ -10,8 +10,7 @@ from omegaconf import OmegaConf
 from rdkit import RDLogger
 from pytorch_lightning.strategies import DDPStrategy
 
-from chemflow.utils.utils import build_callbacks, init_uniform_prior
-from chemflow.dataset.vocab import setup_token_weights
+from chemflow.utils.utils import build_callbacks, init_uniform_prior, bootstrap_run_id
 from chemflow.dataset.vocab import setup_token_weights
 from chemflow.model.lightning_module import LightningModuleRates
 from chemflow.utils.metrics import init_metrics
@@ -31,7 +30,7 @@ RDLogger.DisableLog("rdApp.*")
 pl.seed_everything(42)
 
 
-def run(cfg: DictConfig):
+def setup(cfg: DictConfig):
     OmegaConf.set_struct(cfg, False)
 
     # Instantiate preprocessing to compute distributions from training dataset
@@ -44,11 +43,9 @@ def run(cfg: DictConfig):
 
     # Keep training-frequency distributions for loss weighting.
     loss_weight_distributions = deepcopy(distributions)
-
     token_prior_distribution = init_uniform_prior(distributions)
 
     cfg.data.vocab = vocab
-    print(cfg)
 
     hydra.utils.log.info(
         f"Preprocessing complete.\n"
@@ -79,15 +76,22 @@ def run(cfg: DictConfig):
         type_loss_token_weights=tw.type_loss_token_weights,
     )
 
+    # Whether charged molecules are considered valid for this dataset.
+    # Defaults to False (e.g. QM9) if the data config does not set it.
+    allow_charged = bool(cfg.data.get("allow_charged", False))
+
     # Build metrics (including novelty against the training set)
     train_smiles = datamodule.train_dataset.base_dataset.get_all_smiles()
-    metrics, stability_metrics = init_metrics(
+    metrics, stability_metrics, distribution_metrics = init_metrics(
         train_smiles=train_smiles,
         target_n_atoms_distribution=loss_weight_distributions.n_atoms_distribution,
         atom_type_distribution=loss_weight_distributions.atom_type_distribution,
         edge_type_distribution=loss_weight_distributions.edge_type_distribution,
+        charge_type_distribution=loss_weight_distributions.charge_type_distribution,
         atom_tokens=list(vocab.atom_tokens),
         edge_tokens=list(vocab.edge_tokens),
+        charge_tokens=list(vocab.charge_tokens),
+        allow_charged=allow_charged,
     )
 
     # Instantiate module
@@ -102,6 +106,8 @@ def run(cfg: DictConfig):
         charge_token_weights=charge_token_weights,
         metrics=metrics,
         stability_metrics=stability_metrics,
+        distribution_metrics=distribution_metrics,
+        allow_charged=allow_charged,
     )
 
     # module.compile()
@@ -110,31 +116,35 @@ def run(cfg: DictConfig):
     wandb_logger = WandbLogger(**cfg.logging)
     callbacks = build_callbacks(cfg)
     lr_monitor = LearningRateMonitor(logging_interval="step")
-
     callbacks.append(lr_monitor)
+
     # Instantiate trainer
     trainer = pl.Trainer(
-        # strategy=DDPStrategy(find_unused_parameters=True),
         logger=wandb_logger,
         callbacks=callbacks,
         **cfg.trainer.trainer,
     )
 
-    ckpt_path = None
-    # ckpt_path = "/cluster/project/jorner/schmiste/flexflow/chemflow/outputs/2026-04-18/10-50-21/best_train/best_train-epoch=0825-step=071800-loss/total=0.9296.ckpt"
+    return module, datamodule, trainer
 
-    # Train the model
+
+def train(module, datamodule, trainer, ckpt_path=None):
     trainer.fit(
         module,
         datamodule=datamodule,
         ckpt_path=ckpt_path,
     )
 
+
+def validate(module, datamodule, trainer, ckpt_path=None):
     trainer.validate(
         module,
         dataloaders=datamodule.val_dataloader(),
         ckpt_path=ckpt_path,
     )
+
+
+def predict(module, datamodule, trainer, ckpt_path=None):
 
     predictions = trainer.predict(
         module,
@@ -176,8 +186,18 @@ def run(cfg: DictConfig):
     version_base="1.1",
 )
 def main(cfg: omegaconf.DictConfig):
-    run(cfg)
+    ckpt_path = cfg.trainer.checkpoint_path
+
+    module, datamodule, trainer = setup(cfg)
+
+    if cfg.trainer.do_train:
+        train(module, datamodule, trainer, ckpt_path)
+    if cfg.trainer.do_validate:
+        validate(module, datamodule, trainer, ckpt_path)
+    if cfg.trainer.do_predict:
+        predict(module, datamodule, trainer, ckpt_path)
 
 
 if __name__ == "__main__":
+    bootstrap_run_id()
     main()

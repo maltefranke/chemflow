@@ -1,7 +1,9 @@
 import os
 import pickle
 from multiprocessing import get_context
+from typing import Iterable
 
+import lmdb
 import torch
 from rdkit import Chem
 from torch.utils.data import Dataset
@@ -10,7 +12,12 @@ from tqdm import tqdm
 
 from chemflow.dataset.molecule_data import MoleculeData
 from chemflow.dataset.vocab import Distributions, Vocab
-from chemflow.utils.rdkit import BOND_IDX_MAP, mol_is_valid, sanitize_mol_correctly, smiles_from_mol
+from chemflow.utils.rdkit_utils import (
+    BOND_IDX_MAP,
+    mol_is_valid,
+    sanitize_mol_correctly,
+    smiles_from_mol,
+)
 from chemflow.utils.utils import (
     edge_types_to_symmetric,
     token_to_index,
@@ -18,6 +25,19 @@ from chemflow.utils.utils import (
 )
 
 PICKLE_PROTOCOL = 4
+
+# 128 GiB virtual address reservation for the LMDB file. This is NOT disk
+# usage — the file grows sparsely with actual data. Large enough to hold the
+# full processed GEOM train split with headroom.
+LMDB_MAP_SIZE = 128 * (1024**3)
+
+# Reserved metadata key for entry count. Integer data keys are 8-byte
+# big-endian, so this textual key cannot collide with them.
+LEN_KEY = b"__len__"
+
+
+def _int_key(i: int) -> bytes:
+    return i.to_bytes(8, "big")
 
 
 def process_one_conformer(mol: Chem.Mol):
@@ -114,18 +134,6 @@ def mol_from_bytes(data: bytes) -> Data:
     )
 
 
-def save_dataset_bytes(mol_bytes_list: list[bytes], filepath: str) -> None:
-    """Save a list of serialized molecule bytes to a single pickle file."""
-    with open(filepath, "wb") as f:
-        pickle.dump(mol_bytes_list, f, protocol=PICKLE_PROTOCOL)
-
-
-def load_dataset_bytes(filepath: str) -> list[bytes]:
-    """Load a list of serialized molecule bytes from a pickle file."""
-    with open(filepath, "rb") as f:
-        return pickle.load(f)
-
-
 def process_one_conformer_to_bytes(mol: Chem.Mol) -> bytes | None:
     """Process one conformer and return serialized bytes if valid."""
     data = process_one_conformer(mol)
@@ -134,58 +142,132 @@ def process_one_conformer_to_bytes(mol: Chem.Mol) -> bytes | None:
     return mol_to_bytes(data)
 
 
-def process_conformers_parallel(
+def open_read_env(lmdb_path: str) -> lmdb.Environment:
+    """Open an LMDB environment configured for multi-worker read access.
+
+    ``lock=False`` + ``readonly=True`` allows multiple processes (DataLoader
+    workers) to share the mmap without the writer lock. ``readahead=False``
+    is better for random access patterns typical in training.
+    """
+    return lmdb.open(
+        lmdb_path,
+        readonly=True,
+        lock=False,
+        readahead=False,
+        meminit=False,
+        subdir=True,
+        max_readers=512,
+    )
+
+
+def read_lmdb_length(lmdb_path: str) -> int:
+    """Return the number of molecules stored in an LMDB env."""
+    env = open_read_env(lmdb_path)
+    try:
+        with env.begin() as txn:
+            raw = txn.get(LEN_KEY)
+            if raw is not None:
+                return int(raw)
+            return txn.stat()["entries"]
+    finally:
+        env.close()
+
+
+def write_bytes_to_lmdb(
+    bytes_iter: Iterable[bytes | None],
+    lmdb_path: str,
+    total: int | None = None,
+    map_size: int = LMDB_MAP_SIZE,
+    commit_every: int = 10_000,
+    desc: str = "Writing LMDB",
+) -> tuple[int, int]:
+    """Stream serialized molecule bytes into a new LMDB environment.
+
+    ``None`` entries in the iterator are counted as failures and skipped.
+    """
+    os.makedirs(os.path.dirname(lmdb_path) or ".", exist_ok=True)
+    env = lmdb.open(
+        lmdb_path,
+        map_size=map_size,
+        subdir=True,
+        meminit=False,
+        writemap=False,
+        max_readers=512,
+    )
+    n_written = 0
+    n_failed = 0
+    try:
+        txn = env.begin(write=True)
+        for out in tqdm(bytes_iter, total=total, desc=desc):
+            if out is None:
+                n_failed += 1
+                continue
+            txn.put(_int_key(n_written), out)
+            n_written += 1
+            if n_written % commit_every == 0:
+                txn.commit()
+                txn = env.begin(write=True)
+        txn.put(LEN_KEY, str(n_written).encode())
+        txn.commit()
+    finally:
+        env.close()
+    return n_written, n_failed
+
+
+def process_conformers_to_lmdb(
     conformers: list[Chem.Mol],
+    lmdb_path: str,
     num_workers: int | None = None,
     chunksize: int = 128,
-) -> tuple[list[bytes], int]:
-    """Process conformers in parallel with multiprocessing.
+    map_size: int = LMDB_MAP_SIZE,
+    commit_every: int = 10_000,
+) -> tuple[int, int]:
+    """Process conformers in parallel and stream serialized bytes into LMDB.
 
-    Args:
-        conformers: RDKit conformers to process.
-        num_workers: Number of processes. Defaults to ``max(cpu_count - 1, 1)``.
-        chunksize: Chunk size for ``imap_unordered``.
+    Writes happen as workers complete so peak memory stays bounded regardless
+    of dataset size (unlike accumulating a full in-memory list first).
     """
     if num_workers is None:
         cpu_count = os.cpu_count() or 1
         num_workers = max(1, cpu_count - 1)
 
     if num_workers <= 1:
-        mol_bytes_list = []
-        n_failed = 0
-        for conformer in tqdm(conformers, desc="Processing conformers"):
-            out = process_one_conformer_to_bytes(conformer)
-            if out is None:
-                n_failed += 1
-            else:
-                mol_bytes_list.append(out)
-        return mol_bytes_list, n_failed
+        iterator = (process_one_conformer_to_bytes(c) for c in conformers)
+        return write_bytes_to_lmdb(
+            iterator,
+            lmdb_path,
+            total=len(conformers),
+            map_size=map_size,
+            commit_every=commit_every,
+            desc="Processing conformers",
+        )
 
-    mol_bytes_list = []
-    n_failed = 0
     ctx = get_context("spawn")
     with ctx.Pool(processes=num_workers) as pool:
         outputs = pool.imap_unordered(
             process_one_conformer_to_bytes, conformers, chunksize=chunksize
         )
-        for out in tqdm(outputs, total=len(conformers), desc="Processing conformers"):
-            if out is None:
-                n_failed += 1
-            else:
-                mol_bytes_list.append(out)
-
-    return mol_bytes_list, n_failed
+        return write_bytes_to_lmdb(
+            outputs,
+            lmdb_path,
+            total=len(conformers),
+            map_size=map_size,
+            commit_every=commit_every,
+            desc="Processing conformers",
+        )
 
 
 class GEOM(Dataset):
-    """GEOM dataset with pickle-bytes serialization for fast loading.
+    """GEOM dataset backed by an LMDB environment.
 
-    Raw pickle files containing (smiles, list of conformers) tuples are
-    processed once via ``process()`` or a standalone preprocessing script.
-    Each conformer is serialized to compact pickle bytes (via ``mol_to_bytes``)
-    and stored in a single ``.pkl`` file.  Subsequent loads deserialize only
-    the byte-string list (no tensor reconstruction), and individual molecules
-    are reconstructed lazily in ``__getitem__``.
+    The processed data lives in ``<root>/processed/<split>_data.lmdb/`` as a
+    key-value store with 8-byte big-endian integer keys mapping to the same
+    compact pickle-dict bytes produced by :func:`mol_to_bytes`.
+
+    Reads are memory-mapped: the dataset does not load into RAM, and multiple
+    DataLoader workers share the mmap. The LMDB handle is opened lazily on
+    first access so it's safe under both ``fork`` and ``spawn`` worker start
+    methods.
     """
 
     def __init__(
@@ -205,15 +287,28 @@ class GEOM(Dataset):
 
         os.makedirs(self.processed_dir, exist_ok=True)
 
-        self.processed_file = os.path.join(self.processed_dir, f"{split}_data.pkl")
+        self.lmdb_path = os.path.join(self.processed_dir, f"{split}_data.lmdb")
 
-        if not os.path.exists(self.processed_file):
+        if not os.path.exists(self.lmdb_path):
             self.process()
 
-        self._mol_bytes = load_dataset_bytes(self.processed_file)
+        self._length = read_lmdb_length(self.lmdb_path)
+        self._env: lmdb.Environment | None = None
+
+    def _ensure_env(self) -> lmdb.Environment:
+        if self._env is None:
+            self._env = open_read_env(self.lmdb_path)
+        return self._env
+
+    def __getstate__(self):
+        # Strip the live env handle so DataLoader workers using spawn can
+        # pickle the dataset. Each worker reopens lazily on first access.
+        state = self.__dict__.copy()
+        state["_env"] = None
+        return state
 
     def process(self):
-        """Process raw pickle files and save as serialized molecule bytes."""
+        """Process raw pickle files and write them into LMDB."""
         raw_file = os.path.join(self.raw_dir, f"{self.split}_data.pickle")
 
         if not os.path.exists(raw_file):
@@ -229,38 +324,57 @@ class GEOM(Dataset):
             for _smiles, conformers_list in tqdm(raw_data, desc="Preparing data")
             for conformer in conformers_list
         ]
-
         del raw_data
 
         print(f"Total conformers to process: {len(all_conformers)}")
-        print(f"Processing {len(all_conformers)} conformers with multiprocessing...")
-        mol_bytes_list, n_failed = process_conformers_parallel(all_conformers)
-
-        print(f"Successfully processed: {len(mol_bytes_list)} molecules")
+        n_written, n_failed = process_conformers_to_lmdb(all_conformers, self.lmdb_path)
+        print(f"Successfully processed: {n_written} molecules")
         print(f"Failed: {n_failed} molecules")
-
         del all_conformers
 
-        print(f"Saving processed data to {self.processed_file}...")
-        save_dataset_bytes(mol_bytes_list, self.processed_file)
+        self._write_smiles_sidecar()
 
+    def _write_smiles_sidecar(self) -> None:
+        """Build the unique-SMILES sidecar by reading the LMDB env once."""
         smiles_path = os.path.join(self.processed_dir, f"{self.split}_smiles.txt")
-        unique_smiles = sorted(set(
-            pickle.loads(b)["smiles"] for b in mol_bytes_list
-        ))
+        unique: set[str] = set()
+        env = open_read_env(self.lmdb_path)
+        try:
+            with env.begin() as txn, txn.cursor() as cur:
+                for key, value in tqdm(cur, desc="Collecting SMILES"):
+                    if bytes(key) == LEN_KEY:
+                        continue
+                    unique.add(pickle.loads(bytes(value))["smiles"])
+        finally:
+            env.close()
         with open(smiles_path, "w") as f:
-            f.write("\n".join(unique_smiles))
+            f.write("\n".join(sorted(unique)))
 
     def get_all_smiles(self) -> list[str]:
         smiles_path = os.path.join(self.processed_dir, f"{self.split}_smiles.txt")
         with open(smiles_path) as f:
             return f.read().splitlines()
 
+    def iter_bytes(self) -> Iterable[bytes]:
+        """Iterate raw serialized molecule bytes in insertion order."""
+        env = self._ensure_env()
+        with env.begin() as txn:
+            for i in range(self._length):
+                raw = txn.get(_int_key(i))
+                if raw is None:
+                    continue
+                yield bytes(raw)
+
     def __len__(self):
-        return len(self._mol_bytes)
+        return self._length
 
     def __getitem__(self, index):
-        return mol_from_bytes(self._mol_bytes[index])
+        env = self._ensure_env()
+        with env.begin(buffers=True) as txn:
+            raw = txn.get(_int_key(index))
+        if raw is None:
+            raise IndexError(index)
+        return mol_from_bytes(bytes(raw))
 
     def get(self, index):
         return self.__getitem__(index)
