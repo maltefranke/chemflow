@@ -1,13 +1,7 @@
 ## Put your model args here
-<<<<<<< HEAD
 project: "chemflow"
 name: "develop_stefan"
 save_dir: "logs"
-=======
-project: morph-${hydra:runtime.choices.data}
-name: ${oc.env:CHEMFLOW_RUN_ID,base}
-save_dir: .
->>>>>>> origin/main
 offline: false
 
     
