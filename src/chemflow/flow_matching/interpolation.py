@@ -554,12 +554,25 @@ class Interpolator:
         interp_state.n_ins_missing = mask_future_ins.sum().float()
         interp_state.n_del_missing = mask_keep_del.sum().float()
 
-        # I. Remove center of mass (mol_t defines the reference frame)
+        # I. Coordinate Centering
+        # Decouple the persistent target frame from the instantaneous spawn frame.
+        # Semla is SE(3)-equivariant on a ZCoM input, so it can only produce a ZCoM
+        # output in the active frame. Subtracting c_t (interp COM) from the target
+        # leaves a c_1 - c_t global offset the network cannot match, which jumps
+        # whenever mask_exists changes (ins/del). Centering the target by its own
+        # mean keeps the linear OT path intact while removing that irreducible term.
+
+        # 1. ZCoM projection for the active input state
         x_mean = interp_state.x.mean(dim=0)
         interp_state.x = interp_state.x - x_mean
-        target_state.x = target_state.x - x_mean
+
+        # 2. Spawn targets remain relative to the instantaneous active frame (x_mean)
         if future_ins_nodes.x.shape[0] > 0:
             future_ins_nodes.x = future_ins_nodes.x - x_mean
+
+        # 3. Persistent target must be strictly ZCoM within its own frame
+        target_mean = target_state.x.mean(dim=0)
+        target_state.x = target_state.x - target_mean
 
         return interp_state, target_state, future_ins_nodes
 
