@@ -25,7 +25,12 @@ from torch_geometric.data import InMemoryDataset, download_url, extract_zip
 
 from chemflow.dataset.molecule_data import MoleculeData
 from chemflow.dataset.vocab import Vocab, Distributions
-from chemflow.utils.rdkit import mol_is_valid, sanitize_mol_correctly, BOND_IDX_MAP, smiles_from_mol
+from chemflow.utils.rdkit_utils import (
+    mol_is_valid,
+    sanitize_mol_correctly,
+    BOND_IDX_MAP,
+    smiles_from_mol,
+)
 from scipy.spatial.transform import Rotation
 
 # Maps QM9 property names to their column index in the y tensor after
@@ -33,18 +38,18 @@ from scipy.spatial.transform import Rotation
 # during processing.  The raw CSV columns (A, B, C) are moved to the end, so
 # the first 16 entries are the standard QM9 molecular-property targets:
 QM9_PROPERTY_NAMES: dict[str, int] = {
-    "mu": 0,    # dipole moment (D)
-    "alpha": 1, # isotropic polarizability (a0^3)
+    "mu": 0,  # dipole moment (D)
+    "alpha": 1,  # isotropic polarizability (a0^3)
     "homo": 2,  # HOMO energy (eV)
     "lumo": 3,  # LUMO energy (eV)
-    "gap": 4,   # HOMO-LUMO gap (eV)
-    "r2": 5,    # electronic spatial extent (a0^2)
+    "gap": 4,  # HOMO-LUMO gap (eV)
+    "r2": 5,  # electronic spatial extent (a0^2)
     "zpve": 6,  # zero-point vibrational energy (kcal/mol)
-    "u0": 7,    # internal energy at 0 K (kcal/mol)
-    "u": 8,     # internal energy at 298.15 K (kcal/mol)
-    "h": 9,     # enthalpy at 298.15 K (kcal/mol)
-    "g": 10,    # free energy at 298.15 K (kcal/mol)
-    "cv": 11,   # heat capacity at 298.15 K (cal/mol/K)
+    "u0": 7,  # internal energy at 0 K (kcal/mol)
+    "u": 8,  # internal energy at 298.15 K (kcal/mol)
+    "h": 9,  # enthalpy at 298.15 K (kcal/mol)
+    "g": 10,  # free energy at 298.15 K (kcal/mol)
+    "cv": 11,  # heat capacity at 298.15 K (cal/mol/K)
 }
 
 
@@ -291,6 +296,12 @@ class FlowMatchingQM9Dataset(RevisedQM9):
         # Keep 2D so PyG batching concatenates along dim 0 → [batch_size, num_properties]
         if hasattr(data, "y") and data.y is not None:
             mol.y = data.y if data.y.dim() == 2 else data.y.unsqueeze(0)
+
+        # Propagate canonical SMILES so on-the-fly conditioning signals
+        # (e.g. RDKit logP in chemflow.model.cfg) can be computed at the
+        # CFGAdapter level without re-extracting it from atom/bond tensors.
+        if hasattr(data, "smiles"):
+            mol.smiles = data.smiles
 
         return mol
 

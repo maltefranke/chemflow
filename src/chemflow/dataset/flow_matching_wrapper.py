@@ -79,6 +79,13 @@ class FlowMatchingDatasetWrapper(Dataset):
             if hasattr(target, "y") and target.y is not None:
                 mol_t.y = target.y
 
+            # The interpolator builds mol_1 from filter_nodes(target) and drops
+            # non-tensor attributes; re-attach the SMILES so downstream CFG
+            # signals (e.g. logP) can be computed from mol_1.
+            if hasattr(target, "smiles"):
+                mol_1.smiles = target.smiles
+                mol_t.smiles = target.smiles
+
             return mol_t, mol_1, ins_targets, t
 
         return sample, target

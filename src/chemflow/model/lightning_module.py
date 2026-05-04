@@ -706,12 +706,14 @@ class LightningModuleRates(pl.LightningModule):
         return_traj = bool(getattr(self, "predict_return_traj", True))
         target_override = getattr(self, "predict_target_n_atoms_override", None)
         target_mw_override = getattr(self, "predict_target_mw_override", None)
+        target_logp_override = getattr(self, "predict_target_logp_override", None)
         gen_mols = self.sample(
             batch,
             batch_idx,
             return_traj=return_traj,
             target_n_atoms_override=target_override,
             target_mw_override=target_mw_override,
+            target_logp_override=target_logp_override,
         )
 
         # do quick validity check of the generated molecules
@@ -755,6 +757,7 @@ class LightningModuleRates(pl.LightningModule):
         batch_size,
         target_n_atoms_override=None,
         target_mw_override=None,
+        target_logp_override=None,
     ) -> dict:
         """Build the cfg_inputs dict for inference."""
         properties = self.cfg_adapter.extract_properties(mol_t)
@@ -789,6 +792,19 @@ class LightningModuleRates(pl.LightningModule):
         else:
             target_mw = self.cfg_adapter.extract_target_mw(mol_1)
 
+        if target_logp_override is not None:
+            if isinstance(target_logp_override, (int, float)):
+                target_logp = torch.full(
+                    (batch_size,),
+                    float(target_logp_override),
+                    dtype=torch.float,
+                    device=self.device,
+                )
+            else:
+                target_logp = target_logp_override.to(self.device)
+        else:
+            target_logp = self.cfg_adapter.extract_target_logp(mol_1)
+
         return {
             "properties": properties,
             "property_drop_mask": None,
@@ -796,6 +812,8 @@ class LightningModuleRates(pl.LightningModule):
             "natoms_drop_mask": None,
             "target_mw": target_mw,
             "mw_drop_mask": None,
+            "target_logp": target_logp,
+            "logp_drop_mask": None,
         }
 
     def sample(
@@ -805,6 +823,7 @@ class LightningModuleRates(pl.LightningModule):
         return_traj: bool = False,
         target_n_atoms_override: torch.Tensor | int | None = None,
         target_mw_override: torch.Tensor | float | None = None,
+        target_logp_override: torch.Tensor | float | None = None,
     ):
         """
         Inference step for flow matching.
@@ -817,6 +836,8 @@ class LightningModuleRates(pl.LightningModule):
                 Shape (batch_size,) with integer atom counts.
             target_mw_override: If provided, overrides the target molecular weight.
                 Shape (batch_size,) with MW in Daltons, or a scalar float.
+            target_logp_override: If provided, overrides the RDKit Crippen logP
+                target.  Shape (batch_size,) with floats, or a scalar float.
 
         Returns:
             If return_traj is False: MoleculeBatch - final sampled molecules
@@ -860,6 +881,7 @@ class LightningModuleRates(pl.LightningModule):
             batch_size,
             target_n_atoms_override,
             target_mw_override,
+            target_logp_override,
         )
 
         # Integration loop: integrate from t=0 to t=1

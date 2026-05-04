@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import hydra
 import omegaconf
 import torch
@@ -5,11 +7,13 @@ import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from omegaconf import DictConfig
 from omegaconf import OmegaConf
+from rdkit import Chem
 from torch_geometric.utils import to_dense_adj
 
 from chemflow.flow_matching.interpolation import Interpolator
 from chemflow.flow_matching.assignment import partial_optimal_transport_single
 from chemflow.dataset.molecule_data import (
+    IDX_BOND_MAP,
     AugmentedMoleculeData,
     MoleculeData,
     MoleculeBatch,
@@ -19,7 +23,8 @@ import torch.nn.functional as F
 
 from chemflow.flow_matching.schedules import FastPowerSchedule
 from chemflow.flow_matching.schedules import SmoothstepSchedule
-from chemflow.utils.utils import init_uniform_prior
+from chemflow.utils.repr import tensors_to_rdkit_mol
+from chemflow.utils.utils import index_to_token, init_uniform_prior
 
 # resolvers for more complex config expressions
 OmegaConf.register_new_resolver("oc.eval", eval)
@@ -30,6 +35,8 @@ OmegaConf.register_new_resolver("eq", lambda x, y: x == y)
 torch.set_float32_matmul_precision("medium")
 
 pl.seed_everything(42)
+
+COORD_STD = 1.0
 
 
 def pre_sample_events(
@@ -282,6 +289,141 @@ def smooth_trajectory(
     return trajectory
 
 
+def _build_raw_mol(
+    atom_symbols: list[str],
+    coords,
+    charges: list[int],
+    edge_types: list[Chem.BondType],
+    edge_index_list: list[tuple[int, int]],
+) -> Chem.Mol | None:
+    """Build an unsanitized RDKit mol with bonds, even if chemically invalid."""
+    try:
+        mol = Chem.EditableMol(Chem.Mol())
+        for sym, ch in zip(atom_symbols, charges, strict=True):
+            atom = Chem.Atom(sym)
+            atom.SetFormalCharge(int(ch))
+            atom.SetNoImplicit(True)
+            mol.AddAtom(atom)
+        for (start, end), btype in zip(edge_index_list, edge_types, strict=True):
+            if start == end:
+                continue
+            mol.AddBond(int(start), int(end), btype)
+        mol = mol.GetMol()
+        conf = Chem.Conformer(len(atom_symbols))
+        for i, xyz in enumerate(coords):
+            conf.SetAtomPosition(i, tuple(map(float, xyz)))
+        mol.AddConformer(conf, assignId=True)
+        for atom in mol.GetAtoms():
+            atom.UpdatePropertyCache(strict=False)
+        return mol
+    except Exception:
+        return None
+
+
+def _frame_to_rdkit(
+    frame: AugmentedMoleculeData | MoleculeData, vocab
+) -> Chem.Mol | None:
+    """Convert one trajectory frame into an unsanitized RDKit mol.
+
+    Atom counts vary across frames (insertions/deletions), so each frame is
+    written as its own molecule entry rather than a conformer. Sanitization is
+    skipped so chemically invalid intermediate states still produce a writable
+    mol with bonds; if even the unsanitized build raises, falls back to the
+    same atoms+bonds via _build_raw_mol.
+    """
+    if frame.num_nodes == 0:
+        return None
+
+    mol_data = MoleculeData(
+        x=frame.x,
+        a=frame.a,
+        c=frame.c,
+        e=frame.e,
+        edge_index=frame.edge_index,
+    )
+
+    a = mol_data.a.detach().cpu().numpy()
+    x = mol_data.x.detach().cpu().numpy() * COORD_STD
+    c = mol_data.c.detach().cpu().numpy()
+
+    atom_syms = [index_to_token(vocab.atom_tokens, int(i)) for i in a]
+    charge_vals = [int(index_to_token(vocab.charge_tokens, int(i))) for i in c]
+
+    edge_types: list[Chem.BondType] = []
+    edge_index_list: list[tuple[int, int]] = []
+    if mol_data.num_nodes > 1 and mol_data.e is not None and mol_data.e.numel() > 0:
+        e_triu, edge_index_triu = mol_data.get_e_triu()
+        e_arr = e_triu.detach().cpu().numpy()
+        edge_idx_arr = edge_index_triu.detach().cpu().numpy().T.tolist()
+        edge_token_strs = [index_to_token(vocab.edge_tokens, int(i)) for i in e_arr]
+        for edge, tok in zip(edge_idx_arr, edge_token_strs, strict=True):
+            if tok == "<NO_BOND>":
+                continue
+            edge_types.append(IDX_BOND_MAP[tok])
+            edge_index_list.append(edge)
+
+    mol = None
+    try:
+        mol = tensors_to_rdkit_mol(
+            atom_syms, x, charge_vals, edge_types, edge_index_list, sanitize=False
+        )
+    except Exception:
+        mol = None
+
+    if mol is None:
+        mol = _build_raw_mol(atom_syms, x, charge_vals, edge_types, edge_index_list)
+    return mol
+
+
+def _write_trajectory_sdf(
+    path: Path,
+    trajectory: list[AugmentedMoleculeData],
+    time_points: torch.Tensor,
+    vocab,
+    target: AugmentedMoleculeData | MoleculeData | None = None,
+) -> int:
+    """Write one trajectory as a multi-entry SDF. Returns frames written."""
+    writer = Chem.SDWriter(str(path))
+    writer.SetKekulize(False)
+    n_written = 0
+
+    def _emit(mol: Chem.Mol | None, name: str, frame_idx: int, t_val: float) -> None:
+        nonlocal n_written
+        if mol is None:
+            print(f"  {path.name}: dropping {name}: empty frame")
+            return
+        mol.SetProp("_Name", name)
+        mol.SetProp("frame_idx", str(frame_idx))
+        mol.SetProp("t", f"{t_val:.6f}")
+        try:
+            writer.write(mol)
+            n_written += 1
+        except Exception as e:
+            print(
+                f"  {path.name}: write failed for {name} ({e}); retrying without bonds"
+            )
+            stripped = Chem.RWMol(mol)
+            for bond in list(stripped.GetBonds()):
+                stripped.RemoveBond(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+            stripped.SetProp("_Name", name)
+            stripped.SetProp("frame_idx", str(frame_idx))
+            stripped.SetProp("t", f"{t_val:.6f}")
+            try:
+                writer.write(stripped)
+                n_written += 1
+            except Exception as e2:
+                print(f"  {path.name}: still failed for {name}: {e2}")
+
+    try:
+        for idx, (frame, t) in enumerate(zip(trajectory, time_points, strict=True)):
+            _emit(_frame_to_rdkit(frame, vocab), f"frame_{idx:04d}", idx, float(t))
+        if target is not None:
+            _emit(_frame_to_rdkit(target, vocab), "ground_truth", -1, 1.0)
+    finally:
+        writer.close()
+    return n_written
+
+
 def run(cfg: DictConfig):
     OmegaConf.set_struct(cfg, False)
 
@@ -291,6 +433,13 @@ def run(cfg: DictConfig):
     vocab = preprocessing.vocab
     distributions = preprocessing.distributions
     token_prior_distribution = init_uniform_prior(distributions)
+
+    global COORD_STD
+    COORD_STD = (
+        float(distributions.coordinate_std)
+        if distributions.coordinate_std is not None
+        else 1.0
+    )
 
     cfg.data.vocab = vocab
     print(distributions)
@@ -323,8 +472,8 @@ def run(cfg: DictConfig):
         vocab=vocab,
         distributions=token_prior_distribution,
         ins_noise_scale=0.25,
-        ins_schedule=SmoothstepSchedule(shift=0.65),
-        del_schedule=SmoothstepSchedule(shift=0.65),
+        ins_schedule=SmoothstepSchedule(shift=0.8),
+        del_schedule=SmoothstepSchedule(shift=0.8),
         sub_schedule=SmoothstepSchedule(shift=1.5),
         sub_e_schedule=SmoothstepSchedule(shift=1.5),
         c_del=0.0,
@@ -339,7 +488,7 @@ def run(cfg: DictConfig):
         distributions=token_prior_distribution,
     )
 
-    num_steps = 100
+    num_steps = 30
     if integrator.time_strategy == "linear":
         time_points = torch.linspace(0, 1, num_steps + 1, device=device)
     elif integrator.time_strategy == "log":
@@ -358,7 +507,12 @@ def run(cfg: DictConfig):
     results = []
     targets_single = []
 
-    for sample_single, target_single in zip(samples_list, targets_list):
+    sdf_dir = Path(cfg.get("sdf_dir", "interpolation_sdfs"))
+    sdf_dir.mkdir(parents=True, exist_ok=True)
+
+    for mol_idx, (sample_single, target_single) in enumerate(
+        zip(samples_list, targets_list, strict=True)
+    ):
         trajectory = smooth_trajectory(
             interpolator,
             sample_single,
@@ -368,6 +522,12 @@ def run(cfg: DictConfig):
         )
         results.append(trajectory)
         targets_single.append(target_single)
+
+        sdf_path = sdf_dir / f"mol_{mol_idx:04d}.sdf"
+        n_written = _write_trajectory_sdf(
+            sdf_path, trajectory, time_points, vocab, target=target_single
+        )
+        print(f"wrote {n_written} frames to {sdf_path}")
 
     torch.save(results, "results.pt")
     torch.save(targets_single, "ground_truth.pt")

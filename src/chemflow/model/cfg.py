@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from rdkit.Chem import GetPeriodicTable
+from rdkit import Chem
+from rdkit.Chem import Crippen, GetPeriodicTable
 
 from chemflow.dataset.qm9 import QM9_PROPERTY_NAMES
 from chemflow.model.embedding import (
@@ -50,6 +51,8 @@ class CFGAdapter:
         natoms_cfg_guidance_scale: float = 2.5,
         mw_cfg_dropout_prob: float = 0.15,
         mw_cfg_guidance_scale: float = 0.0,
+        logp_cfg_dropout_prob: float = 0.0,
+        logp_cfg_guidance_scale: float = 0.0,
         atom_tokens: list[str] | None = None,
         property_names: list[str] | None = None,
     ):
@@ -60,6 +63,8 @@ class CFGAdapter:
         self.natoms_cfg_guidance_scale = float(natoms_cfg_guidance_scale)
         self.mw_cfg_dropout_prob = float(mw_cfg_dropout_prob)
         self.mw_cfg_guidance_scale = float(mw_cfg_guidance_scale)
+        self.logp_cfg_dropout_prob = float(logp_cfg_dropout_prob)
+        self.logp_cfg_guidance_scale = float(logp_cfg_guidance_scale)
         self.atom_tokens = atom_tokens
 
         if property_names is not None:
@@ -91,6 +96,11 @@ class CFGAdapter:
     def _has_mw_cfg(self) -> bool:
         e = self._cfg_embedding
         return e is not None and getattr(e, "mw_encoder", None) is not None
+
+    @property
+    def _has_logp_cfg(self) -> bool:
+        e = self._cfg_embedding
+        return e is not None and getattr(e, "logp_encoder", None) is not None
 
     def extract_properties(self, mols_t) -> torch.Tensor | None:
         if not self._has_property_conditioning:
@@ -150,6 +160,22 @@ class CFGAdapter:
         b = batch if batch is not None else mols.batch
         return compute_molecular_weight(mols.a, self.atom_tokens, b, mols.num_graphs)
 
+    def extract_target_logp(self, mols) -> torch.Tensor | None:
+        """Per-graph RDKit Crippen logP, computed on-the-fly from SMILES.
+
+        Expects ``mols.smiles`` to be either a single string (single graph) or
+        a list of canonical SMILES of length ``num_graphs`` (the form PyG
+        ``Batch`` uses when batching string attributes).  Returns ``None`` if
+        SMILES are unavailable so the embedding falls back to its null token.
+        """
+        if not self._has_logp_cfg:
+            return None
+        smiles = getattr(mols, "smiles", None)
+        if smiles is None:
+            return None
+        device = mols.x.device if hasattr(mols, "x") else None
+        return compute_logp(smiles, device=device)
+
     def _sample_drop_mask(
         self,
         prob: float,
@@ -180,6 +206,13 @@ class CFGAdapter:
             self.mw_cfg_guidance_scale > 0.0
             and target_mw is not None
             and self._has_mw_cfg
+        )
+
+    def should_use_logp_cfg(self, target_logp) -> bool:
+        return (
+            self.logp_cfg_guidance_scale > 0.0
+            and target_logp is not None
+            and self._has_logp_cfg
         )
 
     def apply_cfg(
@@ -243,6 +276,13 @@ class CFGAdapter:
                 device,
                 training,
             ),
+            "target_logp": self.extract_target_logp(mols_1),
+            "logp_drop_mask": self._sample_drop_mask(
+                self.logp_cfg_dropout_prob,
+                bs,
+                device,
+                training,
+            ),
         }
 
     def _uncond_cfg_inputs(self) -> dict:
@@ -254,6 +294,8 @@ class CFGAdapter:
             "natoms_drop_mask": None,
             "target_mw": None,
             "mw_drop_mask": None,
+            "target_logp": None,
+            "logp_drop_mask": None,
         }
 
     def guided_predict(
@@ -271,10 +313,12 @@ class CFGAdapter:
         """
         target_n_atoms = cfg_inputs.get("target_n_atoms")
         target_mw = cfg_inputs.get("target_mw")
+        target_logp = cfg_inputs.get("target_logp")
         properties = cfg_inputs.get("properties")
 
         use_natoms = self.should_use_natoms_cfg(target_n_atoms)
         use_mw = self.should_use_mw_cfg(target_mw)
+        use_logp = self.should_use_logp_cfg(target_logp)
         use_prop = self.should_use_property_cfg(properties)
 
         # At guidance_scale == 1 the linear interpolation
@@ -285,16 +329,22 @@ class CFGAdapter:
         # output with a single model call and skip the uncond pass entirely.
         # Semantics below mirror the sequential loop: the *last* active
         # signal's conditional inputs determine the forward (property cond
-        # uses the full cfg_inputs, mw / natoms cond use the isolated
+        # uses the full cfg_inputs, mw / natoms / logp cond use the isolated
         # signal only).
         scales_all_unit = (
             (not use_natoms or self.natoms_cfg_guidance_scale == 1.0)
             and (not use_mw or self.mw_cfg_guidance_scale == 1.0)
+            and (not use_logp or self.logp_cfg_guidance_scale == 1.0)
             and (not use_prop or self.cfg_guidance_scale == 1.0)
         )
         if scales_all_unit:
             if use_prop:
                 active_cfg_inputs = cfg_inputs
+            elif use_logp:
+                active_cfg_inputs = {
+                    **self._uncond_cfg_inputs(),
+                    "target_logp": target_logp,
+                }
             elif use_mw:
                 active_cfg_inputs = {
                     **self._uncond_cfg_inputs(),
@@ -353,6 +403,20 @@ class CFGAdapter:
                 self.mw_cfg_guidance_scale,
             )
 
+        if use_logp:
+            cond = {**uncond, "target_logp": target_logp}
+            preds_cond = model(
+                mol_t,
+                t.view(-1, 1),
+                prev_outs=prev_preds,
+                cfg_inputs=cond,
+            )
+            preds = self.apply_cfg(
+                preds_cond,
+                preds,
+                self.logp_cfg_guidance_scale,
+            )
+
         if use_prop:
             preds_cond = model(
                 mol_t,
@@ -405,6 +469,29 @@ def compute_molecular_weight(
         return mw
 
     return per_atom_mw.sum().unsqueeze(0)
+
+
+def compute_logp(
+    smiles: list[str] | str,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Compute RDKit Crippen MolLogP for each SMILES on the fly.
+
+    Args:
+        smiles: A single canonical SMILES or a list of length ``num_graphs``.
+            Empty / unparsable strings yield 0.0 (the trained null prior).
+        device: Device for the returned tensor.
+
+    Returns:
+        ``(num_graphs,)`` float tensor of logP values.
+    """
+    if isinstance(smiles, str):
+        smiles = [smiles]
+    values: list[float] = []
+    for s in smiles:
+        mol = Chem.MolFromSmiles(s) if s else None
+        values.append(float(Crippen.MolLogP(mol)) if mol is not None else 0.0)
+    return torch.tensor(values, dtype=torch.float, device=device)
 
 
 def _encode_signal(
@@ -465,6 +552,11 @@ class UnifiedCFGEmbedding(nn.Module):
         use_mw: bool = False,
         mw_sinusoidal_dim: int = 64,
         mw_max_period: float = 1000.0,
+        # LogP conditioning (RDKit Crippen, computed on the fly from SMILES)
+        use_logp: bool = False,
+        logp_sinusoidal_dim: int = 64,
+        # QM9 logP roughly spans [-3, 6]; period 20 gives well-separated phases.
+        logp_max_period: float = 20.0,
     ):
         super().__init__()
         self.out_dim = out_dim
@@ -516,6 +608,20 @@ class UnifiedCFGEmbedding(nn.Module):
             self._mw_null = nn.Parameter(torch.randn(mw_sinusoidal_dim) * 0.02)
             internal_dim += mw_sinusoidal_dim
 
+        self.logp_encoder = None
+        self._logp_null = None
+        if use_logp:
+            self._logp_sinusoidal = SinusoidalEncoding(
+                logp_sinusoidal_dim, max_period=logp_max_period
+            )
+            self.logp_encoder = nn.Sequential(
+                nn.Linear(logp_sinusoidal_dim, logp_sinusoidal_dim),
+                nn.SiLU(),
+                nn.Linear(logp_sinusoidal_dim, logp_sinusoidal_dim),
+            )
+            self._logp_null = nn.Parameter(torch.randn(logp_sinusoidal_dim) * 0.02)
+            internal_dim += logp_sinusoidal_dim
+
         if internal_dim > 0:
             self.projection = nn.Sequential(
                 nn.Linear(internal_dim, out_dim),
@@ -543,6 +649,19 @@ class UnifiedCFGEmbedding(nn.Module):
         if drop_mask is not None:
             null = self._mw_null.unsqueeze(0).expand_as(emb)
             emb = torch.where(drop_mask.unsqueeze(-1), null, emb)
+        return emb
+
+    def _encode_logp(self, value, drop_mask, batch_size):
+        if value is None:
+            return self._logp_null.unsqueeze(0).expand(batch_size, -1)
+        if value.ndim == 1:
+            value = value.unsqueeze(-1)
+        emb = self.logp_encoder(self._logp_sinusoidal(value))
+        if drop_mask is not None:
+            null = self._logp_null.unsqueeze(0).expand_as(emb)
+            emb = torch.where(drop_mask.unsqueeze(-1), null, emb)
+        else:
+            emb = emb + self._logp_null.sum() * 0
         return emb
 
     def forward(
@@ -579,6 +698,15 @@ class UnifiedCFGEmbedding(nn.Module):
                 self._encode_mw(
                     cfg_inputs.get("target_mw"),
                     cfg_inputs.get("mw_drop_mask"),
+                    batch_size,
+                )
+            )
+
+        if self.logp_encoder is not None:
+            parts.append(
+                self._encode_logp(
+                    cfg_inputs.get("target_logp"),
+                    cfg_inputs.get("logp_drop_mask"),
                     batch_size,
                 )
             )
