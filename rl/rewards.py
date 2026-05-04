@@ -173,6 +173,9 @@ def scaffold_diversity_wrapper(
 
     Diagnostics from the base function are copied; ``scaffold_*`` keys are added.
     A second pass over ``_iter_valid_mols`` extracts the bucket id (Murcko or SMILES).
+    Current-batch bucket slots are allocated after all ids are known, with random
+    tie-breaking when a bucket is overfull. This preserves the original hard
+    bucket capacity while avoiding first-come-first-served bias from batch order.
     """
     if bucket_size < 1:
         raise ValueError(f"bucket_size must be >= 1, got {bucket_size}")
@@ -187,11 +190,11 @@ def scaffold_diversity_wrapper(
         r, diag = base_reward_fn(module, trajectory)
         diag_out = dict(diag)
 
-        batch_scaffolds: dict[str, int] = {}
         n_valid = 0
         n_penalized = 0
         n_scaffold_fail = 0
         mask = torch.ones_like(r, dtype=r.dtype, device=r.device)
+        bucket_to_indices: dict[str, list[int]] = {}
 
         for idx, (rd, ok) in enumerate(_iter_valid_mols(module, trajectory)):
             if not ok or rd is None:
@@ -206,14 +209,28 @@ def scaffold_diversity_wrapper(
             if bucket_id is None:
                 n_scaffold_fail += 1
                 continue
+            bucket_to_indices.setdefault(bucket_id, []).append(idx)
 
-            total_seen = mem.total_seen(bucket_id)
-            batch_seen = batch_scaffolds.get(bucket_id, 0)
-            if total_seen + batch_seen >= bucket_size:
-                mask[idx] = penalty
-                n_penalized += 1
+        batch_scaffolds: dict[str, int] = {}
+        for bucket_id, indices in bucket_to_indices.items():
+            available = bucket_size - mem.total_seen(bucket_id)
+            if available <= 0:
+                accepted: set[int] = set()
+            elif available >= len(indices):
+                accepted = set(indices)
             else:
-                batch_scaffolds[bucket_id] = batch_seen + 1
+                perm = torch.randperm(len(indices), device=r.device)[:available]
+                accepted = {indices[int(i)] for i in perm.detach().cpu().tolist()}
+
+            accepted_count = 0
+            for idx in indices:
+                if idx in accepted:
+                    accepted_count += 1
+                else:
+                    mask[idx] = penalty
+                    n_penalized += 1
+            if accepted_count > 0:
+                batch_scaffolds[bucket_id] = accepted_count
 
         mem.commit_batch(batch_scaffolds)
 
@@ -324,6 +341,21 @@ def n_atoms_reward(module, trajectory) -> tuple[torch.Tensor, dict[str, float]]:
 
 _SHAPE_REF_SMILES = "CCCNC(C)C(=O)Nc1ccccc1C"  # Prilocaine
 _SHAPE_REF_CACHE: dict | None = None
+_TANIMOTO_REF_CACHE: dict | None = None
+
+
+def _get_tanimoto_ref() -> dict:
+    global _TANIMOTO_REF_CACHE
+    if _TANIMOTO_REF_CACHE is None:
+        from rdkit.Chem import rdFingerprintGenerator
+
+        mol = Chem.MolFromSmiles(_SHAPE_REF_SMILES)
+        morgan_gen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+        _TANIMOTO_REF_CACHE = {
+            "fp": morgan_gen.GetFingerprint(mol),
+            "morgan_gen": morgan_gen,
+        }
+    return _TANIMOTO_REF_CACHE
 
 
 def _get_shape_ref() -> dict:
@@ -411,6 +443,38 @@ def shape_reward(module, trajectory) -> tuple[torch.Tensor, dict[str, float]]:
         "shape_product_max_valid": max(product_vals) if product_vals else 0.0,
     }
 
+
+def tanimoto_reward(module, trajectory) -> tuple[torch.Tensor, dict[str, float]]:
+    """Morgan Tanimoto to Prilocaine if valid, else 0."""
+    from rdkit.Chem import DataStructs
+
+    device = trajectory.mol_final.x.device
+    ref = _get_tanimoto_ref()
+    rewards: list[float] = []
+    vals: list[float] = []
+    n_valid = 0
+
+    for rd, ok in _iter_valid_mols(module, trajectory):
+        if not ok or rd is None:
+            rewards.append(0.0)
+            continue
+        n_valid += 1
+        try:
+            sim = DataStructs.TanimotoSimilarity(
+                ref["morgan_gen"].GetFingerprint(rd),
+                ref["fp"],
+            )
+        except Exception:
+            sim = 0.0
+        rewards.append(sim)
+        vals.append(sim)
+
+    return _as_tensor(rewards, device), {
+        "p_valid": n_valid / max(len(rewards), 1),
+        "tanimoto_mean_valid": (sum(vals) / len(vals)) if vals else 0.0,
+        "tanimoto_max_valid": max(vals) if vals else 0.0,
+    }
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Registry (add new rewards here)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -421,4 +485,5 @@ REWARDS: dict[str, Callable] = {
     "qed": qed_reward,
     "n_atoms": n_atoms_reward,
     "shape": shape_reward,
+    "tanimoto": tanimoto_reward,
 }
