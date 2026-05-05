@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""CLI driver for GRPO fine-tuning.
+"""Hydra CLI driver for GRPO fine-tuning.
 
 Owns the shared RL setup helpers (Hydra config composition, module/datamodule
 construction, and checkpoint loading) and plugs the module into `rl.grpo.train`.
 
 Example:
     python -m rl.run_grpo \
-        --ckpt .pretrained_model/epoch=499-step=48500.ckpt \
-        --n_updates 200 \
-        --num_steps 40 \
+        'rl.ckpt=".pretrained_model/epoch=499-step=48500.ckpt"' \
+        rl.n_updates=200 \
+        rl.grpo.num_integration_steps=40 \
         data.n_atoms_strategy=fixed
 
 Any trailing args are Hydra overrides.
@@ -29,7 +29,7 @@ import hydra  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from hydra import compose, initialize_config_dir  # noqa: E402
-from omegaconf import OmegaConf  # noqa: E402
+from omegaconf import DictConfig, OmegaConf  # noqa: E402
 
 
 def seed_everything(seed: int) -> None:
@@ -46,10 +46,20 @@ def seed_everything(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-OmegaConf.register_new_resolver("oc.eval", eval)
-OmegaConf.register_new_resolver("len", lambda x: len(x))
-OmegaConf.register_new_resolver("if", lambda cond, t, f: t if cond else f)
-OmegaConf.register_new_resolver("eq", lambda x, y: x == y)
+def register_resolvers() -> None:
+    """Register custom resolvers used by ChemFlow configs."""
+    resolvers = {
+        "oc.eval": eval,
+        "len": lambda x: len(x),
+        "if": lambda cond, t, f: t if cond else f,
+        "eq": lambda x, y: x == y,
+    }
+    for name, fn in resolvers.items():
+        if not OmegaConf.has_resolver(name):
+            OmegaConf.register_new_resolver(name, fn)
+
+
+register_resolvers()
 
 from chemflow.dataset.vocab import setup_token_weights  # noqa: E402
 from chemflow.utils.metrics import init_metrics  # noqa: E402
@@ -132,204 +142,155 @@ def first_test_dataloader(datamodule):
     return dls
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--ckpt",
-        default=os.path.join(_PROJECT_ROOT, ".pretrained_model", "epoch=499-step=48500.ckpt"),
-    )
-    ap.add_argument("--config_path", default=os.path.join(_PROJECT_ROOT, "configs"))
-    ap.add_argument("--config_name", default="default")
-    ap.add_argument("--n_updates", type=int, default=100)
-    ap.add_argument("--num_steps", type=int, default=None,
-                    help="Integration steps per rollout; default = module's own setting")
-    ap.add_argument(
-        "--max_atoms",
-        type=int,
-        default=60,
-        help="Maximum atoms allowed by the variable-atom integrator during GRPO.",
-    )
-    ap.add_argument("--lr", type=float, default=1e-5)
-    ap.add_argument(
-        "--sigma_explore",
-        type=float,
-        default=0.05,
-        help="Per-coordinate std σ for position kernel N(x+v·dt, σ² I) (see GRPOConfig.sigma_explore).",
-    )
-    ap.add_argument("--clip_eps", type=float, default=0.2)
-    ap.add_argument("--max_grad_norm", type=float, default=1.0,
-                    help="Global-norm gradient clip threshold; pass 0 or negative to disable")
-    ap.add_argument("--group_size", type=int, default=1,
-                    help="GRPO group size G: number of rollouts per shared prompt. "
-                         "G=1 recovers batch-relative advantages (the old default). "
-                         "G>1 replicates each prompt G times in-place, so the "
-                         "effective unique-prompt count per update is batch_size // G.")
-    ap.add_argument(
-        "--update_passes",
-        type=int,
-        default=1,
-        help="Number of PPO-style optimization passes over one sampled trajectory "
-             "(importance ratios always use rollout lp_old).",
-    )
-    ap.add_argument("--seed", type=int, default=0,
-                    help="Seed for python/numpy/torch RNGs. Does not pin cuDNN.")
-    ap.add_argument("--kl_coef", type=float, default=0.0,
-                    help="β for reverse-KL to frozen ref (k3 per channel). 0 = disabled "
-                         "(no second model copy, no extra forward).")
-    ap.add_argument(
-        "--kl_omit_pos",
-        action="store_true",
-        help="Exclude the position channel from the k3 KL term (other channels unchanged).",
-    )
-    ap.add_argument(
-        "--per_element_logp_mean",
-        action="store_true",
-        help="Use mean within each RL channel before summing channels (positions: per "
-             "Cartesian coord, i.e. denom 3×surviving atoms). May require a larger "
-             "--kl_coef when using ref KL. Default: sum within each channel.",
-    )
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--log_every", type=int, default=1)
-    ap.add_argument(
-        "--reward", default="validity", choices=sorted(REWARDS),
-        help="Reward name (see rl/rewards.py::REWARDS). "
-             "Combine with --scaffold_diversity for scaffold/SMILES bucket gating.",
-    )
-    ap.add_argument(
-        "--scaffold_diversity",
-        action="store_true",
-        help="Wrap the chosen reward with REINVENT-style occurrence bucketing "
-             "(see --scaffold_diversity_key).",
-    )
-    ap.add_argument(
-        "--scaffold_bucket_size",
-        type=int,
-        default=10,
-        help="With --scaffold_diversity: max occurrences per scaffold before penalty.",
-    )
-    ap.add_argument(
-        "--scaffold_penalty",
-        type=float,
-        default=0.0,
-        help="With --scaffold_diversity: multiply reward when bucket is full (0 = hard zero).",
-    )
-    ap.add_argument(
-        "--scaffold_window_batches",
-        type=int,
-        default=-1,
-        help="With --scaffold_diversity: rolling memory length in batches (-1 = full run).",
-    )
-    ap.add_argument(
-        "--scaffold_labeled",
-        action="store_true",
-        help="With --scaffold_diversity and --scaffold_diversity_key murcko: "
-             "labeled Murcko scaffold; default is generic carbon skeleton "
-             "(MakeScaffoldGeneric). Ignored for canonical_smiles.",
-    )
-    ap.add_argument(
-        "--scaffold_diversity_key",
-        default="murcko",
-        choices=("murcko", "canonical_smiles"),
-        help="With --scaffold_diversity: bucket identity per molecule — Bemis–Murcko "
-             "scaffold (murcko) or full canonical SMILES (canonical_smiles).",
-    )
-    ap.add_argument("--wandb", action="store_true", help="Log metrics to wandb.")
-    ap.add_argument("--wandb_project", default="chemflow-grpo")
-    ap.add_argument("--wandb_name", default=None)
-    ap.add_argument(
-        "--wandb_group",
-        default=None,
-        help="Optional W&B run group (sweep / compare runs in the project UI).",
-    )
-    ap.add_argument("--save", default=None, help="Optional path to dump final module state_dict")
-    ap.add_argument("--save_best", default=None,
-                    help="Optional path to save the best (smoothed) reward checkpoint during training")
-    ap.add_argument("--best_ema_beta", type=float, default=0.9,
-                    help="EMA smoothing coefficient for reward (higher = smoother, ~1/(1-beta) effective window)")
-    ap.add_argument("--best_warmup_steps", type=int, default=3,
-                    help="Skip best-ckpt updates for the first N steps")
-    ap.add_argument("overrides", nargs="*")
-    args = ap.parse_args()
+def _resolve_device(device: str) -> str:
+    if device == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return device
 
-    seed_everything(args.seed)
 
-    cfg = compose_cfg(args.config_path, args.config_name, overrides=list(args.overrides))
+def _resolve_path(path: str | None) -> str | None:
+    if path is None:
+        return None
+    path = os.path.expanduser(str(path))
+    if os.path.isabs(path):
+        return path
+    return os.path.abspath(path)
+
+
+def build_grpo_config(grpo_cfg: DictConfig) -> GRPOConfig:
+    kwargs = dict(OmegaConf.to_container(grpo_cfg, resolve=True))
+    max_grad_norm = kwargs.get("max_grad_norm")
+    if max_grad_norm is not None and float(max_grad_norm) <= 0:
+        kwargs["max_grad_norm"] = None
+    return GRPOConfig(**kwargs)
+
+
+def build_reward(reward_cfg: DictConfig):
+    name = str(reward_cfg.name)
+    if name not in REWARDS:
+        raise ValueError(
+            f"Unknown RL reward {name!r}. Available rewards: {sorted(REWARDS)}"
+        )
+
+    reward_fn = REWARDS[name]
+    if not bool(reward_cfg.scaffold_diversity):
+        return reward_fn
+
+    bucket_size = int(reward_cfg.scaffold_bucket_size)
+    if bucket_size < 1:
+        raise ValueError(f"scaffold_bucket_size must be >= 1, got {bucket_size}")
+
+    window_batches_raw = int(reward_cfg.scaffold_window_batches)
+    scaffold_window = None if window_batches_raw < 0 else window_batches_raw
+    if scaffold_window is not None and scaffold_window < 1:
+        raise ValueError(
+            "scaffold_window_batches must be >= 1 or -1 (full run), "
+            f"got {window_batches_raw}"
+        )
+
+    return scaffold_diversity_wrapper(
+        reward_fn,
+        bucket_size=bucket_size,
+        penalty=float(reward_cfg.scaffold_penalty),
+        generic_scaffold=not bool(reward_cfg.scaffold_labeled),
+        diversity_bucket=str(reward_cfg.scaffold_diversity_key),
+        window_batches=scaffold_window,
+    )
+
+
+def _init_wandb(cfg: DictConfig, config_payload: dict):
+    if not bool(cfg.rl.wandb.enabled):
+        return None
+    import wandb
+
+    w_init = {
+        "project": str(cfg.rl.wandb.project),
+        "name": None if cfg.rl.wandb.name is None else str(cfg.rl.wandb.name),
+        "config": config_payload,
+    }
+    if cfg.rl.wandb.group:
+        w_init["group"] = str(cfg.rl.wandb.group)
+    return wandb.init(**w_init)
+
+
+def run_from_cfg(cfg: DictConfig):
+    OmegaConf.set_struct(cfg, False)
+
+    seed_everything(int(cfg.rl.seed))
+
+    ckpt_path = _resolve_path(cfg.rl.ckpt)
+    save_path = _resolve_path(cfg.rl.save)
+    save_best_path = _resolve_path(cfg.rl.save_best)
+    wandb_config = OmegaConf.to_container(cfg, resolve=False)
+
+    print(
+        "[grpo] building datamodule + metrics (slow on cold cache / NFS) …",
+        flush=True,
+    )
     module, datamodule = build_module_and_datamodule(cfg)
-    module = load_ckpt_into_module(module, args.ckpt)
-    module.integrator.max_atoms = args.max_atoms
+    print(f"[grpo] loading checkpoint: {ckpt_path}", flush=True)
+    module = load_ckpt_into_module(module, ckpt_path)
+    module.integrator.max_atoms = int(cfg.rl.max_atoms)
 
-    if args.group_size < 1:
-        raise ValueError(f"--group_size must be >= 1, got {args.group_size}")
-    if args.update_passes < 1:
-        raise ValueError(f"--update_passes must be >= 1, got {args.update_passes}")
+    if int(cfg.rl.grpo.group_size) < 1:
+        raise ValueError(f"rl.grpo.group_size must be >= 1, got {cfg.rl.grpo.group_size}")
+    if int(cfg.rl.grpo.update_passes) < 1:
+        raise ValueError(
+            f"rl.grpo.update_passes must be >= 1, got {cfg.rl.grpo.update_passes}"
+        )
 
-    grpo_cfg = GRPOConfig(
-        sigma_explore=args.sigma_explore,
-        clip_eps=args.clip_eps,
-        num_integration_steps=args.num_steps,
-        max_grad_norm=(args.max_grad_norm if args.max_grad_norm and args.max_grad_norm > 0 else None),
-        group_size=args.group_size,
-        update_passes=args.update_passes,
-        kl_coef=args.kl_coef,
-        kl_omit_pos=args.kl_omit_pos,
-        per_element_logp_mean=args.per_element_logp_mean,
-    )
+    grpo_cfg = build_grpo_config(cfg.rl.grpo)
 
     dataloader = first_test_dataloader(datamodule)
+    reward_fn = build_reward(cfg.rl.reward)
+    device = _resolve_device(str(cfg.rl.device))
 
-    if args.wandb:
-        import wandb
-        w_init = dict(
-            project=args.wandb_project, name=args.wandb_name, config=vars(args)
-        )
-        if args.wandb_group:
-            w_init["group"] = args.wandb_group
-        wandb.init(**w_init)
-
-    reward_fn = REWARDS[args.reward]
-    if args.scaffold_diversity:
-        if args.scaffold_bucket_size < 1:
-            raise ValueError(
-                f"--scaffold_bucket_size must be >= 1, got {args.scaffold_bucket_size}",
-            )
-        scaffold_window = None if args.scaffold_window_batches < 0 else args.scaffold_window_batches
-        if scaffold_window is not None and scaffold_window < 1:
-            raise ValueError(
-                f"--scaffold_window_batches must be >= 1 or -1 (full run), got "
-                f"{args.scaffold_window_batches}",
-            )
-        reward_fn = scaffold_diversity_wrapper(
-            reward_fn,
-            bucket_size=args.scaffold_bucket_size,
-            penalty=args.scaffold_penalty,
-            generic_scaffold=not args.scaffold_labeled,
-            diversity_bucket=args.scaffold_diversity_key,
-            window_batches=scaffold_window,
-        )
-
+    if bool(cfg.rl.wandb.enabled):
+        print("[grpo] initializing wandb …", flush=True)
+    wandb_run = _init_wandb(cfg, wandb_config)
+    print("[grpo] starting updates (first log line is after step 0 completes)", flush=True)
     try:
         train(
             module,
             dataloader,
             grpo_cfg,
-            n_updates=args.n_updates,
-            lr=args.lr,
-            device=args.device,
-            log_every=args.log_every,
+            n_updates=int(cfg.rl.n_updates),
+            lr=float(cfg.rl.lr),
+            device=device,
+            log_every=int(cfg.rl.log_every),
             reward_fn=reward_fn,
-            best_save_path=args.save_best,
-            best_ema_beta=args.best_ema_beta,
-            best_warmup_steps=args.best_warmup_steps,
+            best_save_path=save_best_path,
+            best_ema_beta=float(cfg.rl.best.ema_beta),
+            best_warmup_steps=int(cfg.rl.best.warmup_steps),
         )
     finally:
-        if args.wandb:
-            import wandb
-            wandb.finish()
+        if wandb_run is not None:
+            wandb_run.finish()
 
-    if args.save is not None:
-        os.makedirs(os.path.dirname(os.path.abspath(args.save)) or ".", exist_ok=True)
-        torch.save({"state_dict": module.state_dict()}, args.save)
-        print(f"saved: {args.save}")
+    if save_path is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)) or ".", exist_ok=True)
+        torch.save({"state_dict": module.state_dict()}, save_path)
+        print(f"saved: {save_path}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config_path", default=os.path.join(_PROJECT_ROOT, "configs"))
+    ap.add_argument("--config_name", default="rl/grpo")
+    ap.add_argument(
+        "--cfg",
+        choices=("job",),
+        default=None,
+        help="Print the composed job config and exit.",
+    )
+    ap.add_argument("overrides", nargs="*")
+    args = ap.parse_args()
+
+    cfg = compose_cfg(args.config_path, args.config_name, overrides=list(args.overrides))
+    if args.cfg == "job":
+        print(OmegaConf.to_yaml(cfg))
+        return
+    run_from_cfg(cfg)
 
 
 if __name__ == "__main__":

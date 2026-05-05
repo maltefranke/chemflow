@@ -1,0 +1,64 @@
+# @package _global_
+
+defaults:
+  - /default
+  - _self_
+
+# GRPO fine-tuning config.
+#
+# This composes the normal ChemFlow model/data/trainer stack from
+# configs/default.yaml and adds an `rl` block for RL-only settings.
+# Override examples:
+#   python -m rl.run_grpo rl.n_updates=20
+#   python -m rl.run_grpo rl.grpo.kl_coef=0.03 rl.grpo.group_size=4
+
+rl:
+  # Checkpoints and run control
+  # Keep this pointed at the pretrained model by default. The Slurm continuation
+  # script overrides `rl.ckpt` when continuing from an RL checkpoint.
+  ckpt: .pretrained_model/epoch=499-step=48500.ckpt
+  save: null
+  save_best: null
+  n_updates: 200
+  lr: 1e-4
+  device: auto  # auto | cuda | cpu
+  log_every: 1
+  seed: 0
+  max_atoms: 100
+
+  # Best-checkpoint tracking inside rl.grpo.train
+  best:
+    ema_beta: 0.9
+    warmup_steps: 3
+
+  # Policy / objective settings mapped directly into rl.grpo.GRPOConfig.
+  grpo:
+    sigma_explore: 0.05
+    clip_eps: 0.2
+    eps_t: 0.01
+    log_ratio_clamp: 20.0
+    p_ins_clamp: 0.999
+    num_integration_steps: 100
+    max_grad_norm: 1.0  # null disables; <=0 is also treated as disabled
+    group_size: 8
+    kl_coef: 0.02
+    kl_omit_pos: true
+    update_passes: 2
+    per_element_logp_mean: false
+
+  # Reward registry key and optional REINVENT-style diversity wrapper.
+  reward:
+    name: n_atoms
+    scaffold_diversity: true
+    scaffold_bucket_size: 10
+    scaffold_penalty: 0.5
+    scaffold_window_batches: 50  # -1 = full-run memory; >=1 = rolling batches
+    scaffold_labeled: false
+    scaffold_diversity_key: canonical_smiles  # murcko | canonical_smiles
+
+  # Weights & Biases logging for RL metrics.
+  wandb:
+    enabled: true
+    project: chemflow-grpo-sweep-20260424_111439
+    name: null
+    group: null

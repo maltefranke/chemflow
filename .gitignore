@@ -182,8 +182,10 @@ rl/notes/
 # RL experiment runs: one folder per checkpoint (plots + tensors); reproducible via scripts/notebooks.
 rl/experiments/natoms/grpo_*/
 rl/experiments/shape/grpo_*/
+rl/experiments/tanimoto/grpo_*/
 # Loose PNGs beside notebooks (preferred: write under grpo_* only)
 rl/experiments/natoms/*.png
 rl/experiments/shape/*.png
+rl/experiments/tanimoto/*.png
 
 .codex

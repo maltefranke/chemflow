@@ -11,9 +11,9 @@ Add a new reward by writing a function and registering it in `REWARDS`.
 All built-in rewards gate on RDKit validity: invalid molecules receive 0, so
 validity pressure is preserved regardless of the property being maximized.
 
-Use ``scaffold_diversity_wrapper`` (see ``run_grpo --scaffold_diversity``) to layer
-REINVENT-style occurrence bucketing on top of any registered reward (Murcko scaffold
-or full-molecule canonical SMILES).
+Use ``scaffold_diversity_wrapper`` (or ``rl.reward.scaffold_diversity=true`` in
+``run_grpo``) to layer REINVENT-style occurrence bucketing on top of any
+registered reward (Murcko scaffold or full-molecule canonical SMILES).
 """
 
 from __future__ import annotations
@@ -163,7 +163,7 @@ def scaffold_diversity_wrapper(
 
     ``diversity_bucket``:
       - ``murcko``: Bemis–Murcko scaffold (see ``generic_scaffold`` /
-        ``--scaffold_labeled``).
+        ``rl.reward.scaffold_labeled``).
       - ``canonical_smiles``: full molecule canonical SMILES; labeled/generic
         scaffold flags are ignored.
 
