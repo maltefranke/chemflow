@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Minimal CLI driver for GRPO fine-tuning (Phase 1: no ins/del).
+"""CLI driver for GRPO fine-tuning.
 
-Reuses the setup from `eval_pretrained_validity.py` (same config + ckpt loading)
-and plugs the module into `rl.grpo.train`.
+Owns the shared RL setup helpers (Hydra config composition, module/datamodule
+construction, and checkpoint loading) and plugs the module into `rl.grpo.train`.
 
 Example:
     python -m rl.run_grpo \
@@ -11,7 +11,7 @@ Example:
         --num_steps 40 \
         data.n_atoms_strategy=fixed
 
-Any trailing args are Hydra overrides, exactly as in `eval_pretrained_validity.py`.
+Any trailing args are Hydra overrides.
 """
 
 import argparse

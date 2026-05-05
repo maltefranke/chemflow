@@ -7,9 +7,8 @@ This folder implements **Group Relative Policy Optimization (GRPO)** fine-tuning
 | Path | Role |
 |------|------|
 | [`grpo.py`](grpo.py) | `GRPOConfig`, rollout storage, `train(...)` — algorithm and conventions (time direction, log-prob channels, KL / clipping). Start here for behavior details. |
-| [`run_grpo.py`](run_grpo.py) | CLI: load Hydra config + checkpoint, attach reward, call `train`. Supports W&B, KL to frozen ref, scaffold/SMILES diversity wrapper, best-checkpoint saving. |
+| [`run_grpo.py`](run_grpo.py) | CLI and shared setup helpers: load Hydra config + checkpoint, attach reward, call `train`. Supports W&B, KL to frozen ref, scaffold/SMILES diversity wrapper, best-checkpoint saving. |
 | [`rewards.py`](rewards.py) | Reward functions and `REWARDS` registry. New objectives: implement `(module, trajectory) -> (Tensor(B,), dict)` and register the name. |
-| [`eval_pretrained_validity.py`](eval_pretrained_validity.py) | Sample / validity checks for a **frozen** pretrained checkpoint (shared Hydra setup with `run_grpo`). |
 
 ### Launch scripts
 
@@ -30,7 +29,7 @@ python -m rl.run_grpo \
   data.datamodule.batch_size.test=128
 ```
 
-Trailing arguments are **Hydra overrides** (same pattern as `eval_pretrained_validity.py`): config dir defaults to `configs/`, name to `default`.
+Trailing arguments are **Hydra overrides**: config dir defaults to `configs/`, name to `default`.
 
 Useful flags: `--sigma_explore`, `--kl_coef`, `--kl_omit_pos`, `--group_size`, `--update_passes`, `--per_element_logp_mean`, `--save` / `--save_best`, `--wandb` + project/name/group, and `--scaffold_diversity` with `--scaffold_diversity_key` (`murcko` | `canonical_smiles`).
 

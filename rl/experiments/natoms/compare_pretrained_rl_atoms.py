@@ -9,7 +9,7 @@ Or::
 
     python rl/experiments/natoms/compare_pretrained_rl_atoms.py
 
-Uses the same Hydra stack and checkpoint loading as ``rl/eval_pretrained_validity.py``.
+Uses the same Hydra stack and checkpoint loading as ``rl/run_grpo.py``.
 After each load we set ``module.integrator.max_atoms`` (default ``60``, same as ``rl/run_grpo.py``)
 so insertion overflow matches GRPO inference; pass ``--max_atoms`` to match your RL job.
 Trailing CLI args are forwarded as Hydra overrides (must match how the RL run was trained).
@@ -49,7 +49,7 @@ import torch
 from matplotlib.ticker import MaxNLocator
 from omegaconf import OmegaConf
 
-from rl.eval_pretrained_validity import (
+from rl.run_grpo import (
     build_module_and_datamodule,
     compose_cfg,
     load_ckpt_into_module,
@@ -75,7 +75,7 @@ def _gather_predict_outputs(module, datamodule, cfg, ckpt_path: str, n_mols: int
     module.integrator.max_atoms = max_atoms
     bs = int(cfg.data.datamodule.batch_size.test)
     cfg.trainer.trainer.limit_predict_batches = int(math.ceil(n_mols / max(bs, 1)))
-    # Match `rl/eval_pretrained_validity.py` (Hydra trainer block includes accelerator/strategy).
+    # Match the Hydra trainer block (includes accelerator/strategy).
     trainer = pl.Trainer(
         logger=False,
         callbacks=[],

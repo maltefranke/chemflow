@@ -35,7 +35,7 @@ import pytorch_lightning as pl
 import torch
 from omegaconf import OmegaConf
 
-from rl.eval_pretrained_validity import (
+from rl.run_grpo import (
     build_module_and_datamodule,
     compose_cfg,
     load_ckpt_into_module,
