@@ -350,12 +350,23 @@ def _get_tanimoto_ref() -> dict:
         from rdkit.Chem import rdFingerprintGenerator
 
         mol = Chem.MolFromSmiles(_SHAPE_REF_SMILES)
+        mol = _heavy_atom_mol(mol)
         morgan_gen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
         _TANIMOTO_REF_CACHE = {
             "fp": morgan_gen.GetFingerprint(mol),
             "morgan_gen": morgan_gen,
         }
     return _TANIMOTO_REF_CACHE
+
+
+def _heavy_atom_mol(rd: Chem.Mol) -> Chem.Mol:
+    """Return a heavy-atom copy for graph fingerprints."""
+    try:
+        heavy = Chem.RemoveHs(Chem.Mol(rd), sanitize=True)
+        Chem.SanitizeMol(heavy)
+        return heavy
+    except Exception:
+        return rd
 
 
 def _get_shape_ref() -> dict:
@@ -384,7 +395,7 @@ def _get_shape_ref() -> dict:
     morgan_gen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
     _SHAPE_REF_CACHE = {
         "usrcat": rdMolDescriptors.GetUSRCAT(mol),
-        "fp": morgan_gen.GetFingerprint(mol),
+        "fp": morgan_gen.GetFingerprint(_heavy_atom_mol(mol)),
         "morgan_gen": morgan_gen,
     }
     return _SHAPE_REF_CACHE
@@ -404,7 +415,7 @@ def _score_shape_single(rd: Chem.Mol) -> tuple[float, float, float]:
     except Exception:
         shape_sim = 0.0
     try:
-        fp = ref["morgan_gen"].GetFingerprint(rd)
+        fp = ref["morgan_gen"].GetFingerprint(_heavy_atom_mol(rd))
         graph_sim = DataStructs.TanimotoSimilarity(fp, ref["fp"])
     except Exception:
         graph_sim = 0.0
@@ -460,8 +471,9 @@ def tanimoto_reward(module, trajectory) -> tuple[torch.Tensor, dict[str, float]]
             continue
         n_valid += 1
         try:
+            rd_heavy = _heavy_atom_mol(rd)
             sim = DataStructs.TanimotoSimilarity(
-                ref["morgan_gen"].GetFingerprint(rd),
+                ref["morgan_gen"].GetFingerprint(rd_heavy),
                 ref["fp"],
             )
         except Exception:

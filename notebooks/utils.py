@@ -192,6 +192,65 @@ def visualize_mols_side_by_side(mol_data_list, width=800, height=400, gap=4.0):
     return view
 
 
+def visualize_mols_grid(mol_data_list, width=800, height=600, num_cols=8, gap=4.0):
+    """
+    One static py3Dmol scene with multiple molecules laid out in an XY grid.
+
+    Args:
+        mol_data_list: List of dicts in the same format as ``process_mol`` / ``visualize_single_mol``.
+        num_cols: Number of molecules per row.
+        gap: Extra spacing (Angstrom) between grid cells along X and Y.
+    """
+    if not mol_data_list:
+        raise ValueError("mol_data_list is empty")
+    if num_cols < 1:
+        raise ValueError("num_cols must be >= 1")
+
+    bounds = []
+    for mol_data in mol_data_list:
+        xs = [float(p[0]) for p in mol_data["pos"]]
+        ys = [float(p[1]) for p in mol_data["pos"]]
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+        bounds.append((x_min, x_max, y_min, y_max))
+
+    cell_width = max(max(x_max - x_min, 1e-3) for x_min, x_max, _, _ in bounds) + gap
+    cell_height = max(max(y_max - y_min, 1e-3) for _, _, y_min, y_max in bounds) + gap
+
+    view = py3Dmol.view(width=width, height=height)
+
+    for idx, (mol_data, (x_min, x_max, y_min, y_max)) in enumerate(zip(mol_data_list, bounds)):
+        row, col = divmod(idx, num_cols)
+        target_x = col * cell_width
+        target_y = -row * cell_height
+        dx = target_x - (x_min + x_max) / 2
+        dy = target_y - (y_min + y_max) / 2
+
+        mol = Chem.RWMol()
+
+        for i, symbol in enumerate(mol_data["atoms"]):
+            atom = Chem.Atom(symbol)
+            atom.SetFormalCharge(int(mol_data["charges"][i]))
+            mol.AddAtom(atom)
+
+        for (src, dst), b_type in zip(mol_data["edges"], mol_data["edge_types"]):
+            rdkit_type = bond_mapping.get(b_type, Chem.BondType.SINGLE)
+            mol.AddBond(int(src), int(dst), rdkit_type)
+
+        conf = Chem.Conformer(len(mol_data["atoms"]))
+        for i, (x, y, z) in enumerate(mol_data["pos"]):
+            conf.SetAtomPosition(i, (float(x) + dx, float(y) + dy, float(z)))
+        mol.AddConformer(conf)
+
+        mol_block = _mol_to_mol_block_with_single_bond_fallback(mol)
+        view.addModel(mol_block, "sdf")
+
+    view.setStyle({"stick": {"radius": 0.15}, "sphere": {"scale": 0.2}})
+    view.zoomTo()
+
+    return view
+
+
 def visualize_variable_topology(trajectory_frames, width=800, height=400, interval=25):
     """
     Visualizes a trajectory where atom counts and types change.

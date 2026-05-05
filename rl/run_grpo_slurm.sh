@@ -9,39 +9,6 @@
 #SBATCH --output=slurm_logs/grpo_%j.out
 #SBATCH --error=slurm_logs/grpo_%j.err
 
-# SLURM wrapper for `rl/run_grpo.sh`.  Parameterises `SIGMA_EXPLORE` (position
-# kernel std σ), `SEED`, `GROUP_SIZE`, `KL_COEF` (0 = no KL), `LR`,
-# `UPDATE_PASSES` (PPO-style passes over sampled trajectory), `MAX_ATOMS`, `REWARD`
-# (`shape`, `n_atoms`, …; see rl/rewards.py), optional diversity bucketing
-# (`SCAFFOLD_DIVERSITY`, `SCAFFOLD_DIVERSITY_KEY` murcko or canonical_smiles,
-# `SCAFFOLD_BUCKET_SIZE`, `SCAFFOLD_PENALTY`, `SCAFFOLD_WINDOW_BATCHES`,
-# `SCAFFOLD_LABELED`; maps to `rl.run_grpo --scaffold_*`),
-# `KL_OMIT_POS` (omit KL on position channel vs full KL), optional
-# `PER_ELEMENT_LOGP_MEAN`, and W&B overrides
-# `GRPO_WANDB_PROJECT` / `GRPO_WANDB_GROUP` (same env vars as `sweep_grpo_unkillable.sh`).
-#
-# Examples:
-#   for s in 0.03 0.05 0.1; do for k in 0.02 0.05 0.1; do SIGMA_EXPLORE=$s KL_COEF=$k sbatch rl/run_grpo_slurm.sh; done; done
-#   for lr in 3e-5 1e-4; do LR=$lr sbatch rl/run_grpo_slurm.sh; done
-#   # Same W&B project as a prior sweep + per-element log-prob mean:
-#   GRPO_WANDB_PROJECT=chemflow-grpo-sweep-20260423_164156 GRPO_WANDB_GROUP=20260423_164156 \
-#     PER_ELEMENT_LOGP_MEAN=1 SIGMA_EXPLORE=0.05 KL_COEF=0.05 sbatch rl/run_grpo_slurm.sh
-#
-#   GROUP_SIZE=1 is recommended for stable batch-normalized advantages (see grpo.py).
-#
-#   Scaffold / SMILES diversity on top of REWARD (e.g. n_atoms):
-#     SCAFFOLD_DIVERSITY=1 SCAFFOLD_BUCKET_SIZE=10 sbatch rl/run_grpo_slurm.sh
-#     SCAFFOLD_DIVERSITY_KEY=canonical_smiles sbatch rl/run_grpo_slurm.sh  # bucket by full SMILES
-#
-# Default: reward=n_atoms, seed0, sigma_explore=0.05, g1, mu2 (UPDATE_PASSES),
-#          kl=0.05, lr=1e-4, KL_OMIT_POS=1 (--kl_omit_pos: no KL on `pos` channel).
-#
-# Policy updates: N_UPDATES (default 400). Other hyperparameters align with
-# rl/run_grpo.sh (lr from env, max_grad_norm 1.0, batch 128) unless overridden.
-#
-# Run / checkpoint tags include REWARD (short slug) and omit-pos-KL marker
-# (omitposkl vs fullposkl) so different reward / KL setups do not collide.
-
 set -euo pipefail
 
 # Run from the directory where `sbatch` was invoked.
@@ -58,7 +25,7 @@ N_UPDATES="${N_UPDATES:-200}"
 MAX_ATOMS="${MAX_ATOMS:-100}"
 PER_ELEMENT_LOGP_MEAN="${PER_ELEMENT_LOGP_MEAN:-0}"
 UPDATE_PASSES="${UPDATE_PASSES:-2}"
-REWARD="${REWARD:-shape}"
+REWARD="${REWARD:-tanimoto}"
 # Filename-safe short name (n_atoms → natoms).
 REWARD_SLUG="${REWARD//_/}"
 
@@ -111,10 +78,10 @@ if [[ "$PER_ELEMENT_LOGP_MEAN" =~ ^(1|true|yes|on)$ ]]; then
 fi
 
 SIG_TAG="${SIGMA_EXPLORE//./p}"
-RUN_TAG="${REWARD_SLUG}-seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_maxa${MAX_ATOMS}_${KL_OMIT_SUFFIX}${SCAFFOLD_SUFFIX}"
-CKPT_TAG="${REWARD_SLUG}_seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_maxa${MAX_ATOMS}-${KL_OMIT_SUFFIX}${SCAFFOLD_SUFFIX}"
+RUN_TAG="${REWARD_SLUG}-seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_continue_maxa${MAX_ATOMS}_${KL_OMIT_SUFFIX}${SCAFFOLD_SUFFIX}"
+CKPT_TAG="${REWARD_SLUG}_seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_continue_maxa${MAX_ATOMS}-${KL_OMIT_SUFFIX}${SCAFFOLD_SUFFIX}"
 
-GRPO_WANDB_PROJECT="${GRPO_WANDB_PROJECT:-chemflow-grpo-shape_rew}"
+GRPO_WANDB_PROJECT="${GRPO_WANDB_PROJECT:-chemflow-grpo-tanimoto}"
 GRPO_WANDB_GROUP="${GRPO_WANDB_GROUP:-}"
 
 echo "host=$(hostname)  gpus=${CUDA_VISIBLE_DEVICES:-unset}  reward=${REWARD}  scaffold_diversity=${SCAFFOLD_DIVERSITY}  scaffold_diversity_key=${SCAFFOLD_DIVERSITY_KEY}  scaffold_bucket_size=${SCAFFOLD_BUCKET_SIZE}  scaffold_penalty=${SCAFFOLD_PENALTY}  scaffold_window_batches=${SCAFFOLD_WINDOW_BATCHES}  scaffold_labeled=${SCAFFOLD_LABELED}  sigma_explore=${SIGMA_EXPLORE}  seed=${SEED}  group_size=${GROUP_SIZE}  update_passes=${UPDATE_PASSES}  kl_coef=${KL_COEF}  kl_omit_pos=${KL_OMIT_POS}  lr=${LR}  n_updates=${N_UPDATES}  max_atoms=${MAX_ATOMS}  per_element_logp_mean=${PER_ELEMENT_LOGP_MEAN}  run=${RUN_TAG}  wandb_project=${GRPO_WANDB_PROJECT}  wandb_group=${GRPO_WANDB_GROUP:-<none>}"
@@ -126,7 +93,7 @@ if [[ -n "$GRPO_WANDB_GROUP" ]]; then
 fi
 
 uv run --env-file .env python -m rl.run_grpo \
-    --ckpt .pretrained_model/epoch=499-step=48500.ckpt \
+    --ckpt .rl_ckpts/grpo_tanimoto_seed0_sig0p05_g8_mu2_kl0.02_lr1e-4_maxa100-omitposkl_scaff_b10_p0p5_w50_canonsmi.pt \
     --n_updates "$N_UPDATES" --num_steps 100 --max_atoms "$MAX_ATOMS" --sigma_explore "$SIGMA_EXPLORE" --lr "$LR" \
     --max_grad_norm 1.0 \
     --seed "$SEED" --group_size "$GROUP_SIZE" --update_passes "$UPDATE_PASSES" --kl_coef "$KL_COEF" \
