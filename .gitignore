@@ -140,6 +140,14 @@ dmypy.json
 .idea/
 
 # Data & Models
+*.pdf
+*.svg
+*.gif
+*.png
+*.pt
+*.sdf
+*.xyz
+*.cube
 *.h5
 *.tar
 *.tar.gz

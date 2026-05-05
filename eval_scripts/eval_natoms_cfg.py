@@ -76,6 +76,85 @@ def _final_mol(traj):
     return traj
 
 
+def _natoms_trajectories(trajectories) -> list[list[int]]:
+    """For every generation, return per-integration-step atom count.
+
+    Returns a ``list[list[int]]`` of length ``len(trajectories)``. ``-1`` is
+    used as a sentinel for frames whose atom count cannot be inferred (kept
+    defensive; should not happen in practice).
+    """
+    out: list[list[int]] = []
+    for traj in trajectories:
+        if not isinstance(traj, (list, tuple)):
+            n = _mol_n_atoms(traj)
+            out.append([n if n is not None else -1])
+            continue
+        per_step: list[int] = []
+        for frame in traj:
+            n = _mol_n_atoms(frame)
+            per_step.append(n if n is not None else -1)
+        out.append(per_step)
+    return out
+
+
+def _save_natoms_trajectories(
+    valid_trajs: list,
+    invalid_trajs: list,
+    target: int,
+    scale: float,
+    output_path: Path,
+) -> None:
+    """Save per-step atom-count trajectories for a single (scale, target) cell.
+
+    Saved payload:
+
+        {
+            "guidance_scale": float,
+            "target_n_atoms": int,
+            "valid":  Tensor[n_valid, n_steps]   (or ragged list[list[int]]),
+            "invalid": Tensor[n_invalid, n_steps] (or ragged list[list[int]]),
+            "is_valid_final": Tensor[n_valid + n_invalid] bool, valid first,
+            "shape_note": str,
+        }
+    """
+    valid_n = _natoms_trajectories(valid_trajs)
+    invalid_n = _natoms_trajectories(invalid_trajs)
+
+    def _stack_or_ragged(seqs: list[list[int]]):
+        if not seqs:
+            return torch.empty((0, 0), dtype=torch.long)
+        lengths = {len(s) for s in seqs}
+        if len(lengths) == 1:
+            return torch.tensor(seqs, dtype=torch.long)
+        return seqs
+
+    valid_payload = _stack_or_ragged(valid_n)
+    invalid_payload = _stack_or_ragged(invalid_n)
+    is_valid_final = torch.tensor(
+        [True] * len(valid_n) + [False] * len(invalid_n),
+        dtype=torch.bool,
+    )
+    is_tensor = isinstance(valid_payload, torch.Tensor) and isinstance(
+        invalid_payload, torch.Tensor
+    )
+
+    torch.save(
+        {
+            "guidance_scale": float(scale),
+            "target_n_atoms": int(target),
+            "valid": valid_payload,
+            "invalid": invalid_payload,
+            "is_valid_final": is_valid_final,
+            "shape_note": (
+                "rows = generations, cols = integration steps"
+                if is_tensor
+                else "ragged; one inner list per generation"
+            ),
+        },
+        output_path,
+    )
+
+
 def _collect_from_predict_output(
     pred,
 ) -> tuple[list[int], list[int], list, list]:
@@ -568,6 +647,11 @@ def _results_for_json(all_results: dict[tuple[float, int], dict]) -> list[dict]:
         if training_metrics:
             for k, v in training_metrics.items():
                 row[f"metric/{k}"] = v
+        if "per_seed" in row:
+            row["per_seed"] = [
+                {k: v for k, v in ps.items() if k not in drop_keys}
+                for ps in row["per_seed"]
+            ]
         row["guidance_scale"] = scale
         row["target_n_atoms"] = target
         rows.append(row)
@@ -611,7 +695,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=128,
         help="Predict dataloader batch size.",
     )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed (used when --seeds not given).")
+    parser.add_argument(
+        "--seeds",
+        type=str,
+        default=None,
+        help="Comma-separated list of seeds. When set, each (scale, target) cell is run once per seed and aggregated.",
+    )
     parser.add_argument(
         "--overrides",
         nargs="*",
@@ -622,6 +712,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--no-save-trajectories",
         action="store_true",
         help="Disable saving generated molecule trajectories.",
+    )
+    parser.add_argument(
+        "--no-save-natoms-trajectories",
+        action="store_true",
+        help=(
+            "Disable saving the per-step atom-count trajectory of every "
+            "generation (one .pt per (scale, target) cell, written to "
+            "<output-dir>/natoms_trajectories/)."
+        ),
     )
     parser.add_argument(
         "--no-save-gifs",
@@ -643,6 +742,9 @@ def main() -> None:
     trajectories_dir = args.output_dir / "trajectories"
     if not args.no_save_trajectories:
         trajectories_dir.mkdir(parents=True, exist_ok=True)
+    natoms_traj_dir = args.output_dir / "natoms_trajectories"
+    if not args.no_save_natoms_trajectories:
+        natoms_traj_dir.mkdir(parents=True, exist_ok=True)
     gifs_dir = args.output_dir / "natoms_gifs"
     if not args.no_save_gifs:
         gifs_dir.mkdir(parents=True, exist_ok=True)
@@ -650,7 +752,8 @@ def main() -> None:
     _register_resolvers()
     torch.set_float32_matmul_precision("medium")
     RDLogger.DisableLog("rdApp.*")
-    pl.seed_everything(args.seed)
+    seeds = _parse_int_list(args.seeds) if args.seeds else [args.seed]
+    pl.seed_everything(seeds[0])
 
     with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base="1.1"):
         cfg = compose(config_name="default", overrides=args.overrides)
@@ -697,16 +800,57 @@ def main() -> None:
             print(f"\n{'=' * 60}\nn_atoms guidance scale={scale}\n{'=' * 60}")
 
             for target in target_n_atoms:
-                pl.seed_everything(args.seed)
                 module.predict_target_n_atoms_override = int(target)
                 module.predict_target_mw_override = None
-                predictions = trainer.predict(module, dataloaders=test_dl)
-                summary, valid_trajs, invalid_trajs = _summarize(
-                    predictions=predictions,
-                    target_n_atoms=int(target),
-                    max_samples=args.n_mols,
-                )
-                summary["guidance_scale"] = float(scale)
+
+                per_seed: list[dict] = []
+                valid_trajs: list = []
+                invalid_trajs: list = []
+                for seed in seeds:
+                    pl.seed_everything(int(seed))
+                    predictions = trainer.predict(module, dataloaders=test_dl)
+                    seed_summary, vt, it = _summarize(
+                        predictions=predictions,
+                        target_n_atoms=int(target),
+                        max_samples=args.n_mols,
+                    )
+                    per_seed.append(
+                        {
+                            "seed": int(seed),
+                            "n_total": seed_summary["n_total"],
+                            "n_valid": seed_summary["n_valid"],
+                            "n_invalid": seed_summary["n_invalid"],
+                            "validity_rate": seed_summary["validity_rate"],
+                            "all_stats": seed_summary["all_stats"],
+                            "valid_stats": seed_summary["valid_stats"],
+                            "all_n_atoms": list(seed_summary["all_n_atoms"]),
+                            "valid_n_atoms": list(seed_summary["valid_n_atoms"]),
+                            "invalid_n_atoms": list(seed_summary["invalid_n_atoms"]),
+                        }
+                    )
+                    valid_trajs.extend(vt)
+                    invalid_trajs.extend(it)
+
+                valid_counts = [c for ps in per_seed for c in ps["valid_n_atoms"]]
+                invalid_counts = [c for ps in per_seed for c in ps["invalid_n_atoms"]]
+                all_counts = valid_counts + invalid_counts
+                n_total = len(all_counts)
+                n_valid = len(valid_counts)
+                summary = {
+                    "target_n_atoms": int(target),
+                    "n_total": n_total,
+                    "n_valid": n_valid,
+                    "n_invalid": n_total - n_valid,
+                    "validity_rate": (n_valid / n_total) if n_total else 0.0,
+                    "all_stats": _natoms_stats(all_counts, int(target)),
+                    "valid_stats": _natoms_stats(valid_counts, int(target)),
+                    "all_n_atoms": all_counts,
+                    "valid_n_atoms": valid_counts,
+                    "invalid_n_atoms": invalid_counts,
+                    "guidance_scale": float(scale),
+                    "seeds": [int(s) for s in seeds],
+                    "per_seed": per_seed,
+                }
 
                 rdkit_mols = _trajectories_to_rdkit(
                     valid_trajs + invalid_trajs,
@@ -755,6 +899,18 @@ def main() -> None:
                         traj_path,
                     )
 
+                if not args.no_save_natoms_trajectories:
+                    natoms_path = (
+                        natoms_traj_dir / f"scale={scale}_target={target}.pt"
+                    )
+                    _save_natoms_trajectories(
+                        valid_trajs=valid_trajs,
+                        invalid_trajs=invalid_trajs,
+                        target=int(target),
+                        scale=float(scale),
+                        output_path=natoms_path,
+                    )
+
                 if not args.no_save_gifs:
                     gif_path = gifs_dir / f"scale={scale}_target={target}.gif"
                     _plot_natoms_gif(
@@ -774,6 +930,28 @@ def main() -> None:
     json_path = args.output_dir / "natoms_cfg_results.json"
     plot_all_path = args.output_dir / "natoms_cfg_distributions_all.png"
     plot_valid_path = args.output_dir / "natoms_cfg_distributions_valid.png"
+
+    if pt_path.exists():
+        try:
+            existing = torch.load(pt_path, map_location="cpu", weights_only=False)
+            if isinstance(existing, dict):
+                merged = dict(existing)
+                overlapped = sorted(set(merged) & set(all_results))
+                if overlapped:
+                    print(
+                        f"[append] replacing {len(overlapped)} existing cell(s): "
+                        f"{overlapped}"
+                    )
+                merged.update(all_results)
+                all_results = merged
+                print(
+                    f"[append] merged with {len(existing)} existing cell(s) from "
+                    f"{pt_path}; total now {len(all_results)}."
+                )
+            else:
+                print(f"[append] existing {pt_path} is not a dict; overwriting.")
+        except Exception as exc:
+            print(f"[append] failed to load existing results ({exc}); overwriting.")
 
     torch.save(all_results, pt_path)
     with json_path.open("w", encoding="utf-8") as handle:
@@ -799,6 +977,8 @@ def main() -> None:
     print(f"Saved valid-only plot to:       {plot_valid_path}")
     if not args.no_save_trajectories:
         print(f"Saved trajectories under:       {trajectories_dir}")
+    if not args.no_save_natoms_trajectories:
+        print(f"Saved n_atoms trajectories under: {natoms_traj_dir}")
     if not args.no_save_gifs:
         print(f"Saved n_atoms GIFs under:       {gifs_dir}")
 
