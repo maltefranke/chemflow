@@ -7,7 +7,8 @@ export PYTHONUNBUFFERED=1
 # env vars, e.g. `N_UPDATES=20 GRPO_WANDB_PROJECT=my-proj bash rl/run_grpo.sh`.
 
 cd "$(dirname "$0")/.."
-mkdir -p .rl_ckpts
+export PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
+mkdir -p "$PROJECT_ROOT/.rl_ckpts"
 
 SIGMA_EXPLORE="${SIGMA_EXPLORE:-0.05}"
 SEED="${SEED:-0}"
@@ -64,16 +65,30 @@ CKPT_TAG="${REWARD_SLUG}_seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PAS
 
 GRPO_WANDB_PROJECT="${GRPO_WANDB_PROJECT:-chemflow-grpo-sweep-20260424_111439}"
 GRPO_WANDB_GROUP="${GRPO_WANDB_GROUP:-}"
+GRPO_WANDB_ENABLED="${GRPO_WANDB_ENABLED:-true}"
+WANDB_ENABLED="true"
+if [[ "$GRPO_WANDB_ENABLED" =~ ^(0|false|no|off)$ ]]; then
+  WANDB_ENABLED="false"
+fi
 
 WANDB_EXTR=()
 if [[ -n "$GRPO_WANDB_GROUP" ]]; then
   WANDB_EXTR=("rl.wandb.group=$GRPO_WANDB_GROUP")
 fi
 
+SAVE_EXTR=(
+  "rl.save=$PROJECT_ROOT/.rl_ckpts/grpo_${CKPT_TAG}.pt"
+  "rl.save_best=$PROJECT_ROOT/.rl_ckpts/grpo_${CKPT_TAG}_best.pt"
+)
+GRPO_SAVE_CKPTS="${GRPO_SAVE_CKPTS:-true}"
+if [[ "$GRPO_SAVE_CKPTS" =~ ^(0|false|no|off)$ ]]; then
+  SAVE_EXTR=("rl.save=null" "rl.save_best=null")
+fi
+
 echo "reward=${REWARD} sigma_explore=${SIGMA_EXPLORE} seed=${SEED} group_size=${GROUP_SIZE} update_passes=${UPDATE_PASSES} kl_coef=${KL_COEF} kl_omit_pos=${KL_OMIT_POS} lr=${LR} n_updates=${N_UPDATES} max_atoms=${MAX_ATOMS} run=${RUN_TAG}"
 
 uv run --env-file .env python -m rl.run_grpo \
-    'rl.ckpt=".pretrained_model/epoch=499-step=48500.ckpt"' \
+    "rl.ckpt=\"$PROJECT_ROOT/.pretrained_model/epoch=499-step=48500.ckpt\"" \
     "rl.n_updates=$N_UPDATES" \
     rl.grpo.num_integration_steps=100 \
     "rl.max_atoms=$MAX_ATOMS" \
@@ -93,12 +108,11 @@ uv run --env-file .env python -m rl.run_grpo \
     "rl.reward.scaffold_window_batches=$SCAFFOLD_WINDOW_BATCHES" \
     "rl.reward.scaffold_labeled=$SCAFFOLD_LABELED" \
     "rl.grpo.kl_omit_pos=$KL_OMIT_ENABLED" \
-    rl.wandb.enabled=true \
+    "rl.wandb.enabled=$WANDB_ENABLED" \
     "rl.wandb.project=$GRPO_WANDB_PROJECT" \
     "rl.wandb.name=$RUN_TAG" \
     "${WANDB_EXTR[@]}" \
-    "rl.save=.rl_ckpts/grpo_${CKPT_TAG}.pt" \
-    "rl.save_best=.rl_ckpts/grpo_${CKPT_TAG}_best.pt" \
+    "${SAVE_EXTR[@]}" \
     data.datamodule.batch_size.test=128
 
 echo "done: ${RUN_TAG}"

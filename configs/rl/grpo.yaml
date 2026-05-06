@@ -4,6 +4,12 @@ defaults:
   - /default
   - _self_
 
+hydra:
+  job:
+    # GRPO historically ran from the repository root. Keep that runtime shape
+    # even when using @hydra.main; durable artifacts are anchored by PROJECT_ROOT.
+    chdir: false
+
 # GRPO fine-tuning config.
 #
 # This composes the normal ChemFlow model/data/trainer stack from
@@ -16,7 +22,7 @@ rl:
   # Checkpoints and run control
   # Keep this pointed at the pretrained model by default. The Slurm continuation
   # script overrides `rl.ckpt` when continuing from an RL checkpoint.
-  ckpt: .pretrained_model/epoch=499-step=48500.ckpt
+  ckpt: ${oc.env:PROJECT_ROOT}/.pretrained_model/epoch=499-step=48500.ckpt
   save: null
   save_best: null
   n_updates: 200

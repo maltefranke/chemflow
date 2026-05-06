@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hydra CLI driver for GRPO fine-tuning.
+"""Hydra driver for GRPO fine-tuning.
 
 Owns the shared RL setup helpers (Hydra config composition, module/datamodule
 construction, and checkpoint loading) and plugs the module into `rl.grpo.train`.
@@ -14,7 +14,6 @@ Example:
 Any trailing args are Hydra overrides.
 """
 
-import argparse
 import os
 import random
 import sys
@@ -24,6 +23,7 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 for _p in [_PROJECT_ROOT, os.path.join(_PROJECT_ROOT, "src")]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
+os.environ.setdefault("PROJECT_ROOT", _PROJECT_ROOT)
 
 import hydra  # noqa: E402
 import numpy as np  # noqa: E402
@@ -63,7 +63,7 @@ register_resolvers()
 
 from chemflow.dataset.vocab import setup_token_weights  # noqa: E402
 from chemflow.utils.metrics import init_metrics  # noqa: E402
-from chemflow.utils.utils import init_uniform_prior  # noqa: E402
+from chemflow.utils.utils import bootstrap_run_id, init_uniform_prior  # noqa: E402
 
 from rl.grpo import GRPOConfig, train  # noqa: E402
 from rl.rewards import REWARDS, scaffold_diversity_wrapper  # noqa: E402
@@ -148,13 +148,28 @@ def _resolve_device(device: str) -> str:
     return device
 
 
+def _project_root() -> str:
+    return os.path.abspath(os.environ.get("PROJECT_ROOT", _PROJECT_ROOT))
+
+
 def _resolve_path(path: str | None) -> str | None:
     if path is None:
         return None
     path = os.path.expanduser(str(path))
     if os.path.isabs(path):
         return path
-    return os.path.abspath(path)
+    return os.path.abspath(os.path.join(_project_root(), path))
+
+
+def _hydra_output_dir() -> str | None:
+    try:
+        from hydra.core.hydra_config import HydraConfig
+
+        if HydraConfig.initialized():
+            return str(HydraConfig.get().runtime.output_dir)
+    except Exception:
+        return None
+    return None
 
 
 def build_grpo_config(grpo_cfg: DictConfig) -> GRPOConfig:
@@ -224,6 +239,17 @@ def run_from_cfg(cfg: DictConfig):
     wandb_config = OmegaConf.to_container(cfg, resolve=False)
 
     print(
+        "[grpo] runtime "
+        f"cwd={os.getcwd()} project_root={_project_root()} "
+        f"hydra_output_dir={_hydra_output_dir() or '<none>'}",
+        flush=True,
+    )
+    print(
+        f"[grpo] paths ckpt={ckpt_path} save={save_path} save_best={save_best_path}",
+        flush=True,
+    )
+
+    print(
         "[grpo] building datamodule + metrics (slow on cold cache / NFS) …",
         flush=True,
     )
@@ -273,25 +299,12 @@ def run_from_cfg(cfg: DictConfig):
         print(f"saved: {save_path}")
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config_path", default=os.path.join(_PROJECT_ROOT, "configs"))
-    ap.add_argument("--config_name", default="rl/grpo")
-    ap.add_argument(
-        "--cfg",
-        choices=("job",),
-        default=None,
-        help="Print the composed job config and exit.",
-    )
-    ap.add_argument("overrides", nargs="*")
-    args = ap.parse_args()
-
-    cfg = compose_cfg(args.config_path, args.config_name, overrides=list(args.overrides))
-    if args.cfg == "job":
-        print(OmegaConf.to_yaml(cfg))
-        return
+@hydra.main(config_path="../configs", config_name="rl/grpo", version_base="1.1")
+def main(cfg: DictConfig) -> None:
     run_from_cfg(cfg)
 
 
 if __name__ == "__main__":
+    os.environ.setdefault("PROJECT_ROOT", _PROJECT_ROOT)
+    bootstrap_run_id()
     main()

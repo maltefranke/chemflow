@@ -42,6 +42,7 @@ Useful overrides: `rl.grpo.sigma_explore`, `rl.grpo.kl_coef`, `rl.grpo.kl_omit_p
 Registered names (see [`rewards.py`](rewards.py)):
 
 - `validity`, `qed`, `n_atoms`, `shape`, `tanimoto`
+- `topology`: ring-aware MCS + Murcko scaffold + RDK/Morgan fingerprint blend + size penalty
 
 Built-in rewards gate on RDKit validity (invalid samples get zero reward). `rl.reward.scaffold_diversity=true` layers REINVENT-style occurrence bucketing on top of any registered reward.
 
@@ -65,7 +66,7 @@ Built-in rewards gate on RDKit validity (invalid samples get zero reward). `rl.r
 | `rl.grpo.per_element_logp_mean` | Mean within each RL channel before summing channels. |
 | `rl.device` | `auto`, `cuda`, or `cpu`. |
 | `rl.log_every` | Logging interval. |
-| `rl.reward.name` | `validity`, `qed`, `n_atoms`, `shape`, or `tanimoto`. |
+| `rl.reward.name` | `validity`, `qed`, `n_atoms`, `shape`, `tanimoto`, or `topology`. |
 | `rl.reward.scaffold_diversity` | Enable bucket gating on top of `rl.reward.name`. |
 | `rl.reward.scaffold_diversity_key` | `murcko` or `canonical_smiles`. |
 | `rl.reward.scaffold_bucket_size`, `rl.reward.scaffold_penalty`, `rl.reward.scaffold_window_batches` | Capacity, multiplier when full (`0` = hard zero), rolling memory (`-1` = full run). |

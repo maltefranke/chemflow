@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:a100l:1
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=32G
-#SBATCH --partition=long
+#SBATCH --partition=unkillable
 #SBATCH --time=6:00:00
 #SBATCH --output=slurm_logs/grpo_%j.out
 #SBATCH --error=slurm_logs/grpo_%j.err
@@ -17,7 +17,8 @@ export PYTHONUNBUFFERED=1
 # Run from the directory where `sbatch` was invoked.
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
-mkdir -p slurm_logs .rl_ckpts
+export PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
+mkdir -p slurm_logs "$PROJECT_ROOT/.rl_ckpts"
 
 SIGMA_EXPLORE="${SIGMA_EXPLORE:-0.05}"
 SEED="${SEED:-0}"
@@ -28,7 +29,7 @@ N_UPDATES="${N_UPDATES:-200}"
 MAX_ATOMS="${MAX_ATOMS:-100}"
 PER_ELEMENT_LOGP_MEAN="${PER_ELEMENT_LOGP_MEAN:-0}"
 UPDATE_PASSES="${UPDATE_PASSES:-2}"
-REWARD="${REWARD:-n_atoms}"
+REWARD="${REWARD:-topology}"
 # Filename-safe short name (n_atoms → natoms).
 REWARD_SLUG="${REWARD//_/}"
 
@@ -74,11 +75,16 @@ if [[ "$PER_ELEMENT_LOGP_MEAN" =~ ^(1|true|yes|on)$ ]]; then
 fi
 
 SIG_TAG="${SIGMA_EXPLORE//./p}"
-RUN_TAG="${REWARD_SLUG}-seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_yaml_maxa${MAX_ATOMS}_${KL_OMIT_SUFFIX}${SCAFFOLD_SUFFIX}"
-CKPT_TAG="${REWARD_SLUG}_seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_yaml_maxa${MAX_ATOMS}-${KL_OMIT_SUFFIX}${SCAFFOLD_SUFFIX}"
+RUN_TAG="${REWARD_SLUG}-seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_hydra_maxa${MAX_ATOMS}_${KL_OMIT_SUFFIX}${SCAFFOLD_SUFFIX}"
+CKPT_TAG="${REWARD_SLUG}_seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_hydra_maxa${MAX_ATOMS}-${KL_OMIT_SUFFIX}${SCAFFOLD_SUFFIX}"
 
-GRPO_WANDB_PROJECT="${GRPO_WANDB_PROJECT:-chemflow-grpo-sweep-20260424_111439}"
+GRPO_WANDB_PROJECT="${GRPO_WANDB_PROJECT:-chemflow-grpo-topology}"
 GRPO_WANDB_GROUP="${GRPO_WANDB_GROUP:-}"
+GRPO_WANDB_ENABLED="${GRPO_WANDB_ENABLED:-true}"
+WANDB_ENABLED="true"
+if [[ "$GRPO_WANDB_ENABLED" =~ ^(0|false|no|off)$ ]]; then
+  WANDB_ENABLED="false"
+fi
 
 echo "host=$(hostname)  gpus=${CUDA_VISIBLE_DEVICES:-unset}  reward=${REWARD}  scaffold_diversity=${SCAFFOLD_DIVERSITY}  scaffold_diversity_key=${SCAFFOLD_DIVERSITY_KEY}  scaffold_bucket_size=${SCAFFOLD_BUCKET_SIZE}  scaffold_penalty=${SCAFFOLD_PENALTY}  scaffold_window_batches=${SCAFFOLD_WINDOW_BATCHES}  scaffold_labeled=${SCAFFOLD_LABELED}  sigma_explore=${SIGMA_EXPLORE}  seed=${SEED}  group_size=${GROUP_SIZE}  update_passes=${UPDATE_PASSES}  kl_coef=${KL_COEF}  kl_omit_pos=${KL_OMIT_POS}  lr=${LR}  n_updates=${N_UPDATES}  max_atoms=${MAX_ATOMS}  per_element_logp_mean=${PER_ELEMENT_LOGP_MEAN}  run=${RUN_TAG}  wandb_project=${GRPO_WANDB_PROJECT}  wandb_group=${GRPO_WANDB_GROUP:-<none>}"
 nvidia-smi -L || true
@@ -88,8 +94,17 @@ if [[ -n "$GRPO_WANDB_GROUP" ]]; then
   WANDB_EXTR=("rl.wandb.group=$GRPO_WANDB_GROUP")
 fi
 
+SAVE_EXTR=(
+  "rl.save=$PROJECT_ROOT/.rl_ckpts/grpo_${CKPT_TAG}.pt"
+  "rl.save_best=$PROJECT_ROOT/.rl_ckpts/grpo_${CKPT_TAG}_best.pt"
+)
+GRPO_SAVE_CKPTS="${GRPO_SAVE_CKPTS:-true}"
+if [[ "$GRPO_SAVE_CKPTS" =~ ^(0|false|no|off)$ ]]; then
+  SAVE_EXTR=("rl.save=null" "rl.save_best=null")
+fi
+
 uv run --env-file .env python -m rl.run_grpo \
-    'rl.ckpt=".pretrained_model/epoch=499-step=48500.ckpt"' \
+    "rl.ckpt=\"$PROJECT_ROOT/.pretrained_model/epoch=499-step=48500.ckpt\"" \
     "rl.n_updates=$N_UPDATES" \
     rl.grpo.num_integration_steps=100 \
     "rl.max_atoms=$MAX_ATOMS" \
@@ -109,12 +124,11 @@ uv run --env-file .env python -m rl.run_grpo \
     "rl.reward.scaffold_window_batches=$SCAFFOLD_WINDOW_BATCHES" \
     "rl.reward.scaffold_labeled=$SCAFFOLD_LABELED" \
     "rl.grpo.kl_omit_pos=$KL_OMIT_ENABLED" \
-    rl.wandb.enabled=true \
+    "rl.wandb.enabled=$WANDB_ENABLED" \
     "rl.wandb.project=$GRPO_WANDB_PROJECT" \
     "rl.wandb.name=$RUN_TAG" \
     "${WANDB_EXTR[@]}" \
-    "rl.save=.rl_ckpts/grpo_${CKPT_TAG}.pt" \
-    "rl.save_best=.rl_ckpts/grpo_${CKPT_TAG}_best.pt" \
+    "${SAVE_EXTR[@]}" \
     data.datamodule.batch_size.test=128
 
 echo "done: ${RUN_TAG}"
