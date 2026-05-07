@@ -8,17 +8,17 @@ This folder implements **Group Relative Policy Optimization (GRPO)** fine-tuning
 |------|------|
 | [`grpo.py`](grpo.py) | `GRPOConfig`, rollout storage, `train(...)` — algorithm and conventions (time direction, log-prob channels, KL / clipping). Start here for behavior details. |
 | [`run_grpo.py`](run_grpo.py) | CLI and shared setup helpers: load Hydra config + checkpoint, attach reward, call `train`. Supports W&B, KL to frozen ref, scaffold/SMILES diversity wrapper, best-checkpoint saving. |
-| [`rewards.py`](rewards.py) | Reward functions and `REWARDS` registry. New objectives: implement `(module, trajectory) -> (Tensor(B,), dict)` and register the name. |
+| [`rewards/`](rewards/) | Reward functions, shared helpers, diversity wrapper, and `REWARDS` registry. New objectives: implement `(module, trajectory) -> (Tensor(B,), dict)` and register the name. |
 
 ### Launch scripts
 
-- [`run_grpo.sh`](run_grpo.sh) — Example local launch (`uv run` from repo root; env vars become Hydra overrides).
-- [`run_grpo_slurm.sh`](run_grpo_slurm.sh) — **Single GPU** Slurm job; hyperparameters via env vars (`SIGMA_EXPLORE`, `SEED`, `KL_COEF`, `REWARD`, scaffold diversity, W&B project/group, …). Comments in-file list options.
-- [`sweep_grpo_unkillable.sh`](sweep_grpo_unkillable.sh) — Run **on a login node** with `./rl/sweep_grpo_unkillable.sh` — it **submits** multiple `run_grpo_slurm.sh` jobs. **Do not** `sbatch` this file (it has no `#SBATCH` GPU allocation).
+- [`scripts/run_grpo.sh`](scripts/run_grpo.sh) — Example local launch (`uv run` from repo root; env vars become Hydra overrides).
+- [`scripts/run_grpo_slurm.sh`](scripts/run_grpo_slurm.sh) — **Single GPU** Slurm job; hyperparameters via env vars (`SIGMA_EXPLORE`, `SEED`, `KL_COEF`, `REWARD`, scaffold diversity, W&B project/group, …). Comments in-file list options.
+- [`scripts/sweep_grpo_unkillable.sh`](scripts/sweep_grpo_unkillable.sh) — Run **on a login node** with `./rl/scripts/sweep_grpo_unkillable.sh` — it **submits** multiple `scripts/run_grpo_slurm.sh` jobs. **Do not** `sbatch` this file (it has no `#SBATCH` GPU allocation).
 
 ## Quick start
 
-Checkpoint paths in this README, in [`configs/rl/grpo.yaml`](../configs/rl/grpo.yaml), and in the launch shells (e.g. `.pretrained_model/...`) are **placeholders aligned with how this repo was set up**. Point `rl.ckpt` (and any hard-coded paths in your copy of `run_grpo.sh` / Slurm wrappers) at **your** checkpoint file and folder layout.
+Checkpoint paths in this README, in [`configs/rl/grpo.yaml`](../configs/rl/grpo.yaml), and in the launch shells (e.g. `.pretrained_model/...`) are **placeholders aligned with how this repo was set up**. Point `rl.ckpt` (and any hard-coded paths in your copy of `scripts/run_grpo.sh` / Slurm wrappers) at **your** checkpoint file and folder layout.
 
 ```bash
 python -m rl.run_grpo \
@@ -39,10 +39,11 @@ Useful overrides: `rl.grpo.sigma_explore`, `rl.grpo.kl_coef`, `rl.grpo.kl_omit_p
 
 ## Rewards
 
-Registered names (see [`rewards.py`](rewards.py)):
+Registered names (see [`rewards/`](rewards/)):
 
-- `validity`, `qed`, `n_atoms`, `shape`, `tanimoto`
+- `validity`, `n_atoms`, `tanimoto`
 - `topology`: ring-aware MCS + Murcko scaffold + RDK/Morgan fingerprint blend + size penalty
+- `topology_motif`: topology plus non-ring-only functional path motif recall
 
 Built-in rewards gate on RDKit validity (invalid samples get zero reward). `rl.reward.scaffold_diversity=true` layers REINVENT-style occurrence bucketing on top of any registered reward.
 
@@ -66,7 +67,7 @@ Built-in rewards gate on RDKit validity (invalid samples get zero reward). `rl.r
 | `rl.grpo.per_element_logp_mean` | Mean within each RL channel before summing channels. |
 | `rl.device` | `auto`, `cuda`, or `cpu`. |
 | `rl.log_every` | Logging interval. |
-| `rl.reward.name` | `validity`, `qed`, `n_atoms`, `shape`, `tanimoto`, or `topology`. |
+| `rl.reward.name` | `validity`, `n_atoms`, `tanimoto`, `topology`, or `topology_motif`. |
 | `rl.reward.scaffold_diversity` | Enable bucket gating on top of `rl.reward.name`. |
 | `rl.reward.scaffold_diversity_key` | `murcko` or `canonical_smiles`. |
 | `rl.reward.scaffold_bucket_size`, `rl.reward.scaffold_penalty`, `rl.reward.scaffold_window_batches` | Capacity, multiplier when full (`0` = hard zero), rolling memory (`-1` = full run). |
@@ -80,7 +81,7 @@ After load, `run_grpo` sets `module.integrator.max_atoms` from `rl.max_atoms` (d
 
 ### Slurm: `run_grpo_slurm.sh` (environment variables)
 
-Export or prefix before `sbatch rl/run_grpo_slurm.sh` (see script for defaults):
+Export or prefix before `sbatch rl/scripts/run_grpo_slurm.sh` (see script for defaults):
 
 | Variable | Role |
 |----------|------|
@@ -98,9 +99,8 @@ The embedded `rl.ckpt` path in that script is a placeholder—edit it for your c
 ## Experiments (layout)
 
 - [`experiments/natoms/`](experiments/natoms/) — Atom-count comparison, trajectory dumps, analysis notebooks.
-- [`experiments/shape/`](experiments/shape/) — Shape-reward sample bundles and notebook scoring.
 - [`experiments/tanimoto/`](experiments/tanimoto/) — Tanimoto-reward sample bundles and top-unique-molecule notebook for Prilocaine similarity.
 
 ## `notes/`
 
-The [`notes/`](notes/) markdown files are **not kept in sync** with the code. Prefer this README, the docstring at the top of [`grpo.py`](grpo.py), and inline comments in [`run_grpo.py`](run_grpo.py) / [`rewards.py`](rewards.py) for current behavior.
+The [`notes/`](notes/) markdown files are **not kept in sync** with the code. Prefer this README, the docstring at the top of [`grpo.py`](grpo.py), and inline comments in [`run_grpo.py`](run_grpo.py) / [`rewards/`](rewards/) for current behavior.

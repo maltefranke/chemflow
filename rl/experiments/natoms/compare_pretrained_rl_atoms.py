@@ -24,7 +24,7 @@ checkpoint filename without extension (from ``--rl_ckpt`` or the default from ``
 
 Atom count convention: we report ``rd.GetNumAtoms()`` on the RDKit mol built from the
 final trajectory frame via ``MoleculeData.to_rdkit_mol`` — the *same* quantity used by
-``rl/rewards.py::n_atoms_reward``. This includes explicit hydrogens if ``"H"`` is in
+``rl.rewards.simple.n_atoms_reward``. This includes explicit hydrogens if ``"H"`` is in
 the vocab (no ``RemoveHs`` is applied), and equals the graph's ``num_nodes`` for valid
 mols since ``to_rdkit_mol`` adds one RDKit atom per node and sanitize preserves them.
 """

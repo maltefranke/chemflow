@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# WRONG:  sbatch rl/sweep_grpo_unkillable.sh
-# RIGHT:  ./rl/sweep_grpo_unkillable.sh    (from repo root; submits jobs via rl/run_grpo_slurm.sh)
+# WRONG:  sbatch rl/scripts/sweep_grpo_unkillable.sh
+# RIGHT:  ./rl/scripts/sweep_grpo_unkillable.sh    (from repo root; submits jobs via rl/scripts/run_grpo_slurm.sh)
 #
 # Four-run batch: tighten around g8 vs g4 winners (canonical_smiles scaffold diversity on).
 #
@@ -14,27 +14,27 @@
 # scaffold_b10_p0.5_w50 canonical_smiles, KL_OMIT_POS=1 unless overridden by env.
 #
 # Usage:
-#   ./rl/sweep_grpo_unkillable.sh
-#   ./rl/sweep_grpo_unkillable.sh chemflow-grpo-other-project   # override W&B project
-#   SWEEP_STAMP=my001 DRY_RUN=1 ./rl/sweep_grpo_unkillable.sh
+#   ./rl/scripts/sweep_grpo_unkillable.sh
+#   ./rl/scripts/sweep_grpo_unkillable.sh chemflow-grpo-other-project   # override W&B project
+#   SWEEP_STAMP=my001 DRY_RUN=1 ./rl/scripts/sweep_grpo_unkillable.sh
 #
-# Default W&B project matches rl/run_grpo_slurm.sh (change both if you retarget logs).
+# Default W&B project matches rl/scripts/run_grpo_slurm.sh (change both if you retarget logs).
 #
 set -euo pipefail
 
 if [[ -n "${SLURM_JOB_ID:-}" && "${SLURM_JOB_NAME:-}" == "sweep_grpo_unkillable.sh" ]]; then
   echo "error: do not sbatch this file — it is not a GPU batch script (no #SBATCH)." >&2
-  echo "  run from repo root:  ./rl/sweep_grpo_unkillable.sh" >&2
+  echo "  run from repo root:  ./rl/scripts/sweep_grpo_unkillable.sh" >&2
   exit 1
 fi
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 mkdir -p slurm_logs
 
-SLURM_SCRIPT="${REPO_ROOT}/rl/run_grpo_slurm.sh"
+SLURM_SCRIPT="${REPO_ROOT}/rl/scripts/run_grpo_slurm.sh"
 STAMP="${SWEEP_STAMP:-$(date +%Y%m%d_%H%M%S)}"
-# Same fallback as rl/run_grpo_slurm.sh GRPO_WANDB_PROJECT
+# Same fallback as rl/scripts/run_grpo_slurm.sh GRPO_WANDB_PROJECT
 GRPO_WANDB_PROJECT="${1:-${GRPO_WANDB_PROJECT:-chemflow-grpo-sweep-20260424_111439}}"
 GRPO_WANDB_GROUP="${GRPO_WANDB_GROUP:-$STAMP}"
 export GRPO_WANDB_PROJECT GRPO_WANDB_GROUP
