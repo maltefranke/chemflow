@@ -29,7 +29,7 @@ N_UPDATES="${N_UPDATES:-200}"
 MAX_ATOMS="${MAX_ATOMS:-100}"
 PER_ELEMENT_LOGP_MEAN="${PER_ELEMENT_LOGP_MEAN:-0}"
 UPDATE_PASSES="${UPDATE_PASSES:-2}"
-REWARD="${REWARD:-n_atoms}"
+REWARD="${REWARD:-topology_motif}"
 # Filename-safe short name (n_atoms → natoms).
 REWARD_SLUG="${REWARD//_/}"
 
@@ -75,10 +75,10 @@ if [[ "$PER_ELEMENT_LOGP_MEAN" =~ ^(1|true|yes|on)$ ]]; then
 fi
 
 SIG_TAG="${SIGMA_EXPLORE//./p}"
-RUN_TAG="${REWARD_SLUG}-seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_hydra_maxa${MAX_ATOMS}_${KL_OMIT_SUFFIX}${SCAFFOLD_SUFFIX}"
-CKPT_TAG="${REWARD_SLUG}_seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_hydra_maxa${MAX_ATOMS}-${KL_OMIT_SUFFIX}${SCAFFOLD_SUFFIX}"
+RUN_TAG="${REWARD_SLUG}-seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_hydra_continue_maxa${MAX_ATOMS}_${KL_OMIT_SUFFIX}${SCAFFOLD_SUFFIX}"
+CKPT_TAG="${REWARD_SLUG}_seed${SEED}_sig${SIG_TAG}_g${GROUP_SIZE}_mu${UPDATE_PASSES}_kl${KL_COEF}_lr${LR}${ELEM_SUFFIX}_hydra_continue_maxa${MAX_ATOMS}-${KL_OMIT_SUFFIX}${SCAFFOLD_SUFFIX}"
 
-GRPO_WANDB_PROJECT="${GRPO_WANDB_PROJECT:-chemflow-grpo-sweep-20260424_111439}"
+GRPO_WANDB_PROJECT="${GRPO_WANDB_PROJECT:-chemflow-grpo-topology-motif}"
 GRPO_WANDB_GROUP="${GRPO_WANDB_GROUP:-}"
 GRPO_WANDB_ENABLED="${GRPO_WANDB_ENABLED:-true}"
 WANDB_ENABLED="true"
@@ -104,7 +104,7 @@ if [[ "$GRPO_SAVE_CKPTS" =~ ^(0|false|no|off)$ ]]; then
 fi
 
 uv run --env-file .env python -m rl.run_grpo \
-    "rl.ckpt=\"$PROJECT_ROOT/.pretrained_model/epoch=499-step=48500.ckpt\"" \
+    "rl.ckpt=\"$PROJECT_ROOT/.rl_ckpts/grpo_topology_seed0_sig0p05_g8_mu2_kl0.02_lr1e-4_hydra_maxa100-omitposkl_scaff_b10_p0p5_w50_canonsmi_best.pt\"" \
     "rl.n_updates=$N_UPDATES" \
     rl.grpo.num_integration_steps=100 \
     "rl.max_atoms=$MAX_ATOMS" \

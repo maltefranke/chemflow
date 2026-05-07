@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate molecules (pretrained vs shape-GRPO checkpoint) and save trajectories for notebook analysis.
+"""Archived generator for pretrained vs legacy shape-GRPO trajectory bundles.
 
 Run from repository root::
 
@@ -10,8 +10,8 @@ Or::
     python rl/experiments/shape/generate_shape_grpo_samples.py
 
 Writes ``shape_grpo_samples.pt`` under ``<out_dir>/<rl_ckpt_stem>/`` (same layout idea as
-``rl/experiments/natoms/compare_pretrained_rl_atoms.py``). Load in ``shape_reward_similarity.ipynb``
-to score with ``_score_shape_single``, plot histograms/scatter, and py3Dmol top structures.
+``rl/experiments/natoms/compare_pretrained_rl_atoms.py``). The active reward registry no
+longer includes the old shape reward.
 
 Trailing CLI args are forwarded as Hydra overrides (must match training / eval config).
 """
