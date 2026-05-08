@@ -42,8 +42,8 @@ class GRPOConfig:
     sigma_explore: float = 0.05    # per-coordinate std for N(x_t + v_θ dt, σ² I) position kernel
     clip_eps: float = DEFAULT_CLIP_EPS
     eps_t: float = EPS_T
-    log_ratio_clamp: float = DEFAULT_LOG_RATIO_CLAMP  # clamp |lp_new - lp_old| before exp (see §A)
-    p_ins_clamp: float = DEFAULT_P_INS_CLAMP       # overleaf §4.1: `min(p_ins, 1-eps)` (see §4)
+    log_ratio_clamp: float = DEFAULT_LOG_RATIO_CLAMP  # pre-exp bound: ratio / k3, avoid exp Inf
+    p_ins_clamp: float = DEFAULT_P_INS_CLAMP       # cap p_ins below 1 (insert Bernoulli floor headroom)
     num_integration_steps: int | None = None       # None -> module's default
     max_grad_norm: float | None = 1.0              # clip_grad_norm_ threshold; None disables
     # GRPO group size: number of rollouts sharing the same prompt. G=1 keeps
@@ -163,7 +163,8 @@ def _gather_logp(probs: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
 
 
 def _q_to_p(q: torch.Tensor, rate_node: torch.Tensor, dt: float) -> torch.Tensor:
-    """Canonical raw-sigmoid -> per-step probability (see DEPARTURES.md §C)."""
+    """Canonical raw-sigmoid -> per-step probability : 
+    sigmoid(q) * rate * dt; clamp interior (0,1) for logs."""
     return (q * rate_node * dt).clamp(EPS, 1.0 - EPS)
 
 
@@ -224,7 +225,7 @@ def node_action_logprob(
     batch_id: torch.Tensor,
     num_graphs: int,
 ) -> torch.Tensor:
-    """log pi^{node} per graph (overleaf Eq. 22).
+    """log pi^{node} per-graph: 3-way noop/sub/del + atom cat (factorised).
 
     `p_sub`, `p_del` already passed through `_q_to_p` (in (EPS, 1-EPS)).  We
     re-clamp `p_any` / `p_noop` defensively because the sum can still exceed 1.
@@ -279,7 +280,7 @@ def ins_gate_logprob(
     batch_id: torch.Tensor,
     num_graphs: int,
 ) -> torch.Tensor:
-    """Sum of per-node Bernoulli log-probs (overleaf Eq. logprob_ins_gate)."""
+    """Sum of per-node Bernoulli log-probs."""
     log_pos = torch.log(p_ins.clamp(min=EPS))
     log_neg = torch.log((1.0 - p_ins).clamp(min=EPS))
     logp = torch.where(do_ins, log_pos, log_neg)
@@ -292,7 +293,7 @@ def gmm_marginal_logprob(
     ins_a: torch.Tensor,         # (n,)
     ins_c: torch.Tensor,         # (n,)
 ) -> torch.Tensor:
-    """log pi^GMM per inserted atom; logsumexp over K components (overleaf Eq. gmm_logprob_lse)."""
+    """log pi^GMM per inserted atom; logsumexp over K components."""
     if ins_x.numel() == 0:
         return ins_x.new_zeros(0)
 
@@ -322,8 +323,7 @@ def ins_edge_marginal_logprob(
     kappa_t: torch.Tensor,       # (E, 1) in [0, 1]
     hat_e: torch.Tensor,         # (E,)
 ) -> torch.Tensor:
-    """Overleaf Eq. ins_edge_marginal.
-
+    """
     P(hat_e = k) = (1 - kappa) * p_prior[k] + kappa * pi_edge[k]
     Closed-form marginal over the latent `e1` that the integrator samples.
     """
@@ -427,7 +427,7 @@ def _per_channel_logprob(
     triu_idx, (q_sub_e_triu, edge_probs_triu) = _extract_triu(
         mol_t.edge_index, [q_sub_e_full, edge_probs_full],
     )
-    # DEPARTURES.md §D
+    # triu order: rollout vs logp must share EDGE_ALIGNER permutation
     assert torch.equal(triu_idx, step.edge_triu_idx), (
         "edge aligner ordering drifted between rollout and scoring"
     )
@@ -769,7 +769,7 @@ def _rollout_step(module, mol_t, t: torch.Tensor, dt: float, cfg: GRPOConfig):
             t_ins_graph = t[batch_id[spawn_idx]] + dt
             kappa_t_e = integrator.sub_e_schedule.kappa_t(t_ins_graph).unsqueeze(1)
             # Closed-form marginal sampling: P(hat_e) = (1 - kappa) * prior + kappa * pi.
-            # Matches integrator's two-stage draw in distribution (DEPARTURES.md §G).
+            # ins edges: same (1−κ)·prior + κ·π mix as integrator
             mixed_probs = (
                 (1.0 - kappa_t_e) * prior_edge_probs.view(1, -1) + kappa_t_e * ins_probs
             )
@@ -991,10 +991,7 @@ def _k3_kl_per_channel(
     cfg: GRPOConfig,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Schulman k3 = exp(t) - t - 1 with t = log π_ref - log π_θ, per channel and graph.
-
-    Each channel is one term; the returned `kl_total` is the sum (same as STABILITY_FIXES
-    for a factorised per-step policy).  `t` is clamped like the PPO log-ratio to avoid
-    `exp` overflow.
+    Sum over channels (factorised per-step policy).  Clamp `t` before `exp` (overflow).
     """
     kl_by_ch: dict[str, torch.Tensor] = {}
     for name, lp_t in breakdown_theta.items():
@@ -1108,7 +1105,7 @@ def grpo_step(
             lp_new, breakdown = _step_logprob_with_grad(
                 module, step, cfg, detach_breakdown=not use_kl,
             )
-            # DEPARTURES.md §A: clamp log-ratio before exp.
+            # clamp Δlogp before exp (importance weight / grad stability)
             log_ratio = (lp_new - step.logp_old).clamp(
                 -cfg.log_ratio_clamp, cfg.log_ratio_clamp,
             )
@@ -1204,9 +1201,8 @@ def train(
     ) -> None:
     """GRPO training loop.
 
-    When `cfg.kl_coef > 0`, a **frozen** copy of the policy at `train()` start
-    (post-checkpoint) is used as the reference; see `grpo_step` and
-    `STABILITY_FIXES.md` §2.
+    When `cfg.kl_coef > 0`, a **frozen** deepcopy of the policy at `train()`
+    start (post-checkpoint) is the ref in `grpo_step` (k3 on per-channel logp).
 
     Best-checkpoint tracking
     ------------------------
