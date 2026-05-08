@@ -177,17 +177,17 @@ wandb/
 *.pt
 slurm_logs/
 diagnostics/
-rl/notes/
+src/chemflow/rl/notes/
 
 # RL experiment runs: one folder per checkpoint (plots + tensors); reproducible via scripts/notebooks.
-rl/experiments/natoms/grpo_*/
-rl/experiments/shape/grpo_*/
-rl/experiments/tanimoto/grpo_*/
-rl/experiments/topology/grpo_*/
+src/chemflow/rl/experiments/natoms/grpo_*/
+src/chemflow/rl/experiments/shape/grpo_*/
+src/chemflow/rl/experiments/tanimoto/grpo_*/
+src/chemflow/rl/experiments/topology/grpo_*/
 # Loose PNGs beside notebooks (preferred: write under grpo_* only)
-rl/experiments/natoms/*.png
-rl/experiments/shape/*.png
-rl/experiments/tanimoto/*.png
-rl/experiments/topology/*.png
+src/chemflow/rl/experiments/natoms/*.png
+src/chemflow/rl/experiments/shape/*.png
+src/chemflow/rl/experiments/tanimoto/*.png
+src/chemflow/rl/experiments/topology/*.png
 
 .codex

@@ -11,13 +11,6 @@ hydra:
     chdir: false
 
 # GRPO fine-tuning config.
-#
-# This composes the normal ChemFlow model/data/trainer stack from
-# configs/default.yaml and adds an `rl` block for RL-only settings.
-# Override examples:
-#   python -m rl.run_grpo rl.n_updates=20
-#   python -m rl.run_grpo rl.grpo.kl_coef=0.03 rl.grpo.group_size=4
-
 rl:
   # Checkpoints and run control
   # Keep this pointed at the pretrained model by default. The Slurm continuation
