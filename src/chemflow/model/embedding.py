@@ -246,6 +246,134 @@ class ExtrapolatableCountEmbedding(nn.Module):
         return self.projection(torch.cat([fourier, scalar], dim=-1))
 
 
+class ExtrapolatableScalarEmbedding(nn.Module):
+    """Scalar (continuous, possibly negative) embedding designed to extrapolate
+    slightly outside the training range.
+
+    Continuous-valued analogue of :class:`ExtrapolatableCountEmbedding`.  Suited
+    for signals like RDKit Crippen logP, molecular weight, or any other
+    real-valued conditioning scalar where:
+
+    * Training values can be negative.
+    * The desired query range at inference exceeds the training support
+      (e.g. QM9 trains at logP ∈ [-3, 4] but you want to query logP=6).
+
+    The naive ``SinusoidalEncoding(... , max_period=20)`` + MLP path used by
+    the legacy :class:`UnifiedCFGEmbedding` logp/mw branches has two failure
+    modes:
+
+    * Its highest-frequency components have wavelengths comparable to (or
+      shorter than) the training range, so they alias inside-distribution and
+      produce never-seen sin/cos quadrants for slight OOD queries.
+    * Every output dim is bounded in ``[-1, 1]``, so there is no monotonic /
+      unbounded direction the downstream MLP can ride to "go further".
+
+    This module fixes both:
+
+    * Uses a low-frequency Fourier basis whose **shortest period
+      (``min_period``)** is larger than the expected training-range span
+      (``value_max - value_min``), so every Fourier dim varies smoothly across
+      the training range and its immediate neighbourhood.
+    * Concatenates a **raw centred-and-normalised scalar**
+      ``(value - mid) / half_range`` (``mid = (value_min + value_max) / 2``,
+      ``half_range = (value_max - value_min) / 2``) so the projection MLP has
+      a strictly linear, unbounded axis to extrapolate along — the Fourier
+      basis only contributes local precision within range.
+
+    Defaults are tuned for QM9 logP (training span ~``[-3, 4]``) with query
+    headroom up to logP=8: ``min_period=16`` (> training-span 7), plus
+    ``value_min=-4``, ``value_max=8`` so ``value=8`` maps to scalar=+1 and
+    ``value=14`` would map to scalar=+2 (extrapolation direction).
+
+    Args:
+        embedding_dim: Number of Fourier features (must be even — sin/cos
+            pairs).
+        out_dim: Output embedding size.  Defaults to ``embedding_dim``.
+        min_period: Shortest Fourier wavelength in input units.  Must
+            exceed ``(value_max - value_min)`` so every dim is monotonic
+            across the training range.
+        max_period: Longest Fourier wavelength.
+        value_min: Lower end of the expected (training) value range.  Used
+            only to centre/normalise the raw scalar pass-through.
+        value_max: Upper end of the expected (training) value range.
+
+    Input:  Float Tensor ``[Batch]`` or ``[Batch, 1]``.
+    Output: Float Tensor ``[Batch, out_dim]``.
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        out_dim: int = None,
+        min_period: float = 16.0,
+        max_period: float = 64.0,
+        value_min: float = -4.0,
+        value_max: float = 8.0,
+    ):
+        super().__init__()
+        if out_dim is None:
+            out_dim = embedding_dim
+        if embedding_dim % 2 != 0:
+            raise ValueError(
+                f"embedding_dim {embedding_dim} must be even (sin/cos pairs)."
+            )
+        if min_period <= 0 or max_period < min_period:
+            raise ValueError(
+                f"Expected 0 < min_period <= max_period, got "
+                f"min_period={min_period}, max_period={max_period}."
+            )
+        if value_max <= value_min:
+            raise ValueError(
+                f"Expected value_max > value_min, got "
+                f"value_min={value_min}, value_max={value_max}."
+            )
+
+        self.embedding_dim = embedding_dim
+        self.out_dim = out_dim
+        self.min_period = float(min_period)
+        self.max_period = float(max_period)
+        self.value_min = float(value_min)
+        self.value_max = float(value_max)
+        self.value_mid = 0.5 * (self.value_min + self.value_max)
+        self.value_half_range = 0.5 * (self.value_max - self.value_min)
+
+        half_dim = embedding_dim // 2
+        if half_dim == 1:
+            periods = torch.tensor([min_period], dtype=torch.float32)
+        else:
+            log_pmin = math.log(min_period)
+            log_pmax = math.log(max_period)
+            periods = torch.exp(torch.linspace(log_pmin, log_pmax, half_dim))
+        self.register_buffer("freqs", 2 * math.pi / periods)
+
+        # MLP takes [fourier_features, raw_centred_scalar] and mixes them.
+        # The raw scalar is the path responsible for linear extrapolation.
+        self.projection = nn.Sequential(
+            nn.Linear(embedding_dim + 1, out_dim),
+            nn.SiLU(),
+            nn.Linear(out_dim, out_dim),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        if value.ndim == 1:
+            value = value.unsqueeze(-1)
+
+        x = value.float()
+        args = x * self.freqs.unsqueeze(0)
+        fourier = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        scalar = (x - self.value_mid) / self.value_half_range
+        return self.projection(torch.cat([fourier, scalar], dim=-1))
+
+
 class TimeEmbedding(nn.Module):
     """
     Embeds continuous time/noise levels.

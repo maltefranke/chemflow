@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from rdkit import Chem
 from rdkit.Chem import Crippen, GetPeriodicTable
+from rdkit.Chem.QED import qed as _rdkit_qed
 
 from chemflow.dataset.qm9 import QM9_PROPERTY_NAMES
 from chemflow.model.embedding import (
@@ -53,6 +54,8 @@ class CFGAdapter:
         mw_cfg_guidance_scale: float = 0.0,
         logp_cfg_dropout_prob: float = 0.0,
         logp_cfg_guidance_scale: float = 0.0,
+        qed_cfg_dropout_prob: float = 0.0,
+        qed_cfg_guidance_scale: float = 0.0,
         atom_tokens: list[str] | None = None,
         property_names: list[str] | None = None,
     ):
@@ -65,6 +68,8 @@ class CFGAdapter:
         self.mw_cfg_guidance_scale = float(mw_cfg_guidance_scale)
         self.logp_cfg_dropout_prob = float(logp_cfg_dropout_prob)
         self.logp_cfg_guidance_scale = float(logp_cfg_guidance_scale)
+        self.qed_cfg_dropout_prob = float(qed_cfg_dropout_prob)
+        self.qed_cfg_guidance_scale = float(qed_cfg_guidance_scale)
         self.atom_tokens = atom_tokens
 
         if property_names is not None:
@@ -101,6 +106,11 @@ class CFGAdapter:
     def _has_logp_cfg(self) -> bool:
         e = self._cfg_embedding
         return e is not None and getattr(e, "logp_encoder", None) is not None
+
+    @property
+    def _has_qed_cfg(self) -> bool:
+        e = self._cfg_embedding
+        return e is not None and getattr(e, "qed_encoder", None) is not None
 
     def extract_properties(self, mols_t) -> torch.Tensor | None:
         if not self._has_property_conditioning:
@@ -176,6 +186,21 @@ class CFGAdapter:
         device = mols.x.device if hasattr(mols, "x") else None
         return compute_logp(smiles, device=device)
 
+    def extract_target_qed(self, mols) -> torch.Tensor | None:
+        """Per-graph RDKit QED, computed on-the-fly from SMILES.
+
+        Same SMILES contract as :meth:`extract_target_logp`.  Returns ``None``
+        when SMILES are unavailable so the embedding falls back to its null
+        token.
+        """
+        if not self._has_qed_cfg:
+            return None
+        smiles = getattr(mols, "smiles", None)
+        if smiles is None:
+            return None
+        device = mols.x.device if hasattr(mols, "x") else None
+        return compute_qed(smiles, device=device)
+
     def _sample_drop_mask(
         self,
         prob: float,
@@ -213,6 +238,13 @@ class CFGAdapter:
             self.logp_cfg_guidance_scale > 0.0
             and target_logp is not None
             and self._has_logp_cfg
+        )
+
+    def should_use_qed_cfg(self, target_qed) -> bool:
+        return (
+            self.qed_cfg_guidance_scale > 0.0
+            and target_qed is not None
+            and self._has_qed_cfg
         )
 
     def apply_cfg(
@@ -283,6 +315,13 @@ class CFGAdapter:
                 device,
                 training,
             ),
+            "target_qed": self.extract_target_qed(mols_1),
+            "qed_drop_mask": self._sample_drop_mask(
+                self.qed_cfg_dropout_prob,
+                bs,
+                device,
+                training,
+            ),
         }
 
     def _uncond_cfg_inputs(self) -> dict:
@@ -296,6 +335,8 @@ class CFGAdapter:
             "mw_drop_mask": None,
             "target_logp": None,
             "logp_drop_mask": None,
+            "target_qed": None,
+            "qed_drop_mask": None,
         }
 
     def guided_predict(
@@ -314,11 +355,13 @@ class CFGAdapter:
         target_n_atoms = cfg_inputs.get("target_n_atoms")
         target_mw = cfg_inputs.get("target_mw")
         target_logp = cfg_inputs.get("target_logp")
+        target_qed = cfg_inputs.get("target_qed")
         properties = cfg_inputs.get("properties")
 
         use_natoms = self.should_use_natoms_cfg(target_n_atoms)
         use_mw = self.should_use_mw_cfg(target_mw)
         use_logp = self.should_use_logp_cfg(target_logp)
+        use_qed = self.should_use_qed_cfg(target_qed)
         use_prop = self.should_use_property_cfg(properties)
 
         # At guidance_scale == 1 the linear interpolation
@@ -335,11 +378,25 @@ class CFGAdapter:
             (not use_natoms or self.natoms_cfg_guidance_scale == 1.0)
             and (not use_mw or self.mw_cfg_guidance_scale == 1.0)
             and (not use_logp or self.logp_cfg_guidance_scale == 1.0)
+            and (not use_qed or self.qed_cfg_guidance_scale == 1.0)
             and (not use_prop or self.cfg_guidance_scale == 1.0)
         )
         if scales_all_unit:
             if use_prop:
                 active_cfg_inputs = cfg_inputs
+            elif use_logp and use_qed:
+                # Both signals are provided to the model in a single
+                # conditional pass — this is the joint logP × QED case.
+                active_cfg_inputs = {
+                    **self._uncond_cfg_inputs(),
+                    "target_logp": target_logp,
+                    "target_qed": target_qed,
+                }
+            elif use_qed:
+                active_cfg_inputs = {
+                    **self._uncond_cfg_inputs(),
+                    "target_qed": target_qed,
+                }
             elif use_logp:
                 active_cfg_inputs = {
                     **self._uncond_cfg_inputs(),
@@ -415,6 +472,20 @@ class CFGAdapter:
                 preds_cond,
                 preds,
                 self.logp_cfg_guidance_scale,
+            )
+
+        if use_qed:
+            cond = {**uncond, "target_qed": target_qed}
+            preds_cond = model(
+                mol_t,
+                t.view(-1, 1),
+                prev_outs=prev_preds,
+                cfg_inputs=cond,
+            )
+            preds = self.apply_cfg(
+                preds_cond,
+                preds,
+                self.qed_cfg_guidance_scale,
             )
 
         if use_prop:
@@ -494,6 +565,33 @@ def compute_logp(
     return torch.tensor(values, dtype=torch.float, device=device)
 
 
+def compute_qed(
+    smiles: list[str] | str,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Compute RDKit QED (drug-likeness, in ``[0, 1]``) for each SMILES.
+
+    Args:
+        smiles: A single canonical SMILES or a list of length ``num_graphs``.
+            Empty / unparsable strings yield 0.0 (the trained null prior —
+            note QED is bounded in ``[0, 1]`` so 0 is the floor of the range).
+        device: Device for the returned tensor.
+
+    Returns:
+        ``(num_graphs,)`` float tensor of QED values.
+    """
+    if isinstance(smiles, str):
+        smiles = [smiles]
+    values: list[float] = []
+    for s in smiles:
+        mol = Chem.MolFromSmiles(s) if s else None
+        try:
+            values.append(float(_rdkit_qed(mol)) if mol is not None else 0.0)
+        except Exception:
+            values.append(0.0)
+    return torch.tensor(values, dtype=torch.float, device=device)
+
+
 def _encode_signal(
     value: torch.Tensor | None,
     encoder: nn.Module,
@@ -552,11 +650,27 @@ class UnifiedCFGEmbedding(nn.Module):
         use_mw: bool = False,
         mw_sinusoidal_dim: int = 64,
         mw_max_period: float = 1000.0,
-        # LogP conditioning (RDKit Crippen, computed on the fly from SMILES)
+        # LogP conditioning (RDKit Crippen, computed on the fly from SMILES).
+        # ``logp_encoder`` is an optional pre-instantiated nn.Module (e.g.
+        # :class:`ExtrapolatableScalarEmbedding`) that takes a float scalar
+        # ``[B]`` / ``[B, 1]`` and returns a ``[B, encoder.out_dim]``
+        # embedding.  When ``None`` the legacy
+        # ``SinusoidalEncoding(logp_sinusoidal_dim, max_period=logp_max_period)
+        # → MLP`` path is built — this preserves backward compatibility with
+        # checkpoints trained before the external-encoder hook existed.
         use_logp: bool = False,
+        logp_encoder: nn.Module | None = None,
         logp_sinusoidal_dim: int = 64,
         # QM9 logP roughly spans [-3, 6]; period 20 gives well-separated phases.
         logp_max_period: float = 20.0,
+        # QED conditioning (RDKit drug-likeness, bounded in ``[0, 1]``).
+        # Encoded via the same ``SinusoidalEncoding -> MLP`` recipe as the
+        # legacy logP / MW branches.  Default ``qed_max_period=4`` covers the
+        # full ``[0, 1]`` range with ~1/4 of a period on the lowest-frequency
+        # component — no extrapolation hook is provided since QED is bounded.
+        use_qed: bool = False,
+        qed_sinusoidal_dim: int = 64,
+        qed_max_period: float = 4.0,
     ):
         super().__init__()
         self.out_dim = out_dim
@@ -609,18 +723,54 @@ class UnifiedCFGEmbedding(nn.Module):
             internal_dim += mw_sinusoidal_dim
 
         self.logp_encoder = None
+        self._logp_sinusoidal = None
         self._logp_null = None
+        # When True we keep the legacy two-step encode (sinusoidal -> MLP);
+        # when False the external ``logp_encoder`` is responsible for the
+        # whole pipeline (see :class:`ExtrapolatableScalarEmbedding`).
+        self._logp_uses_internal_sinusoidal = False
         if use_logp:
-            self._logp_sinusoidal = SinusoidalEncoding(
-                logp_sinusoidal_dim, max_period=logp_max_period
+            if logp_encoder is not None:
+                if not hasattr(logp_encoder, "out_dim"):
+                    raise AttributeError(
+                        f"logp_encoder {type(logp_encoder).__name__} must "
+                        "expose an `out_dim` attribute so the null embedding "
+                        "can be sized."
+                    )
+                self.logp_encoder = logp_encoder
+                logp_dim = int(logp_encoder.out_dim)
+            else:
+                # Legacy path: matches every checkpoint trained before
+                # the external-encoder hook existed.  Parameter names
+                # (``_logp_sinusoidal.freqs``, ``logp_encoder.{0,2}.{weight,bias}``,
+                # ``_logp_null``) are preserved for state_dict compatibility.
+                self._logp_sinusoidal = SinusoidalEncoding(
+                    logp_sinusoidal_dim, max_period=logp_max_period
+                )
+                self.logp_encoder = nn.Sequential(
+                    nn.Linear(logp_sinusoidal_dim, logp_sinusoidal_dim),
+                    nn.SiLU(),
+                    nn.Linear(logp_sinusoidal_dim, logp_sinusoidal_dim),
+                )
+                logp_dim = logp_sinusoidal_dim
+                self._logp_uses_internal_sinusoidal = True
+            self._logp_null = nn.Parameter(torch.randn(logp_dim) * 0.02)
+            internal_dim += logp_dim
+
+        self.qed_encoder = None
+        self._qed_sinusoidal = None
+        self._qed_null = None
+        if use_qed:
+            self._qed_sinusoidal = SinusoidalEncoding(
+                qed_sinusoidal_dim, max_period=qed_max_period
             )
-            self.logp_encoder = nn.Sequential(
-                nn.Linear(logp_sinusoidal_dim, logp_sinusoidal_dim),
+            self.qed_encoder = nn.Sequential(
+                nn.Linear(qed_sinusoidal_dim, qed_sinusoidal_dim),
                 nn.SiLU(),
-                nn.Linear(logp_sinusoidal_dim, logp_sinusoidal_dim),
+                nn.Linear(qed_sinusoidal_dim, qed_sinusoidal_dim),
             )
-            self._logp_null = nn.Parameter(torch.randn(logp_sinusoidal_dim) * 0.02)
-            internal_dim += logp_sinusoidal_dim
+            self._qed_null = nn.Parameter(torch.randn(qed_sinusoidal_dim) * 0.02)
+            internal_dim += qed_sinusoidal_dim
 
         if internal_dim > 0:
             self.projection = nn.Sequential(
@@ -656,12 +806,28 @@ class UnifiedCFGEmbedding(nn.Module):
             return self._logp_null.unsqueeze(0).expand(batch_size, -1)
         if value.ndim == 1:
             value = value.unsqueeze(-1)
-        emb = self.logp_encoder(self._logp_sinusoidal(value))
+        if self._logp_uses_internal_sinusoidal:
+            emb = self.logp_encoder(self._logp_sinusoidal(value))
+        else:
+            emb = self.logp_encoder(value)
         if drop_mask is not None:
             null = self._logp_null.unsqueeze(0).expand_as(emb)
             emb = torch.where(drop_mask.unsqueeze(-1), null, emb)
         else:
             emb = emb + self._logp_null.sum() * 0
+        return emb
+
+    def _encode_qed(self, value, drop_mask, batch_size):
+        if value is None:
+            return self._qed_null.unsqueeze(0).expand(batch_size, -1)
+        if value.ndim == 1:
+            value = value.unsqueeze(-1)
+        emb = self.qed_encoder(self._qed_sinusoidal(value))
+        if drop_mask is not None:
+            null = self._qed_null.unsqueeze(0).expand_as(emb)
+            emb = torch.where(drop_mask.unsqueeze(-1), null, emb)
+        else:
+            emb = emb + self._qed_null.sum() * 0
         return emb
 
     def forward(
@@ -707,6 +873,15 @@ class UnifiedCFGEmbedding(nn.Module):
                 self._encode_logp(
                     cfg_inputs.get("target_logp"),
                     cfg_inputs.get("logp_drop_mask"),
+                    batch_size,
+                )
+            )
+
+        if self.qed_encoder is not None:
+            parts.append(
+                self._encode_qed(
+                    cfg_inputs.get("target_qed"),
+                    cfg_inputs.get("qed_drop_mask"),
                     batch_size,
                 )
             )

@@ -24,6 +24,8 @@ class LightningDataModule(pl.LightningDataModule):
         n_atoms_strategy: str = "flexible",
         optimal_transport: str = "equivariant",
         time_dist: DictConfig = None,
+        rotate: bool = False,
+        n_augmentations: int = 1,
     ):
         self.vocab = vocab
         self.distributions = distributions
@@ -33,6 +35,14 @@ class LightningDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.n_atoms_strategy = n_atoms_strategy
         self.optimal_transport = optimal_transport
+        self.rotate = rotate
+        self.n_augmentations = max(1, int(n_augmentations))
+
+        if self.n_augmentations > 1 and self.batch_size.train % self.n_augmentations != 0:
+            raise ValueError(
+                f"batch_size.train ({self.batch_size.train}) must be divisible by "
+                f"n_augmentations ({self.n_augmentations})."
+            )
 
         if time_dist is None:
             time_dist = DictConfig(
@@ -82,6 +92,8 @@ class LightningDataModule(pl.LightningDataModule):
             n_atoms_strategy=self.n_atoms_strategy,
             time_dist=self.time_dist,
             stage="train",
+            rotate=self.rotate,
+            n_augmentations=self.n_augmentations,
         )
 
         self.val_datasets = []
@@ -144,10 +156,14 @@ class LightningDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         nw = self.num_workers.train
+        # Each __getitem__ produces n_augmentations training items, so we
+        # request batch_size.train // n_augmentations unique molecules per
+        # batch and the wrapper expands them to the configured effective size.
+        per_load_batch_size = self.batch_size.train // self.n_augmentations
         return DataLoader(
             self.train_dataset,
             shuffle=True,
-            batch_size=self.batch_size.train,
+            batch_size=per_load_batch_size,
             num_workers=nw,
             persistent_workers=nw > 0,
             pin_memory=True,

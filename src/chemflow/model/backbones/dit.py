@@ -516,8 +516,17 @@ class DiTBackboneWithHeads(nn.Module):
         out_dict["gmm_head"] = self.ins_gmm_head(h, x, edge_index_tuple)
         out_dict["h_latent"] = h
 
+        return out_dict
+
+    @staticmethod
+    def apply_activations(out_dict: dict[str, Any]) -> dict[str, Any]:
+        """Apply post-head activations (softplus on rate logits).
+
+        Separated from forward() so that CFGAdapter can apply CFG on raw logits
+        first and then activate. Must be called by callers of forward() before
+        the outputs are consumed.
+        """
         for key in out_dict:
             if "rate" in key:
                 out_dict[key] = F.softplus(out_dict[key])
-
         return out_dict

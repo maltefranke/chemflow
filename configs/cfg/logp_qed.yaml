@@ -1,0 +1,74 @@
+cfg_adapter:
+    _target_: chemflow.model.cfg.CFGAdapter
+    cfg_dropout_prob: 0.0
+    cfg_guidance_scale: 0.0
+    natoms_cfg_dropout_prob: 0.0
+    natoms_cfg_guidance_scale: 0.0
+    mw_cfg_dropout_prob: 0.0
+    mw_cfg_guidance_scale: 0.0
+    logp_cfg_dropout_prob: ${if:${cfg.do_cfg}, ${cfg.cfg.logp_dropout_prob}, 0.0}
+    logp_cfg_guidance_scale: ${if:${cfg.do_cfg}, ${cfg.cfg.logp_guidance_scale}, 0.0}
+    qed_cfg_dropout_prob: ${if:${cfg.do_cfg}, ${cfg.cfg.qed_dropout_prob}, 0.0}
+    qed_cfg_guidance_scale: ${if:${cfg.do_cfg}, ${cfg.cfg.qed_guidance_scale}, 0.0}
+
+# ── Joint classifier-free guidance on RDKit Crippen logP + RDKit QED ──
+# Both signals are computed on the fly from each molecule's canonical SMILES
+# inside ``CFGAdapter.extract_target_logp`` / ``extract_target_qed`` (see
+# ``chemflow.model.cfg.compute_logp`` / ``compute_qed``).  Like the other
+# conditional case studies the model is always given both values at the same
+# time — there is no per-signal toggling at inference.
+do_cfg: true
+
+cfg:
+  embed_dim: 128
+  # Property / n_atoms / MW conditioning all disabled — only logP and QED.
+  num_properties: 0
+  property_hidden_dim: 128
+  property_dropout_prob: 0.0
+  property_guidance_scale: 1.0
+  use_natoms: false
+  use_mw: false
+
+  # LogP conditioning
+  use_logp: true
+  # dropout=0: model always sees the conditioning signal; no unconditional
+  # branch is learned.  Bump to e.g. 0.15 to enable real CFG (allows
+  # logp_guidance_scale > 1.0 at inference for stronger steering).
+  logp_dropout_prob: 0.0
+  # scale=1: guided output = uncond + 1*(cond - uncond) = cond exactly.
+  # The model always runs the conditional forward; CFG just passes it through.
+  logp_guidance_scale: 1.0
+  logp_sinusoidal_dim: 64
+  logp_max_period: 20.0
+
+  # Optional external logP encoder (e.g. ExtrapolatableScalarEmbedding) —
+  # see configs/cfg/logp.yaml for the override recipe.
+  logp_encoder: null
+
+  # QED conditioning (RDKit, bounded in [0, 1]).  No external-encoder hook
+  # because the value range is bounded — the legacy SinusoidalEncoding+MLP
+  # path is sufficient for in-range conditioning.
+  use_qed: true
+  qed_dropout_prob: 0.0
+  qed_guidance_scale: 1.0
+  qed_sinusoidal_dim: 64
+  qed_max_period: 4.0
+
+  # Unified embedding
+  embedding:
+    _target_: chemflow.model.cfg.UnifiedCFGEmbedding
+    out_dim: ${cfg.cfg.embed_dim}
+    num_properties: ${cfg.cfg.num_properties}
+    property_hidden_dim: ${cfg.cfg.property_hidden_dim}
+    use_natoms: ${cfg.cfg.use_natoms}
+    use_mw: ${cfg.cfg.use_mw}
+    use_logp: ${cfg.cfg.use_logp}
+    logp_encoder: ${cfg.cfg.logp_encoder}
+    logp_sinusoidal_dim: ${cfg.cfg.logp_sinusoidal_dim}
+    logp_max_period: ${cfg.cfg.logp_max_period}
+    use_qed: ${cfg.cfg.use_qed}
+    qed_sinusoidal_dim: ${cfg.cfg.qed_sinusoidal_dim}
+    qed_max_period: ${cfg.cfg.qed_max_period}
+
+cfg_embedding: ${if:${cfg.do_cfg}, ${cfg.cfg.embedding}, null}
+cfg_embed_dim: ${if:${cfg.do_cfg}, ${cfg.cfg.embed_dim}, 0}

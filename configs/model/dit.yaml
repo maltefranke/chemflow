@@ -4,6 +4,11 @@ gmm_params:
     D: 3
 
 rotate: true
+# Number of randomly-rotated copies per source molecule per training batch.
+# When > 1, the dataloader requests batch_size.train // n_augmentations unique
+# molecules per batch and the wrapper expands them with N independent random
+# rotations. Requires rotate=true and batch_size.train % n_augmentations == 0.
+n_augmentations: 4
 
 
 integrator:
@@ -98,7 +103,6 @@ module:
     edge_type_embedding_args: ${model.edge_type_embedding}
     time_embedding_args: ${model.time_embedding}
     node_count_embedding_args: ${model.node_count_embedding}
-    bond_degree_embedding_args: ${model.bond_degree_embedding}
 
     backbone_model_args: ${model.backbone}
 
@@ -147,16 +151,10 @@ token_weighting:
   weight_alpha: 0.4
 
 
-bond_degree_embedding:
-  _target_: chemflow.model.embedding.BondDegreeEmbedding
-  n_edge_types: ${len:${data.vocab.edge_tokens}}
-  out_dim: 128
-bond_degree_embed_dim: 128
-
 backbone:
   _target_: chemflow.model.backbones.dit.DiTBackbone
   _recursive_: false
-  d_input: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.bond_degree_embed_dim}"}
+  d_input: ${model.atom_type_embedding.out_dim}
   d_cond: ${oc.eval:"${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${cfg.cfg_embed_dim}"}
   d_model: 512
   out_node_nf: 256
@@ -190,11 +188,6 @@ heads:
         hidden_dim: 128
 
       ins_rate_head:
-        input_dim: ${model.backbone.out_node_nf}
-        output_dim: 1
-        hidden_dim: 128
-
-      do_ins_head:
         input_dim: ${model.backbone.out_node_nf}
         output_dim: 1
         hidden_dim: 128

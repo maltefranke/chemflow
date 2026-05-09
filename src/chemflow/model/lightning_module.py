@@ -585,6 +585,14 @@ class LightningModuleRates(pl.LightningModule):
         loss = self.loss_accumulator.total_loss()
         self.log_dict(self.loss_accumulator.log_dict(), prog_bar=False, logger=True)
 
+        # ins_edge_head.unseen_node_embedding is exclusive to forward_ins_to_ins
+        # (InsertionEdgeHead.forward never references it). On batches without a
+        # single ins-to-ins edge — more likely with smaller effective batches
+        # such as n_augmentations > 1 — the param ends up with .grad = None and
+        # DDP rejects the step. Add a 0-weighted reference so it always lands
+        # in the autograd graph.
+        loss = loss + 0.0 * self.model.ins_edge_head.unseen_node_embedding.sum()
+
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -707,6 +715,7 @@ class LightningModuleRates(pl.LightningModule):
         target_override = getattr(self, "predict_target_n_atoms_override", None)
         target_mw_override = getattr(self, "predict_target_mw_override", None)
         target_logp_override = getattr(self, "predict_target_logp_override", None)
+        target_qed_override = getattr(self, "predict_target_qed_override", None)
         gen_mols = self.sample(
             batch,
             batch_idx,
@@ -714,6 +723,7 @@ class LightningModuleRates(pl.LightningModule):
             target_n_atoms_override=target_override,
             target_mw_override=target_mw_override,
             target_logp_override=target_logp_override,
+            target_qed_override=target_qed_override,
         )
 
         # do quick validity check of the generated molecules
@@ -758,6 +768,7 @@ class LightningModuleRates(pl.LightningModule):
         target_n_atoms_override=None,
         target_mw_override=None,
         target_logp_override=None,
+        target_qed_override=None,
     ) -> dict:
         """Build the cfg_inputs dict for inference."""
         properties = self.cfg_adapter.extract_properties(mol_t)
@@ -805,6 +816,19 @@ class LightningModuleRates(pl.LightningModule):
         else:
             target_logp = self.cfg_adapter.extract_target_logp(mol_1)
 
+        if target_qed_override is not None:
+            if isinstance(target_qed_override, (int, float)):
+                target_qed = torch.full(
+                    (batch_size,),
+                    float(target_qed_override),
+                    dtype=torch.float,
+                    device=self.device,
+                )
+            else:
+                target_qed = target_qed_override.to(self.device)
+        else:
+            target_qed = self.cfg_adapter.extract_target_qed(mol_1)
+
         return {
             "properties": properties,
             "property_drop_mask": None,
@@ -814,6 +838,8 @@ class LightningModuleRates(pl.LightningModule):
             "mw_drop_mask": None,
             "target_logp": target_logp,
             "logp_drop_mask": None,
+            "target_qed": target_qed,
+            "qed_drop_mask": None,
         }
 
     def sample(
@@ -824,6 +850,7 @@ class LightningModuleRates(pl.LightningModule):
         target_n_atoms_override: torch.Tensor | int | None = None,
         target_mw_override: torch.Tensor | float | None = None,
         target_logp_override: torch.Tensor | float | None = None,
+        target_qed_override: torch.Tensor | float | None = None,
     ):
         """
         Inference step for flow matching.
@@ -838,6 +865,9 @@ class LightningModuleRates(pl.LightningModule):
                 Shape (batch_size,) with MW in Daltons, or a scalar float.
             target_logp_override: If provided, overrides the RDKit Crippen logP
                 target.  Shape (batch_size,) with floats, or a scalar float.
+            target_qed_override: If provided, overrides the RDKit QED target
+                (drug-likeness in ``[0, 1]``).  Shape (batch_size,) with
+                floats, or a scalar float.
 
         Returns:
             If return_traj is False: MoleculeBatch - final sampled molecules
@@ -882,6 +912,7 @@ class LightningModuleRates(pl.LightningModule):
             target_n_atoms_override,
             target_mw_override,
             target_logp_override,
+            target_qed_override,
         )
 
         # Integration loop: integrate from t=0 to t=1

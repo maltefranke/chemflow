@@ -4,6 +4,7 @@ gmm_params:
     D: 3
 
 rotate: false
+n_augmentations: 1
 
 
 integrator:

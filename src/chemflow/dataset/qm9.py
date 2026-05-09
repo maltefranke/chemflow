@@ -31,7 +31,6 @@ from chemflow.utils.rdkit_utils import (
     BOND_IDX_MAP,
     smiles_from_mol,
 )
-from scipy.spatial.transform import Rotation
 
 # Maps QM9 property names to their column index in the y tensor after
 # the rearrangement `y = torch.cat([y[:, 3:], y[:, :3]], dim=-1)` applied
@@ -239,7 +238,6 @@ class FlowMatchingQM9Dataset(RevisedQM9):
         distributions: Distributions,
         transform=None,
         pre_transform=None,
-        rotate=False,
         split="train",
     ):
         super().__init__(root, transform, pre_transform)
@@ -248,19 +246,11 @@ class FlowMatchingQM9Dataset(RevisedQM9):
         self.vocab = vocab
         self.distributions = distributions
 
-        self.rotate = rotate
-
     def __getitem__(self, index):
         data = super().__getitem__(index)
 
         # remove center of mass
         coord = data.pos - data.pos.mean(dim=0)
-
-        if self.rotate:
-            # do a random rotation
-            rotation = Rotation.random(1)
-            coord = coord @ rotation.as_matrix()[0]
-            coord = coord.to(dtype=data.pos.dtype)
 
         if self.distributions.coordinate_std is not None:
             coord = coord / self.distributions.coordinate_std
