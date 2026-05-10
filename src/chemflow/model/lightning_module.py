@@ -96,6 +96,8 @@ class LightningModuleRates(pl.LightningModule):
         use_ema_for_eval: bool = True,
         use_time_weights: bool = False,
         allow_charged: bool = False,
+        log_grad_norms_every_n_steps: int = 10,
+        grad_norms_granularity: str = "component",
     ):
         super().__init__()
 
@@ -172,7 +174,8 @@ class LightningModuleRates(pl.LightningModule):
                 "sub": lambda t: self.integrator.sub_schedule.rate(t).clamp(max=100.0),
             }
         else:
-            time_weights = {}
+            # always use time-weighting for x
+            time_weights = {"x": InverseSquaredTimeLossWeighting(clamp_max=100.0)}
 
         # object to tie loss computation, weighting, and logging together
         self.loss_accumulator = LossAccumulator(
@@ -180,6 +183,17 @@ class LightningModuleRates(pl.LightningModule):
         )
 
         self.optimizer_config = optimizer_config
+
+        # Per-loss gradient-norm logging. Each invocation runs one extra
+        # backward per reported term, so this is rate-limited via a step
+        # interval and is off by default.
+        self.log_grad_norms_every_n_steps = int(log_grad_norms_every_n_steps)
+        if grad_norms_granularity not in {"component", "group", "both"}:
+            raise ValueError(
+                "grad_norms_granularity must be one of component/group/both, "
+                f"got {grad_norms_granularity!r}"
+            )
+        self.grad_norms_granularity = grad_norms_granularity
 
         self.is_compiled = False
 
@@ -590,8 +604,46 @@ class LightningModuleRates(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         self.model_ema.eval()
         loss = self.shared_step(batch, batch_idx)
+        self._maybe_log_per_loss_grad_norms()
         self.log("loss/train", loss.detach(), prog_bar=True, logger=True)
         return loss
+
+    def _maybe_log_per_loss_grad_norms(self) -> None:
+        """Log per-loss-term gradient norms at the configured cadence.
+
+        Runs *before* Lightning calls ``loss.backward()``, leveraging
+        ``retain_graph=True`` inside ``LossAccumulator.compute_grad_norms`` so
+        the autograd graph survives for the actual backward pass. The
+        ``.grad`` attributes on parameters are not touched, so this is safe to
+        interleave with DDP's reducer (which only fires on
+        ``loss.backward()``).
+        """
+        every = self.log_grad_norms_every_n_steps
+        if every <= 0 or (self.global_step % every) != 0:
+            return
+
+        norms = self.loss_accumulator.compute_grad_norms(
+            self.model.parameters(),
+            granularity=self.grad_norms_granularity,
+            use_weighted=False,
+            apply_component_weights=False,
+        )
+        if not norms:
+            return
+
+        component_keys = {k for keys in self.LOSS_GROUPS.values() for k in keys}
+        entries: dict[str, torch.Tensor] = {}
+        for key, val in norms.items():
+            prefix = "grad_norm" if key in component_keys else "grad_norm_group"
+            entries[f"{prefix}/{key}"] = val.detach()
+
+        self.log_dict(
+            entries,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            logger=True,
+        )
 
     def on_validation_epoch_start(self):
         # Distribution metrics accumulate histograms across the epoch; reset them

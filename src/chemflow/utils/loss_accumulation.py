@@ -123,6 +123,93 @@ class LossAccumulator:
     def add_stats(self, stats: dict):
         self._stats.update(stats)
 
+    # ── Gradient diagnostics ─────────────────────────────────────────
+
+    def compute_grad_norms(
+        self,
+        parameters,
+        *,
+        granularity: str = "component",
+        norm_type: float = 2.0,
+        use_weighted: bool = False,
+        apply_component_weights: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Per-loss-term gradient norms w.r.t. ``parameters``.
+
+        For each loss term (or group), computes ``torch.autograd.grad`` against
+        ``parameters`` with ``retain_graph=True`` so the graph remains intact
+        for the subsequent ``loss.backward()`` call. The ``.grad`` attribute of
+        each parameter is *not* mutated.
+
+        Cost scales linearly with the number of terms reported (one extra
+        backward each), so callers should rate-limit invocation.
+
+        Args:
+            parameters: Iterable of parameters to differentiate against.
+            granularity: ``"component"`` for per-key norms, ``"group"`` for
+                per-group sums of raw losses, or ``"both"``.
+            norm_type: p-norm used to reduce gradient tensors (default L2).
+            use_weighted: If ``True``, differentiate the time-weighted loss
+                ``self._tw_losses[k]``; otherwise use the raw loss
+                ``self._raw_losses[k]``.
+            apply_component_weights: If ``True``, multiply each term by its
+                current component weight (matches what ``total_loss`` actually
+                backprops). Useful to gauge effective gradient contribution.
+
+        Returns:
+            Mapping ``{key_or_group: scalar grad-norm tensor}``. Keys for
+            losses that don't depend on any parameter (or whose graph was
+            detached) report ``0.0``.
+        """
+        if granularity not in {"component", "group", "both"}:
+            raise ValueError(
+                f"granularity must be one of component/group/both, got {granularity!r}"
+            )
+
+        params = [p for p in parameters if p.requires_grad]
+        losses = self._tw_losses if use_weighted else self._raw_losses
+
+        if apply_component_weights:
+            current_weights = self._weight_module.get_weight_tensors(self._device)
+            losses = {k: float(current_weights.get(k, 1.0)) * v for k, v in losses.items()}
+
+        terms: dict[str, torch.Tensor] = {}
+        if granularity in ("component", "both"):
+            for key, loss in losses.items():
+                terms[key] = loss
+        if granularity in ("group", "both"):
+            for group, keys in self._groups.items():
+                summands = [losses[k] for k in keys if k in losses]
+                if not summands:
+                    continue
+                terms[f"__group__{group}"] = sum(summands)
+
+        norms: dict[str, torch.Tensor] = {}
+        if not params or not terms:
+            return norms
+
+        zero = torch.zeros((), device=self._device)
+        for key, loss in terms.items():
+            out_key = key.removeprefix("__group__") if key.startswith("__group__") else key
+            if not (isinstance(loss, torch.Tensor) and loss.requires_grad):
+                norms[out_key] = zero
+                continue
+            grads = torch.autograd.grad(
+                loss,
+                params,
+                retain_graph=True,
+                allow_unused=True,
+                create_graph=False,
+            )
+            present = [g.detach() for g in grads if g is not None]
+            if not present:
+                norms[out_key] = zero
+                continue
+            stacked = torch.stack([g.norm(norm_type) ** norm_type for g in present])
+            norms[out_key] = stacked.sum() ** (1.0 / norm_type)
+
+        return norms
+
     # ── Outputs ──────────────────────────────────────────────────────
 
     def total_loss(self) -> torch.Tensor:
