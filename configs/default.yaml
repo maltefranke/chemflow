@@ -1,13 +1,10 @@
 defaults:
   - _self_
-  - data: qm9
-  - model: semla
-  - cfg: uncond
-  - schedule: smoothstep
-  - trainer: trainer
-  - callbacks: callbacks
-  - logging: wandb_logger
-  - integrator: integrator
+  # Single-knob preset. `defaults=qm9` and `defaults=geom` each bundle
+  # `data` + `embeddings` (with dataset-tuned ExtrapolatableCount params)
+  # plus the shared `core` group selections. Override individual groups as
+  # usual, e.g. `defaults=geom model=dit embeddings=qm9`.
+  - defaults: qm9
 
 # Run directory: outputs/<dataset>/<cfg_method>/<date>/<wandb_id>.
 # wandb id is CHEMFLOW_RUN_ID (same as WANDB_RUN_ID). Set in the shell before

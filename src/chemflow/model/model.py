@@ -55,13 +55,13 @@ class EmbeddingBackbone(nn.Module):
 
     def forward(
         self,
-        a: torch.Tensor,
-        e: torch.Tensor,
-        edge_index: torch.Tensor,
+        mols,
         t: torch.Tensor,
-        batch: torch.Tensor,
-        cfg_inputs: Optional[dict] = None,
+        *,
+        overrides: Optional[dict] = None,
+        drop_masks: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        a, e, edge_index, batch = mols.a, mols.e, mols.edge_index, mols.batch
         N_nodes = torch.bincount(batch)
 
         a_embed = self.atom_type_embedding(a)
@@ -74,8 +74,9 @@ class EmbeddingBackbone(nn.Module):
         if self.cfg_embedding is not None:
             num_graphs = N_nodes.shape[0]
             cfg_embed = self.cfg_embedding(
-                cfg_inputs if cfg_inputs is not None else {},
                 batch_size=num_graphs,
+                overrides=overrides,
+                drop_masks=drop_masks,
             )
             embeddings_to_concat.append(cfg_embed[batch])
 
@@ -185,15 +186,17 @@ class BackboneWithHeads(nn.Module):
         t: torch.Tensor,
         prev_outs=None,
         is_random_self_conditioning: bool = False,
-        cfg_inputs: Optional[dict] = None,
+        overrides: Optional[dict] = None,
+        drop_masks: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """Forward pass through Embedding -> Backbone -> Heads."""
         x, a, c, e, edge_index, batch = mols_t.unpack()
 
         # 1. Embedding Pass
         h_0, edge_index_tuple, e_embed = self.embedding_backbone(
-            a, e, edge_index, t, batch,
-            cfg_inputs=cfg_inputs,
+            mols_t, t,
+            overrides=overrides,
+            drop_masks=drop_masks,
         )
 
         # 2. Backbone Pass
@@ -219,7 +222,7 @@ class BackboneWithHeads(nn.Module):
     def apply_activations(out_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Apply post-head activations (softplus on rate logits).
 
-        Separated from forward() so that CFGAdapter can apply CFG on raw logits
+        Separated from forward() so that CFGGuidance can apply CFG on raw logits
         first and then activate.  Must be called by callers of forward() before
         the outputs are consumed.
         """

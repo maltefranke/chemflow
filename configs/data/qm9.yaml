@@ -57,23 +57,23 @@ datamodule:
       root: ${data.root_path}/qm9
       vocab: ${data.vocab}
       distributions: None
-      rotate: ${model.rotate}
-      
+
     val:
       - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
         root: ${data.root_path}/qm9
         vocab: ${data.vocab}
         distributions: None
-        rotate: ${model.rotate}
 
     test:
       - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
         root: ${data.root_path}/qm9
         vocab: ${data.vocab}
         distributions: None
-        rotate: ${model.rotate}
-  
+
   interpolator: ${data.interpolator}
+
+  rotate: ${model.rotate}
+  n_augmentations: ${model.n_augmentations}
 
   num_workers:
     train: 4

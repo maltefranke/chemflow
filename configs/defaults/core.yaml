@@ -1,0 +1,13 @@
+# @package _global_
+# Shared default groups that don't change between QM9 / GEOM runs.
+# Dataset-specific presets (defaults/qm9.yaml, defaults/geom.yaml) inherit
+# from this and only add `data` + `embeddings`.
+defaults:
+  - /heads: heads
+  - /model: semla
+  - /cfg: uncond
+  - /schedule: smoothstep
+  - /trainer: trainer
+  - /callbacks: callbacks
+  - /logging: wandb_logger
+  - /integrator: integrator

@@ -1,0 +1,80 @@
+# Shared multi-head module used by all backbones.
+# Each model yaml provides ${model.head_node_dim} and ${model.head_edge_dim}
+# pointing at the appropriate backbone output dim.
+
+heads:
+  _target_: chemflow.model.heads.MultiHeadModule
+
+  heads_configs:
+    graph_aggregation: mean
+
+    node_heads:
+      atom_type_head:
+        input_dim: ${model.head_node_dim}
+        output_dim: ${len:${data.vocab.atom_tokens}}
+        hidden_dim: 128
+
+      charge_head:
+        input_dim: ${model.head_node_dim}
+        output_dim: ${len:${data.vocab.charge_tokens}}
+        hidden_dim: 128
+
+      ins_rate_head:
+        input_dim: ${model.head_node_dim}
+        output_dim: 1
+        hidden_dim: 128
+
+      do_del_head:
+        input_dim: ${model.head_node_dim}
+        output_dim: 1
+        hidden_dim: 128
+
+      do_sub_a_head:
+        input_dim: ${model.head_node_dim}
+        output_dim: 1
+        hidden_dim: 128
+
+    edge_heads:
+      edge_type_head:
+        input_dim: ${model.head_edge_dim}
+        output_dim: ${len:${data.vocab.edge_tokens}}
+        hidden_dim: 128
+
+      do_sub_e_head:
+        input_dim: ${model.head_edge_dim}
+        output_dim: 1
+        hidden_dim: 128
+
+# Equivariant GMM head used for atom-insertion coordinate prediction.
+# Each model yaml provides ${model.head_node_dim}.
+gmm_head:
+  _target_: chemflow.model.heads.EquivariantGMMHead
+  _recursive_: false
+  hidden_dim: ${model.head_node_dim}
+  K: ${model.gmm_params.K}
+  N_a: ${len:${data.vocab.atom_tokens}}
+  N_c: ${len:${data.vocab.charge_tokens}}
+  rbf_embedding_args:
+    _target_: chemflow.model.embedding.RBFEmbedding
+    num_rbf: 128
+    rbf_dmax: 3.5
+    out_dim: 64
+    dropout: 0.0
+    trainable: false
+
+# Insertion edge head: predicts edge types/atoms/charges between newly inserted
+# atoms and existing nodes. Uses the same head_node_dim alias.
+ins_edge_head:
+  _target_: chemflow.model.heads.InsertionEdgeHead
+  _recursive_: false
+  hidden_dim: ${model.head_node_dim}
+  n_edge_types: ${len:${data.vocab.edge_tokens}}
+  n_atom_types: ${len:${data.vocab.atom_tokens}}
+  n_charge_types: ${len:${data.vocab.charge_tokens}}
+  rbf_embedding_args:
+    _target_: chemflow.model.embedding.RBFEmbedding
+    num_rbf: 128
+    rbf_dmax: 3.5
+    out_dim: 64
+    dropout: 0.0
+    trainable: false

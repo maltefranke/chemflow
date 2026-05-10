@@ -83,7 +83,7 @@ class LightningModuleRates(pl.LightningModule):
         atom_type_weights: torch.Tensor,
         edge_token_weights: torch.Tensor,
         charge_token_weights: torch.Tensor,
-        cfg_adapter: DictConfig,
+        cfg_guidance: DictConfig,
         time_dist: DictConfig,
         metrics: MetricCollection,
         stability_metrics: MetricCollection,
@@ -141,8 +141,8 @@ class LightningModuleRates(pl.LightningModule):
         # can log a single pooled KL and render marginal plots at epoch end.
         self.distribution_metrics = distribution_metrics
 
-        self.cfg_adapter = hydra.utils.instantiate(
-            cfg_adapter,
+        self.cfg_guidance = hydra.utils.instantiate(
+            cfg_guidance,
             model=self.model,
             atom_tokens=list(self.vocab.atom_tokens),
         )
@@ -174,7 +174,11 @@ class LightningModuleRates(pl.LightningModule):
                 "sub": lambda t: self.integrator.sub_schedule.rate(t).clamp(max=100.0),
             }
         else:
+<<<<<<< HEAD
             # always use time-weighting for x
+=======
+            # Always use weights for x
+>>>>>>> 6dc059a0fdd6fb1c6f12a94b514af8ddf517e909
             time_weights = {"x": InverseSquaredTimeLossWeighting(clamp_max=100.0)}
 
         # object to tie loss computation, weighting, and logging together
@@ -198,16 +202,16 @@ class LightningModuleRates(pl.LightningModule):
         self.is_compiled = False
 
         # lastly, save hyperparameters
-        # ``cfg_adapter`` wraps ``self.model``; excluding it avoids capturing a
-        # duplicate (cyclic) reference to the backbone in the hparams snapshot
-        # and keeps checkpoint size down.
+        # ``cfg_guidance`` wraps ``self.model``; excluding it avoids capturing
+        # a duplicate (cyclic) reference to the backbone in the hparams
+        # snapshot and keeps checkpoint size down.
         self.save_hyperparameters(
             ignore=[
                 "ema_decay_scheduler",
                 "metrics",
                 "stability_metrics",
                 "distribution_metrics",
-                "cfg_adapter",
+                "cfg_guidance",
             ]
         )
 
@@ -264,19 +268,20 @@ class LightningModuleRates(pl.LightningModule):
         # randomized self-conditioning with p = 0.5 during training
         is_random_self_conditioning = (torch.rand(1) > 0.5).item()
 
-        cfg_inputs = self.cfg_adapter.get_training_inputs(
-            mols_t,
-            mols_1,
-            self.device,
-            self.training,
-            ins_targets=ins_targets,
+        ctx = self.cfg_guidance.build_ctx(ins_targets=ins_targets)
+        overrides = self.cfg_guidance.build_overrides(mols_1, ctx)
+        drop_masks = self.cfg_guidance.sample_drop_masks(
+            batch_size=mols_t.num_graphs,
+            device=self.device,
+            training=self.training,
         )
 
         preds = self.model(
             mols_t,
             t.view(-1, 1),
             is_random_self_conditioning=is_random_self_conditioning,
-            cfg_inputs=cfg_inputs,
+            overrides=overrides,
+            drop_masks=drop_masks,
         )
         # NOTE: we separate this from the forward pass because CFG acts on the logits before activations.
         self.model.apply_activations(preds)
@@ -599,6 +604,14 @@ class LightningModuleRates(pl.LightningModule):
         loss = self.loss_accumulator.total_loss()
         self.log_dict(self.loss_accumulator.log_dict(), prog_bar=False, logger=True)
 
+        # ins_edge_head.unseen_node_embedding is exclusive to forward_ins_to_ins
+        # (InsertionEdgeHead.forward never references it). On batches without a
+        # single ins-to-ins edge — more likely with smaller effective batches
+        # such as n_augmentations > 1 — the param ends up with .grad = None and
+        # DDP rejects the step. Add a 0-weighted reference so it always lands
+        # in the autograd graph.
+        loss = loss + 0.0 * self.model.ins_edge_head.unseen_node_embedding.sum()
+
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -756,14 +769,11 @@ class LightningModuleRates(pl.LightningModule):
 
     def predict_step(self, batch, batch_idx):
         return_traj = bool(getattr(self, "predict_return_traj", True))
-        target_override = getattr(self, "predict_target_n_atoms_override", None)
-        target_mw_override = getattr(self, "predict_target_mw_override", None)
         gen_mols = self.sample(
             batch,
             batch_idx,
             return_traj=return_traj,
-            target_n_atoms_override=target_override,
-            target_mw_override=target_mw_override,
+            overrides=getattr(self, "predict_overrides", None),
         )
 
         # do quick validity check of the generated molecules
@@ -800,79 +810,41 @@ class LightningModuleRates(pl.LightningModule):
             "invalid_mols_rdkit": invalid_mols_rdkit,
         }
 
-    def _build_inference_cfg_inputs(
+    def _broadcast_override(
         self,
-        mol_t,
-        mol_1,
-        batch_size,
-        target_n_atoms_override=None,
-        target_mw_override=None,
-    ) -> dict:
-        """Build the cfg_inputs dict for inference."""
-        properties = self.cfg_adapter.extract_properties(mol_t)
-
-        if target_n_atoms_override is not None:
-            if isinstance(target_n_atoms_override, int):
-                target_n_atoms = torch.full(
-                    (batch_size,),
-                    target_n_atoms_override,
-                    dtype=torch.long,
-                    device=self.device,
-                )
-            else:
-                target_n_atoms = target_n_atoms_override.to(
-                    self.device,
-                )
-        else:
-            target_n_atoms = self.cfg_adapter.extract_target_n_atoms(
-                mol_1,
-            )
-
-        if target_mw_override is not None:
-            if isinstance(target_mw_override, (int, float)):
-                target_mw = torch.full(
-                    (batch_size,),
-                    float(target_mw_override),
-                    dtype=torch.float,
-                    device=self.device,
-                )
-            else:
-                target_mw = target_mw_override.to(self.device)
-        else:
-            target_mw = self.cfg_adapter.extract_target_mw(mol_1)
-
-        return {
-            "properties": properties,
-            "property_drop_mask": None,
-            "target_n_atoms": target_n_atoms,
-            "natoms_drop_mask": None,
-            "target_mw": target_mw,
-            "mw_drop_mask": None,
-        }
+        value: torch.Tensor | float | int | None,
+        batch_size: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        """Coerce a scalar / tensor user-supplied override to ``[B, ...]``."""
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return torch.full((batch_size,), float(value), dtype=dtype, device=self.device)
+        return value.to(self.device)
 
     def sample(
         self,
         batch,
         batch_idx,
         return_traj: bool = False,
-        target_n_atoms_override: torch.Tensor | int | None = None,
-        target_mw_override: torch.Tensor | float | None = None,
+        overrides: dict[str, torch.Tensor | float | int] | None = None,
     ):
-        """
-        Inference step for flow matching.
+        """Inference step for flow matching.
 
         Args:
-            batch: Batch of data (for now, we'll use batch size to determine number of graphs)
-            batch_idx: Batch index
-            return_traj: If True, return trajectory for each molecule. If False, return final state only.
-            target_n_atoms_override: If provided, overrides the target n_atoms extracted from data.
-                Shape (batch_size,) with integer atom counts.
-            target_mw_override: If provided, overrides the target molecular weight.
-                Shape (batch_size,) with MW in Daltons, or a scalar float.
+            batch: Tuple ``(mol_t, mol_1)`` from the dataloader.
+            batch_idx: Batch index.
+            return_traj: Return per-molecule trajectories instead of the final state.
+            overrides: Optional ``{signal_name: tensor | scalar}`` to inject a
+                target value into a CFG signal.  Recognised names are the
+                signal names registered on the model's ``cfg_embedding``
+                (e.g. ``"n_atoms"``, ``"mw"``, ``"logp"``, ``"qed"``).
+                Scalars are broadcast to ``[batch_size]``.
 
         Returns:
-            If return_traj is False: MoleculeBatch - final sampled molecules
-            If return_traj is True: List[List[MoleculeData]] - trajectory for each molecule
+            If ``return_traj`` is False: a ``MoleculeBatch`` with the final state.
+            If ``return_traj`` is True: a ``List[List[MoleculeData]]`` (one per molecule).
         """
         model = self._get_model()
         model.set_inference()
@@ -906,12 +878,25 @@ class LightningModuleRates(pl.LightningModule):
         # previous outputs for self-conditioning. none at the beginning
         preds = None
 
-        cfg_inputs = self._build_inference_cfg_inputs(
-            mol_t,
-            mol_1,
-            batch_size,
-            target_n_atoms_override,
-            target_mw_override,
+        # Build the per-signal override dict once: signal.extract(mols_1)
+        # for each signal not already supplied by the user, broadcasted to
+        # tensors on the right device.
+        ctx = self.cfg_guidance.build_ctx()
+        user_overrides: dict[str, torch.Tensor | None] = {}
+        if overrides:
+            dtype_by_signal = {
+                "n_atoms": torch.long,
+                "mw": torch.float,
+                "logp": torch.float,
+                "qed": torch.float,
+                "properties": torch.float,
+            }
+            for name, v in overrides.items():
+                user_overrides[name] = self._broadcast_override(
+                    v, batch_size, dtype_by_signal.get(name, torch.float)
+                )
+        signal_overrides = self.cfg_guidance.build_overrides(
+            mol_1, ctx, user_overrides=user_overrides
         )
 
         # Integration loop: integrate from t=0 to t=1
@@ -925,12 +910,12 @@ class LightningModuleRates(pl.LightningModule):
 
             prev_preds = preds
 
-            preds = self.cfg_adapter.guided_predict(
+            preds = self.cfg_guidance.guided_predict(
                 model,
                 mol_t,
                 t,
                 prev_preds,
-                cfg_inputs,
+                signal_overrides,
             )
             # Release previous step's preds as soon as self-conditioning no longer needs them.
             del prev_preds

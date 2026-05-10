@@ -1,0 +1,6 @@
+# @package _global_
+# QM9 preset: shared core + data:qm9 + embeddings:qm9 (ExtrapolatableCount tuned for QM9).
+defaults:
+  - core
+  - /data: qm9
+  - /embeddings: qm9

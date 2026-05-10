@@ -388,15 +388,12 @@ class FlowMatchingGEOMDataset(GEOM):
         distributions: Distributions,
         transform=None,
         pre_transform=None,
-        rotate=False,
         split="train",
     ):
         super().__init__(root, split, transform, pre_transform)
 
         self.vocab = vocab
         self.distributions = distributions
-
-        self.rotate = rotate
 
     def __getitem__(self, index):
         data = super().__getitem__(index)

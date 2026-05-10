@@ -25,26 +25,30 @@ from torch_geometric.data import InMemoryDataset, download_url, extract_zip
 
 from chemflow.dataset.molecule_data import MoleculeData
 from chemflow.dataset.vocab import Vocab, Distributions
-from chemflow.utils.rdkit import mol_is_valid, sanitize_mol_correctly, BOND_IDX_MAP, smiles_from_mol
-from scipy.spatial.transform import Rotation
+from chemflow.utils.rdkit_utils import (
+    mol_is_valid,
+    sanitize_mol_correctly,
+    BOND_IDX_MAP,
+    smiles_from_mol,
+)
 
 # Maps QM9 property names to their column index in the y tensor after
 # the rearrangement `y = torch.cat([y[:, 3:], y[:, :3]], dim=-1)` applied
 # during processing.  The raw CSV columns (A, B, C) are moved to the end, so
 # the first 16 entries are the standard QM9 molecular-property targets:
 QM9_PROPERTY_NAMES: dict[str, int] = {
-    "mu": 0,    # dipole moment (D)
-    "alpha": 1, # isotropic polarizability (a0^3)
+    "mu": 0,  # dipole moment (D)
+    "alpha": 1,  # isotropic polarizability (a0^3)
     "homo": 2,  # HOMO energy (eV)
     "lumo": 3,  # LUMO energy (eV)
-    "gap": 4,   # HOMO-LUMO gap (eV)
-    "r2": 5,    # electronic spatial extent (a0^2)
+    "gap": 4,  # HOMO-LUMO gap (eV)
+    "r2": 5,  # electronic spatial extent (a0^2)
     "zpve": 6,  # zero-point vibrational energy (kcal/mol)
-    "u0": 7,    # internal energy at 0 K (kcal/mol)
-    "u": 8,     # internal energy at 298.15 K (kcal/mol)
-    "h": 9,     # enthalpy at 298.15 K (kcal/mol)
-    "g": 10,    # free energy at 298.15 K (kcal/mol)
-    "cv": 11,   # heat capacity at 298.15 K (cal/mol/K)
+    "u0": 7,  # internal energy at 0 K (kcal/mol)
+    "u": 8,  # internal energy at 298.15 K (kcal/mol)
+    "h": 9,  # enthalpy at 298.15 K (kcal/mol)
+    "g": 10,  # free energy at 298.15 K (kcal/mol)
+    "cv": 11,  # heat capacity at 298.15 K (cal/mol/K)
 }
 
 
@@ -234,7 +238,6 @@ class FlowMatchingQM9Dataset(RevisedQM9):
         distributions: Distributions,
         transform=None,
         pre_transform=None,
-        rotate=False,
         split="train",
     ):
         super().__init__(root, transform, pre_transform)
@@ -243,19 +246,11 @@ class FlowMatchingQM9Dataset(RevisedQM9):
         self.vocab = vocab
         self.distributions = distributions
 
-        self.rotate = rotate
-
     def __getitem__(self, index):
         data = super().__getitem__(index)
 
         # remove center of mass
         coord = data.pos - data.pos.mean(dim=0)
-
-        if self.rotate:
-            # do a random rotation
-            rotation = Rotation.random(1)
-            coord = coord @ rotation.as_matrix()[0]
-            coord = coord.to(dtype=data.pos.dtype)
 
         if self.distributions.coordinate_std is not None:
             coord = coord / self.distributions.coordinate_std
@@ -291,6 +286,29 @@ class FlowMatchingQM9Dataset(RevisedQM9):
         # Keep 2D so PyG batching concatenates along dim 0 → [batch_size, num_properties]
         if hasattr(data, "y") and data.y is not None:
             mol.y = data.y if data.y.dim() == 2 else data.y.unsqueeze(0)
+
+        # Propagate canonical SMILES *and* its derived RDKit-Crippen logP /
+        # QED scalars so the CFG signals can read them as cached tensors
+        # instead of re-parsing the SMILES on every training step.
+        if hasattr(data, "smiles"):
+            mol.smiles = data.smiles
+            from rdkit import Chem
+            from rdkit.Chem import Crippen
+            from rdkit.Chem.QED import qed as _qed
+
+            rdmol = Chem.MolFromSmiles(data.smiles) if data.smiles else None
+            if rdmol is not None:
+                try:
+                    mol.logp = torch.tensor([float(Crippen.MolLogP(rdmol))], dtype=torch.float)
+                except Exception:
+                    mol.logp = torch.tensor([0.0], dtype=torch.float)
+                try:
+                    mol.qed = torch.tensor([float(_qed(rdmol))], dtype=torch.float)
+                except Exception:
+                    mol.qed = torch.tensor([0.0], dtype=torch.float)
+            else:
+                mol.logp = torch.tensor([0.0], dtype=torch.float)
+                mol.qed = torch.tensor([0.0], dtype=torch.float)
 
         return mol
 
