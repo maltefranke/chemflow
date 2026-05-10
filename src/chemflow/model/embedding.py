@@ -259,7 +259,8 @@ class ExtrapolatableScalarEmbedding(nn.Module):
       (e.g. QM9 trains at logP ∈ [-3, 4] but you want to query logP=6).
 
     The naive ``SinusoidalEncoding(... , max_period=20)`` + MLP path used by
-    the legacy :class:`UnifiedCFGEmbedding` logp/mw branches has two failure
+    the legacy logp/mw branches in :class:`chemflow.model.cfg.CFGEmbedding`
+    have two failure
     modes:
 
     * Its highest-frequency components have wavelengths comparable to (or

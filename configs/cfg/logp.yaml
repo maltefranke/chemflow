@@ -1,50 +1,25 @@
-cfg_adapter:
-    _target_: chemflow.model.cfg.CFGAdapter
-    cfg_dropout_prob: 0.0
-    cfg_guidance_scale: 0.0
-    natoms_cfg_dropout_prob: 0.0
-    natoms_cfg_guidance_scale: 0.0
-    mw_cfg_dropout_prob: 0.0
-    mw_cfg_guidance_scale: 0.0
-    logp_cfg_dropout_prob: ${if:${cfg.do_cfg}, ${cfg.cfg.logp_dropout_prob}, 0.0}
-    logp_cfg_guidance_scale: ${if:${cfg.do_cfg}, ${cfg.cfg.logp_guidance_scale}, 0.0}
-
 # ── Classifier-free guidance on RDKit Crippen logP ──
-# Computed on the fly from each molecule's canonical SMILES inside
-# CFGAdapter.extract_target_logp via chemflow.model.cfg.compute_logp.
+# logP is cached on the dataset element at __getitem__ time
+# (see chemflow.dataset.qm9), so the signal reads `mols.logp` directly
+# rather than re-parsing SMILES every step.
 do_cfg: true
 
 cfg:
   embed_dim: 128
-  # Property / n_atoms / MW conditioning all disabled — logP is the only signal.
-  num_properties: 0
-  property_hidden_dim: 128
-  property_dropout_prob: 0.0
-  property_guidance_scale: 1.0
-  use_natoms: false
-  use_mw: false
 
-  # LogP conditioning
-  use_logp: true
   # dropout=0: model always sees the conditioning signal; no unconditional
-  # branch is learned.  Bump to e.g. 0.15 to enable real CFG (allows
+  # branch is learned.  Bump to e.g. 0.15 for real CFG (allows
   # logp_guidance_scale > 1.0 at inference for stronger steering).
   logp_dropout_prob: 0.0
   # scale=1: guided output = uncond + 1*(cond - uncond) = cond exactly.
-  # The model always runs the conditional forward; CFG just passes it through.
   logp_guidance_scale: 1.0
-  # Legacy sinusoidal encoder hyperparams.  Used only when ``logp_encoder``
-  # below is null — UnifiedCFGEmbedding then builds the original
-  # ``SinusoidalEncoding(logp_sinusoidal_dim, max_period=logp_max_period)``
-  # → 2-layer MLP path.  These defaults match the QM9 logp checkpoints
-  # trained prior to introducing the external-encoder hook.
   logp_sinusoidal_dim: 64
   logp_max_period: 20.0
 
   # Optional external logP encoder (e.g. ExtrapolatableScalarEmbedding).
-  # When non-null UnifiedCFGEmbedding skips the legacy sinusoidal+MLP path
-  # and uses this module directly.  The encoder must accept a Float Tensor
-  # ``[B]`` / ``[B, 1]`` and expose an ``out_dim`` attribute.
+  # When non-null the legacy SinusoidalEncoding+MLP path is bypassed and the
+  # external module handles the whole pipeline.  The encoder must accept a
+  # Float Tensor [B] / [B, 1] and expose an `out_dim` attribute.
   #
   # To enable extrapolation past the training-distribution logP range, swap
   # this block out at training time via Hydra overrides, e.g.::
@@ -56,22 +31,22 @@ cfg:
   #   ++cfg.cfg.logp_encoder.max_period=64.0 \
   #   ++cfg.cfg.logp_encoder.value_min=-4.0 \
   #   ++cfg.cfg.logp_encoder.value_max=8.0
-  #
-  # This mirrors the n_atoms recipe in ``qm9_semla_natoms_extrapolatable.sh``.
   logp_encoder: null
 
-  # Unified embedding
   embedding:
-    _target_: chemflow.model.cfg.UnifiedCFGEmbedding
+    _target_: chemflow.model.cfg.CFGEmbedding
     out_dim: ${cfg.cfg.embed_dim}
-    num_properties: ${cfg.cfg.num_properties}
-    property_hidden_dim: ${cfg.cfg.property_hidden_dim}
-    use_natoms: ${cfg.cfg.use_natoms}
-    use_mw: ${cfg.cfg.use_mw}
-    use_logp: ${cfg.cfg.use_logp}
-    logp_encoder: ${cfg.cfg.logp_encoder}
-    logp_sinusoidal_dim: ${cfg.cfg.logp_sinusoidal_dim}
-    logp_max_period: ${cfg.cfg.logp_max_period}
+    signals:
+      - _target_: chemflow.model.cfg.LogPSignal
+        sinusoidal_dim: ${cfg.cfg.logp_sinusoidal_dim}
+        max_period: ${cfg.cfg.logp_max_period}
+        encoder_args: ${cfg.cfg.logp_encoder}
+        dropout_prob: ${cfg.cfg.logp_dropout_prob}
+        guidance_scale: ${cfg.cfg.logp_guidance_scale}
+        cfg_mode: linear
 
-cfg_embedding: ${if:${cfg.do_cfg}, ${cfg.cfg.embedding}, null}
-cfg_embed_dim: ${if:${cfg.do_cfg}, ${cfg.cfg.embed_dim}, 0}
+cfg_guidance:
+    _target_: chemflow.model.cfg.CFGGuidance
+
+cfg_embedding: ${cfg.cfg.embedding}
+cfg_embed_dim: ${cfg.cfg.embed_dim}

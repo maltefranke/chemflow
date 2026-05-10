@@ -287,11 +287,28 @@ class FlowMatchingQM9Dataset(RevisedQM9):
         if hasattr(data, "y") and data.y is not None:
             mol.y = data.y if data.y.dim() == 2 else data.y.unsqueeze(0)
 
-        # Propagate canonical SMILES so on-the-fly conditioning signals
-        # (e.g. RDKit logP in chemflow.model.cfg) can be computed at the
-        # CFGAdapter level without re-extracting it from atom/bond tensors.
+        # Propagate canonical SMILES *and* its derived RDKit-Crippen logP /
+        # QED scalars so the CFG signals can read them as cached tensors
+        # instead of re-parsing the SMILES on every training step.
         if hasattr(data, "smiles"):
             mol.smiles = data.smiles
+            from rdkit import Chem
+            from rdkit.Chem import Crippen
+            from rdkit.Chem.QED import qed as _qed
+
+            rdmol = Chem.MolFromSmiles(data.smiles) if data.smiles else None
+            if rdmol is not None:
+                try:
+                    mol.logp = torch.tensor([float(Crippen.MolLogP(rdmol))], dtype=torch.float)
+                except Exception:
+                    mol.logp = torch.tensor([0.0], dtype=torch.float)
+                try:
+                    mol.qed = torch.tensor([float(_qed(rdmol))], dtype=torch.float)
+                except Exception:
+                    mol.qed = torch.tensor([0.0], dtype=torch.float)
+            else:
+                mol.logp = torch.tensor([0.0], dtype=torch.float)
+                mol.qed = torch.tensor([0.0], dtype=torch.float)
 
         return mol
 

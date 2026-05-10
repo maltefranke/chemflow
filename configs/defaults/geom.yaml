@@ -1,0 +1,6 @@
+# @package _global_
+# GEOM preset: shared core + data:geom + embeddings:geom (ExtrapolatableCount tuned for GEOM).
+defaults:
+  - core
+  - /data: geom
+  - /embeddings: geom

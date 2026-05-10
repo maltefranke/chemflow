@@ -1,0 +1,28 @@
+# Shared embedding stack tuned for GEOM-Drugs.
+# - node_count_embedding uses ExtrapolatableCountEmbedding with periods/max_count
+#   scaled up for the much larger atom counts in GEOM-Drugs.
+
+atom_type_embedding:
+  _target_: chemflow.model.embedding.Embedding
+  num_embeddings: ${len:${data.vocab.atom_tokens}}
+  embedding_dim: 64
+  out_dim: 128
+
+edge_type_embedding:
+  _target_: chemflow.model.embedding.Embedding
+  num_embeddings: ${len:${data.vocab.edge_tokens}}
+  embedding_dim: 64
+  out_dim: 128
+
+time_embedding:
+  _target_: chemflow.model.embedding.TimeEmbedding
+  embedding_dim: 128
+  out_dim: 128
+
+node_count_embedding:
+  _target_: chemflow.model.embedding.ExtrapolatableCountEmbedding
+  embedding_dim: 64
+  out_dim: 128
+  min_period: 128.0
+  max_period: 1024.0
+  max_count: 96.0

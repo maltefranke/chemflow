@@ -1,0 +1,29 @@
+# Shared embedding stack tuned for QM9.
+# - node_count_embedding uses ExtrapolatableCountEmbedding so the model can
+#   generalise slightly outside the training atom-count support.
+# - Defaults sized for QM9 (training counts in [3, 29]).
+
+atom_type_embedding:
+  _target_: chemflow.model.embedding.Embedding
+  num_embeddings: ${len:${data.vocab.atom_tokens}}
+  embedding_dim: 64
+  out_dim: 128
+
+edge_type_embedding:
+  _target_: chemflow.model.embedding.Embedding
+  num_embeddings: ${len:${data.vocab.edge_tokens}}
+  embedding_dim: 64
+  out_dim: 128
+
+time_embedding:
+  _target_: chemflow.model.embedding.TimeEmbedding
+  embedding_dim: 128
+  out_dim: 128
+
+node_count_embedding:
+  _target_: chemflow.model.embedding.ExtrapolatableCountEmbedding
+  embedding_dim: 64
+  out_dim: 128
+  min_period: 64.0
+  max_period: 512.0
+  max_count: 32.0

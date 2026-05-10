@@ -316,7 +316,7 @@ class DiTEmbedding(nn.Module):
     conditioning into the node features, this module returns conditioning
     as a separate tensor so DiTBackbone can feed it through adaLN.
 
-    Exposes ``cfg_embedding`` (a :class:`UnifiedCFGEmbedding`) for
+    Exposes ``cfg_embedding`` (a :class:`chemflow.model.cfg.CFGEmbedding`) for
     classifier-free guidance compatibility with the lightning module.
     """
 
@@ -347,12 +347,11 @@ class DiTEmbedding(nn.Module):
 
     def forward(
         self,
-        a: torch.Tensor,
-        e: torch.Tensor,
-        edge_index: torch.Tensor,
+        mols: MoleculeBatch,
         t: torch.Tensor,
-        batch: torch.Tensor,
-        cfg_inputs: dict | None = None,
+        *,
+        overrides: dict[str, torch.Tensor] | None = None,
+        drop_masks: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -360,6 +359,7 @@ class DiTEmbedding(nn.Module):
             e_embed: (E, edge_dim) edge embeddings (per-edge)
             cond: (B, cond_dim) graph-level conditioning vector
         """
+        a, e, edge_index, batch = mols.a, mols.e, mols.edge_index, mols.batch
         N_nodes = torch.bincount(batch)
         num_graphs = N_nodes.shape[0]
 
@@ -377,8 +377,9 @@ class DiTEmbedding(nn.Module):
 
         if self.cfg_embedding is not None:
             cfg_embed = self.cfg_embedding(
-                cfg_inputs if cfg_inputs is not None else {},
                 batch_size=num_graphs,
+                overrides=overrides,
+                drop_masks=drop_masks,
             )
             cond_parts.append(cfg_embed)
 
@@ -490,14 +491,16 @@ class DiTBackboneWithHeads(nn.Module):
         t: torch.Tensor,
         prev_outs=None,
         is_random_self_conditioning: bool = False,
-        cfg_inputs: dict | None = None,
+        overrides: dict[str, torch.Tensor] | None = None,
+        drop_masks: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, Any]:
         """Forward pass through Embedding -> DiT Backbone -> Heads."""
         x, a, _c, e, edge_index, batch = mols_t.unpack()
 
         a_embed, e_embed, cond = self.embedding_backbone(
-            a, e, edge_index, t, batch,
-            cfg_inputs=cfg_inputs,
+            mols_t, t,
+            overrides=overrides,
+            drop_masks=drop_masks,
         )
 
         edge_index_tuple = (edge_index[0], edge_index[1])
@@ -522,7 +525,7 @@ class DiTBackboneWithHeads(nn.Module):
     def apply_activations(out_dict: dict[str, Any]) -> dict[str, Any]:
         """Apply post-head activations (softplus on rate logits).
 
-        Separated from forward() so that CFGAdapter can apply CFG on raw logits
+        Separated from forward() so that CFGGuidance can apply CFG on raw logits
         first and then activate. Must be called by callers of forward() before
         the outputs are consumed.
         """
