@@ -16,6 +16,7 @@ from chemflow.dataset.data_utils import (
 )
 from chemflow.dataset.molecule_data import MoleculeBatch
 from chemflow.flow_matching.sampling import sample_prior_graph
+from chemflow.utils.utils import build_fully_connected_edge_index
 
 
 def _substituents_need_rebuild(subs):
@@ -371,6 +372,13 @@ class FlowMatchingDatasetWrapperScaffoldDecoration(FlowMatchingDatasetWrapper):
             scaffold_mask[scaffold_indices] = 1
             source.scaffold_mask = scaffold_mask
 
+        N = source.num_nodes
+        full_ei = build_fully_connected_edge_index(N)
+        dense = torch.zeros(N, N, dtype=source.e.dtype)
+        dense[source.edge_index[0], source.edge_index[1]] = source.e
+        source.e = dense[full_ei[0], full_ei[1]]
+        source.edge_index = full_ei
+
         return source, target
 
 
@@ -474,6 +482,13 @@ class FlowMatchingDatasetWrapperScaffoldGrowth(FlowMatchingDatasetWrapper):
                 mol_t.y = target.y
 
             return mol_t, mol_1, ins_targets, t
+
+        N = source.num_nodes
+        full_ei = build_fully_connected_edge_index(N)
+        dense = torch.zeros(N, N, dtype=source.e.dtype)
+        dense[source.edge_index[0], source.edge_index[1]] = source.e
+        source.e = dense[full_ei[0], full_ei[1]]
+        source.edge_index = full_ei
 
         scaffold_mask = torch.ones(source.num_nodes, dtype=torch.long)
         source.scaffold_mask = scaffold_mask
