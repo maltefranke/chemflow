@@ -170,7 +170,7 @@ class LightningDataModule(pl.LightningDataModule):
             drop_last=True,
             collate_fn=train_collate_fn,
             worker_init_fn=worker_init_fn,
-            prefetch_factor=2 if nw > 0 else None,
+            prefetch_factor=4 if nw > 0 else None,
         )
 
     def val_dataloader(self):

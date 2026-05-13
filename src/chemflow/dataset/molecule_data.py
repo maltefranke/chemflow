@@ -214,6 +214,14 @@ class MoleculeBatch(Batch):
 
     _data_cls = MoleculeData  # Tell PyG which class to use for separation
 
+    @classmethod
+    def from_data_list(cls, data_list, *args, **kwargs):
+        batch = super().from_data_list(data_list, *args, **kwargs)
+        # Precomputed on CPU at collate so the backbone doesn't need an
+        # `.item()` host sync to know flash-attn's max_seqlen.
+        batch.max_seqlen = max((d.x.shape[0] for d in data_list), default=0)
+        return batch
+
     def unpack(self):
         """
         Unpack the data into a tuple of tensors.

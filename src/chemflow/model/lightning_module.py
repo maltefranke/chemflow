@@ -96,7 +96,7 @@ class LightningModuleRates(pl.LightningModule):
         use_ema_for_eval: bool = True,
         use_time_weights: bool = False,
         allow_charged: bool = False,
-        log_grad_norms_every_n_steps: int = 10,
+        log_grad_norms_every_n_steps: int = 100,
         grad_norms_granularity: str = "component",
     ):
         super().__init__()
@@ -168,18 +168,14 @@ class LightningModuleRates(pl.LightningModule):
         if use_time_weights:
             time_weights = {
                 "x": InverseSquaredTimeLossWeighting(clamp_max=100.0),
-                "c": InverseSquaredTimeLossWeighting(clamp_max=100.0),
+                "c": lambda t: self.integrator.sub_schedule.rate(t).clamp(max=100.0),
                 "ins": lambda t: self.integrator.ins_schedule.rate(t).clamp(max=100.0),
                 "del": lambda t: self.integrator.del_schedule.rate(t).clamp(max=100.0),
                 "sub": lambda t: self.integrator.sub_schedule.rate(t).clamp(max=100.0),
             }
         else:
-<<<<<<< HEAD
-            # always use time-weighting for x
-=======
-            # Always use weights for x
->>>>>>> 6dc059a0fdd6fb1c6f12a94b514af8ddf517e909
-            time_weights = {"x": InverseSquaredTimeLossWeighting(clamp_max=100.0)}
+            # always use time-weighting for x and c
+            time_weights = {"x": InverseSquaredTimeLossWeighting(clamp_max=100.0), "c": lambda t: self.integrator.sub_schedule.rate(t).clamp(max=100.0)}
 
         # object to tie loss computation, weighting, and logging together
         self.loss_accumulator = LossAccumulator(
@@ -220,6 +216,14 @@ class LightningModuleRates(pl.LightningModule):
         if self.is_compiled:
             return
         print("Compiling model...")
+        # Per-loss grad-norm logging calls torch.autograd.grad(..., retain_graph=True)
+        # before the main backward. torch.compile's donated-buffer optimization frees
+        # activations after the first backward and rejects any subsequent one, so
+        # disable it when grad-norm tracking is active.
+        if self.log_grad_norms_every_n_steps > 0:
+            import torch._functorch.config as _functorch_config
+
+            _functorch_config.donated_buffer = False
         self.model = torch.compile(self.model, dynamic=True)
         self.is_compiled = True
 

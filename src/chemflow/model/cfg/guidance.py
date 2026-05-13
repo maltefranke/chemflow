@@ -340,6 +340,7 @@ def _replicate_mol_batch(mol_t: MoleculeBatch, n_replicas: int) -> MoleculeBatch
         edge_index=edge_index,
         batch=batch,
     )
+    big.max_seqlen = mol_t.max_seqlen
     big._num_graphs = B * n_replicas
     nodes_per_graph = torch.bincount(batch, minlength=B * n_replicas)
     big.ptr = torch.cat(

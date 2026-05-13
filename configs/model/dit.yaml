@@ -37,6 +37,7 @@ linear_sched:
 # strategy used for sampling time during **training**
 sample_time_strategy: linear
 
+
 module:
   _target_: chemflow.model.lightning_module_transformer.LightningModuleRatesTransformer
   gmm_params: ${model.gmm_params}
@@ -53,18 +54,33 @@ module:
   
   # Loss component weights
   use_learnable_loss_weights: false
+  use_time_weights: false
+  #loss_weights:
+  #  do_sub_a: 1.0
+  #  sub_a_class: 1.0
+  #  do_sub_e: 1.0
+  #  sub_e_class: 1.0
+  #  do_del: 1.0
+  #  do_ins: 1.0
+  #  ins_rate: 1.0
+  #  ins_gmm: 1.0
+  #  ins_e: 1.0
+  #  x: 1.0
+  #  c: 1.0
+
   loss_weights:
-    do_sub_a: 1.0
-    sub_a_class: 1.0
-    do_sub_e: 1.0
-    sub_e_class: 1.0
-    do_del: 1.0
+    do_sub_a: 0.2
+    sub_a_class: 0.03
+    do_sub_e: 0.25
+    sub_e_class: 0.5
+    do_del: 0.4
     do_ins: 1.0
-    ins_rate: 1.0
-    ins_gmm: 1.0
-    ins_e: 1.0
+    ins_rate: 0.15
+    ins_gmm: 0.01
+    ins_e: 0.4
     x: 1.0
-    c: 1.0
+    c: 0.5
+    ins_e_ii: 0.03
 
   # Optimizer configuration
   # MuonWithAuxAdam: Muon for 2D backbone weights, AdamW for the rest.

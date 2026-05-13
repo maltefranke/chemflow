@@ -9,6 +9,11 @@ concatenating conditioning embeddings to node features as in the standard
 Transformer backbone. The conditioning signal (time, node count, optional
 molecular properties) is injected via scale/shift/gate parameters in each
 transformer block.
+
+Runs fully in packed (total_N, d) layout — no dense padding inside the
+backbone. Self-attention dispatches to flash-attn varlen when available
+(GPU + fp16/bf16 + flash-attn installed) and falls back to SDPA with a
+key-padding mask otherwise.
 """
 
 from __future__ import annotations
@@ -22,6 +27,161 @@ from omegaconf import DictConfig
 from torch_geometric.utils import to_dense_batch, scatter
 
 from chemflow.dataset.molecule_data import MoleculeBatch
+
+
+try:
+    from flash_attn import flash_attn_varlen_qkvpacked_func  # type: ignore
+
+    _HAS_FLASH_ATTN = True
+except ImportError:  # pragma: no cover - exercised when flash-attn is absent
+    flash_attn_varlen_qkvpacked_func = None
+    _HAS_FLASH_ATTN = False
+
+
+# ---------------------------------------------------------------------------
+#  Attention helper
+# ---------------------------------------------------------------------------
+
+
+def _attn_varlen(
+    qkv: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    batch_idx: torch.Tensor,
+    attn_bias: torch.Tensor | None = None,
+    atom_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Variable-length self-attention on packed sequences.
+
+    Args:
+        qkv: (total_N, 3, H, D) packed q/k/v.
+        cu_seqlens: (B+1,) int32 cumulative sequence lengths.
+        max_seqlen: largest sequence length in the batch (Python int).
+        batch_idx: (total_N,) batch assignment, used by the SDPA path.
+        attn_bias: optional (B, H, max_seqlen, max_seqlen) float bias added
+            to attention logits (padded keys carry ``-inf``). When given,
+            flash-attn is bypassed (it can't take arbitrary bias) and the
+            dense SDPA path runs.
+        atom_mask: (B, max_seqlen) bool, True at valid atoms. Required when
+            ``attn_bias`` is provided so we don't recompute it.
+
+    Returns:
+        (total_N, H, D)
+    """
+    use_flash = (
+        attn_bias is None
+        and _HAS_FLASH_ATTN
+        and qkv.is_cuda
+        and qkv.dtype in (torch.float16, torch.bfloat16)
+    )
+    if use_flash:
+        return flash_attn_varlen_qkvpacked_func(
+            qkv, cu_seqlens, max_seqlen, dropout_p=0.0, causal=False
+        )
+
+    # Dense SDPA path. Used when (a) flash-attn is unavailable, or (b) we
+    # have a pair bias that flash-attn varlen can't consume.
+    qkv_padded, mask = to_dense_batch(qkv, batch_idx, max_num_nodes=max_seqlen)
+    if atom_mask is None:
+        atom_mask = mask
+    q, k, v = qkv_padded.unbind(dim=2)
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    attn_mask = attn_bias if attn_bias is not None else atom_mask[:, None, None, :]
+    out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    out = out.transpose(1, 2)
+    return out[atom_mask]
+
+
+# ---------------------------------------------------------------------------
+#  Pair bias for attention (distance + edge type)
+# ---------------------------------------------------------------------------
+
+
+class PairBias(nn.Module):
+    """Per-head additive attention bias from pairwise distance + edge type.
+
+    Logically the bias is::
+
+        bias[b, h, i, j] = down_proj( GELU( Linear(concat([rbf(||x_i - x_j||),
+                                                           edge_features[i, j]])) ) )[h]
+
+    where ``edge_features[i, j] = e_embed`` at edges in ``edge_index`` and
+    zero elsewhere. We exploit ``Linear(concat[a, b]) = Linear_a(a) +
+    Linear_b(b)`` to avoid materialising the dense edge tensor: project
+    distances dense and *scatter-add* the edge contribution at edge positions
+    only. The GELU + final ``down_proj`` is the non-linearity that makes this
+    strictly more expressive than the previous two-linear formulation.
+
+    ``down_proj`` is zero-init so the bias is exactly 0 on valid pairs at
+    init; blocks gate via adaLN-Zero so contribution gates in during training.
+    Padding handling is left to the consumer (we return ``pad_mask``
+    separately) because per-block gating times ``-inf`` would NaN out.
+    """
+
+    def __init__(
+        self,
+        rbf_embedding: nn.Module,
+        rbf_out_dim: int,
+        edge_nf: int,
+        num_heads: int,
+        hidden_dim: int,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.rbf_embedding = rbf_embedding
+        self.dist_to_hidden = nn.Linear(rbf_out_dim, hidden_dim, bias=True)
+        self.edge_to_hidden = nn.Linear(edge_nf, hidden_dim, bias=False)
+        self.act = nn.GELU(approximate="tanh")
+        self.down_proj = nn.Linear(hidden_dim, num_heads, bias=False)
+        nn.init.zeros_(self.down_proj.weight)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: tuple[torch.Tensor, torch.Tensor],
+        e_embed: torch.Tensor,
+        batch: torch.Tensor,
+        batch_size: int,
+        max_seqlen: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            bias: (B, num_heads, max_seqlen, max_seqlen) raw bias values
+                (no -inf masking — see ``pad_mask``).
+            atom_mask: (B, max_seqlen) True at valid atoms (cached for the
+                attention path so it doesn't repad).
+            pad_mask: (B, max_seqlen, max_seqlen) True at padded pairs.
+                Applied AFTER the per-block gate to avoid ``gate * -inf = NaN``.
+        """
+        x_dense, atom_mask = to_dense_batch(
+            x, batch, batch_size=batch_size, max_num_nodes=max_seqlen
+        )
+        diff = x_dense.unsqueeze(2) - x_dense.unsqueeze(1)
+        dist = diff.norm(dim=-1)
+        rbf = self.rbf_embedding(dist.reshape(-1)).reshape(*dist.shape, -1)
+        h = self.dist_to_hidden(rbf)  # (B, N, N, hidden_dim)
+
+        rows, cols = edge_index
+        counts = scatter(
+            batch.new_ones(batch.size(0)), batch, dim=0,
+            dim_size=batch_size, reduce="sum",
+        )
+        cum = F.pad(counts.cumsum(0), (1, 0))[:-1]
+        b_idx = batch[rows]
+        local_rows = rows - cum[b_idx]
+        local_cols = cols - cum[b_idx]
+        h[b_idx, local_rows, local_cols] = (
+            h[b_idx, local_rows, local_cols] + self.edge_to_hidden(e_embed)
+        )
+
+        h = self.act(h)
+        bias = self.down_proj(h)  # (B, N, N, H)
+        bias = bias.permute(0, 3, 1, 2).contiguous()  # (B, H, N, N)
+
+        pad_mask = ~(atom_mask.unsqueeze(2) & atom_mask.unsqueeze(1))
+        return bias, atom_mask, pad_mask
 
 
 # ---------------------------------------------------------------------------
@@ -65,26 +225,40 @@ class Mlp(nn.Module):
         return x
 
 
-def modulate(x, shift, scale):
-    """Apply adaptive modulation: x * (1 + scale) + shift.
+def modulate(x, shift, scale, batch_idx):
+    """Apply adaptive modulation in packed layout: x * (1 + scale) + shift.
 
     Args:
-        x: (B, N, d) token features
-        shift: (B, d) shift parameters
-        scale: (B, d) scale parameters
+        x: (total_N, d) packed token features
+        shift: (B, d) per-graph shift parameters
+        scale: (B, d) per-graph scale parameters
+        batch_idx: (total_N,) batch assignment for gather
     """
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    return x * (1 + scale[batch_idx]) + shift[batch_idx]
 
 
 class DiTBlock(nn.Module):
-    """Transformer block with adaptive layer norm zero (adaLN-Zero) conditioning."""
+    """Transformer block with adaLN-Zero conditioning, packed-sequence layout.
+
+    Self-attention is computed with flash-attn varlen on CUDA (when available
+    and the inputs are fp16/bf16) and SDPA on the fallback path. The MLP and
+    LayerNorms operate on the packed ``(total_N, d)`` tensor so no compute is
+    wasted on padded positions.
+    """
 
     def __init__(self, hidden_dim, num_heads, mlp_ratio=4.0):
         super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError(
+                f"hidden_dim ({hidden_dim}) must be divisible by num_heads ({num_heads})"
+            )
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+
         self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
-        self.attn = nn.MultiheadAttention(
-            hidden_dim, num_heads=num_heads, dropout=0, bias=True, batch_first=True
-        )
+        self.qkv = nn.Linear(hidden_dim, 3 * hidden_dim, bias=True)
+        self.proj = nn.Linear(hidden_dim, hidden_dim, bias=True)
         self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_dim * mlp_ratio)
         self.mlp = Mlp(
@@ -96,33 +270,64 @@ class DiTBlock(nn.Module):
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(), nn.Linear(hidden_dim, 6 * hidden_dim, bias=True)
         )
+        # Per-head pair-bias gate, conditioned on ``c`` (adaLN-Zero style).
+        # No shift — softmax is invariant to adding a constant per row, so a
+        # shift on the bias would be a free parameter. Zero-init so the model
+        # ignores the pair bias at init.
+        self.bias_gate_proj = nn.Sequential(
+            nn.SiLU(), nn.Linear(hidden_dim, num_heads, bias=True)
+        )
 
-    def forward(self, x, c, key_padding_mask):
+    def forward(self, x, c, batch_idx, cu_seqlens, max_seqlen,
+                pair_bias=None, pad_mask=None, atom_mask=None):
         """
         Args:
-            x: (B, N, d) token features
+            x: (total_N, d) packed token features
             c: (B, d) graph-level conditioning
-            key_padding_mask: (B, N) True for padding positions
+            batch_idx: (total_N,) batch assignment
+            cu_seqlens: (B+1,) int32 cumulative sequence lengths
+            max_seqlen: largest sequence length in the batch (Python int)
+            pair_bias: optional (B, H, max_seqlen, max_seqlen) raw pair bias
+                from ``PairBias`` (no -inf masking yet).
+            pad_mask: (B, max_seqlen, max_seqlen) True at padded pairs;
+                required iff ``pair_bias`` is given.
+            atom_mask: (B, max_seqlen) True at valid atoms; required iff
+                ``pair_bias`` is given.
         """
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=1)
         )
-        _x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = (
-            x
-            + gate_msa.unsqueeze(1)
-            * self.attn(
-                _x, _x, _x, key_padding_mask=key_padding_mask, need_weights=False
-            )[0]
+
+        if pair_bias is not None:
+            # Per-(graph, head) gate from c; zero-init means no contribution
+            # until the model learns it. Apply gate before -inf masking to
+            # avoid 0 * -inf = NaN at padded positions. In-place masked_fill
+            # saves the ~(B, H, N, N) buffer that an out-of-place version
+            # would keep for backward.
+            bias_gate = self.bias_gate_proj(c)  # (B, num_heads)
+            attn_bias = pair_bias * bias_gate[:, :, None, None]
+            attn_bias.masked_fill_(pad_mask.unsqueeze(1), float("-inf"))
+        else:
+            attn_bias = None
+
+        _x = modulate(self.norm1(x), shift_msa, scale_msa, batch_idx)
+        qkv = self.qkv(_x).view(-1, 3, self.num_heads, self.head_dim)
+        attn_out = _attn_varlen(
+            qkv, cu_seqlens, max_seqlen, batch_idx,
+            attn_bias=attn_bias, atom_mask=atom_mask,
         )
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(
-            modulate(self.norm2(x), shift_mlp, scale_mlp)
+        attn_out = attn_out.reshape(-1, self.hidden_dim)
+        attn_out = self.proj(attn_out)
+
+        x = x + gate_msa[batch_idx] * attn_out
+        x = x + gate_mlp[batch_idx] * self.mlp(
+            modulate(self.norm2(x), shift_mlp, scale_mlp, batch_idx)
         )
         return x
 
 
 class FinalLayer(nn.Module):
-    """Final DiT layer with adaLN conditioning."""
+    """Final DiT layer with adaLN conditioning, packed-sequence layout."""
 
     def __init__(self, hidden_dim, out_dim):
         super().__init__()
@@ -132,11 +337,10 @@ class FinalLayer(nn.Module):
             nn.SiLU(), nn.Linear(hidden_dim, 2 * hidden_dim, bias=True)
         )
 
-    def forward(self, x, c):
+    def forward(self, x, c, batch_idx):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
-        x = modulate(self.norm_final(x), shift, scale)
-        x = self.linear(x)
-        return x
+        x = modulate(self.norm_final(x), shift, scale, batch_idx)
+        return self.linear(x)
 
 
 # ---------------------------------------------------------------------------
@@ -147,10 +351,10 @@ class FinalLayer(nn.Module):
 class DiTBackbone(nn.Module):
     """Core DiT backbone for molecular graphs.
 
-    Unlike the standard Transformer backbone which receives pre-concatenated
-    conditioning in the node features, this backbone receives atom embeddings
-    and graph-level conditioning separately.  Conditioning is injected via
-    adaLN-Zero in every block.
+    Operates fully in packed ``(total_N, d)`` layout internally — no
+    ``to_dense_batch`` for the main forward path. Self-attention is the only
+    operator that needs to know about sequence boundaries; it gets them via
+    ``cu_seqlens``.
 
     Returns ``(h, x_out, e_out)`` matching the Transformer backbone interface.
     """
@@ -166,6 +370,7 @@ class DiTBackbone(nn.Module):
         mlp_ratio: float = 4.0,
         in_edge_nf: int = 128,
         rbf_embedding_args: DictConfig | None = None,
+        pair_bias_hidden_dim: int = 32,
     ):
         super().__init__()
         self.d_model = d_model
@@ -211,6 +416,14 @@ class DiTBackbone(nn.Module):
             "out_dim", rbf_embedding_args.get("num_rbf", 16)
         )
 
+        self.pair_bias = PairBias(
+            rbf_embedding=self.rbf_embedding,
+            rbf_out_dim=rbf_out_dim,
+            edge_nf=in_edge_nf,
+            num_heads=nhead,
+            hidden_dim=pair_bias_hidden_dim,
+        )
+
         edge_in_dim = 2 * out_node_nf + in_edge_nf + rbf_out_dim
         self.edge_output = nn.Sequential(
             nn.LayerNorm(edge_in_dim),
@@ -240,49 +453,56 @@ class DiTBackbone(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    def forward(
+        # PairBias warm-start: zero-init the final down-projection so the
+        # raw bias is exactly zero at init (analogous to adaLN-Zero).
+        # ``self.apply`` above Xavier-inits every Linear, so re-zero here.
+        nn.init.zeros_(self.pair_bias.down_proj.weight)
+
+        # Per-block pair-bias gates zero-init so each block also starts with
+        # no pair-bias contribution.
+        for block in self.blocks:
+            nn.init.constant_(block.bias_gate_proj[-1].weight, 0)
+            nn.init.constant_(block.bias_gate_proj[-1].bias, 0)
+
+    def encode(
         self,
         a_embed: torch.Tensor,
         x: torch.Tensor,
         cond: torch.Tensor,
-        edge_index: tuple[torch.Tensor, torch.Tensor],
-        e_embed: torch.Tensor,
         batch: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            a_embed: (N, d_input) atom feature embeddings
-            x: (N, 3) atomic positions
-            cond: (B, d_cond) graph-level conditioning (time + count + props)
-            edge_index: tuple (row, col) each of shape (E,)
-            e_embed: (E, in_edge_nf) edge feature embeddings
-            batch: (N,) batch assignment
+        """Project inputs and compute ``cu_seqlens`` for flash-attn varlen.
 
         Returns:
-            h: (N, out_node_nf) node features
-            x_out: (N, 3) predicted positions
-            e_out: (E, out_node_nf) edge features
+            h: (total_N, d_model) packed token features.
+            cu_seqlens: (B+1,) int32 cumulative sequence lengths.
+            c: (B, d_model) projected graph-level conditioning.
         """
         batch_size = cond.shape[0]
-
         h = self.input_proj(a_embed) + self.pos_embedding(x)
         c = self.cond_proj(cond)
 
-        num_nodes = scatter(
-            batch.new_ones(x.size(0)), batch, dim=0, dim_size=batch_size, reduce="sum"
+        counts = scatter(
+            batch.new_ones(batch.size(0)),
+            batch,
+            dim=0,
+            dim_size=batch_size,
+            reduce="sum",
         )
-        max_num_nodes = num_nodes.max()
+        cu_seqlens = F.pad(counts.cumsum(dim=0), (1, 0)).to(torch.int32)
+        return h, cu_seqlens, c
 
-        h_padded, atom_mask = to_dense_batch(
-            h, batch, batch_size=batch_size, max_num_nodes=max_num_nodes
-        )
-
-        for block in self.blocks:
-            h_padded = block(h_padded, c, ~atom_mask)
-
-        h_padded = self.final_layer(h_padded, c)
-        h = h_padded[atom_mask]
-
+    def decode(
+        self,
+        h: torch.Tensor,
+        c: torch.Tensor,
+        batch_idx: torch.Tensor,
+        x: torch.Tensor,
+        edge_index: tuple[torch.Tensor, torch.Tensor],
+        e_embed: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply final layer + node/pos/edge heads on packed inputs."""
+        h = self.final_layer(h, c, batch_idx)
         h = self.node_out(h)
 
         rows, cols = edge_index
@@ -297,8 +517,47 @@ class DiTBackbone(nn.Module):
         e_out = self.edge_output(edge_inputs)
 
         x_out = self.pos_out(h)
-
         return h, x_out, e_out
+
+    def forward(
+        self,
+        a_embed: torch.Tensor,
+        x: torch.Tensor,
+        cond: torch.Tensor,
+        edge_index: tuple[torch.Tensor, torch.Tensor],
+        e_embed: torch.Tensor,
+        batch: torch.Tensor,
+        max_seqlen: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            a_embed: (N, d_input) atom feature embeddings
+            x: (N, 3) atomic positions
+            cond: (B, d_cond) graph-level conditioning (time + count + props)
+            edge_index: tuple (row, col) each of shape (E,)
+            e_embed: (E, in_edge_nf) edge feature embeddings
+            batch: (N,) batch assignment
+            max_seqlen: largest sequence length in the batch (precomputed
+                CPU-side in ``MoleculeBatch.from_data_list``; flash-attn varlen
+                requires a Python int and computing it here would graph-break).
+
+        Returns:
+            h: (N, out_node_nf) node features
+            x_out: (N, 3) predicted positions
+            e_out: (E, out_node_nf) edge features
+        """
+        h, cu_seqlens, c = self.encode(a_embed, x, cond, batch)
+        pair_bias, atom_mask, pad_mask = self.pair_bias(
+            x, edge_index, e_embed, batch, cond.shape[0], max_seqlen,
+        )
+
+        for block in self.blocks:
+            h = block(
+                h, c, batch, cu_seqlens, max_seqlen,
+                pair_bias=pair_bias, pad_mask=pad_mask, atom_mask=atom_mask,
+            )
+
+        return self.decode(h, c, batch, x, edge_index, e_embed)
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +585,6 @@ class DiTEmbedding(nn.Module):
         edge_type_embedding_args: DictConfig,
         time_embedding_args: DictConfig,
         node_count_embedding_args: DictConfig,
-        bond_degree_embedding_args: DictConfig | None = None,
         cfg_embedding_args: DictConfig | None = None,
     ):
         super().__init__()
@@ -334,12 +592,6 @@ class DiTEmbedding(nn.Module):
         self.edge_type_embedding = hydra.utils.instantiate(edge_type_embedding_args)
         self.time_embedding = hydra.utils.instantiate(time_embedding_args)
         self.node_count_embedding = hydra.utils.instantiate(node_count_embedding_args)
-
-        self.bond_degree_embedding = None
-        if bond_degree_embedding_args is not None:
-            self.bond_degree_embedding = hydra.utils.instantiate(
-                bond_degree_embedding_args
-            )
 
         self.cfg_embedding = None
         if cfg_embedding_args is not None:
@@ -359,16 +611,12 @@ class DiTEmbedding(nn.Module):
             e_embed: (E, edge_dim) edge embeddings (per-edge)
             cond: (B, cond_dim) graph-level conditioning vector
         """
-        a, e, edge_index, batch = mols.a, mols.e, mols.edge_index, mols.batch
+        a, e, _edge_index, batch = mols.a, mols.e, mols.edge_index, mols.batch
         N_nodes = torch.bincount(batch)
         num_graphs = N_nodes.shape[0]
 
         a_embed = self.atom_type_embedding(a)
         e_embed = self.edge_type_embedding(e)
-
-        if self.bond_degree_embedding is not None:
-            struct_embed = self.bond_degree_embedding(e, edge_index[0], a.shape[0])
-            a_embed = torch.cat([a_embed, struct_embed], dim=-1)
 
         t_embed = self.time_embedding(t)
         n_embed = self.node_count_embedding(N_nodes)
@@ -410,7 +658,6 @@ class DiTBackboneWithHeads(nn.Module):
         heads_args: DictConfig,
         ins_gmm_head_args: DictConfig,
         ins_edge_head_args: DictConfig,
-        bond_degree_embedding_args: DictConfig | None = None,
         cfg_embedding_args: DictConfig | None = None,
     ):
         super().__init__()
@@ -420,7 +667,6 @@ class DiTBackboneWithHeads(nn.Module):
             edge_type_embedding_args=edge_type_embedding_args,
             time_embedding_args=time_embedding_args,
             node_count_embedding_args=node_count_embedding_args,
-            bond_degree_embedding_args=bond_degree_embedding_args,
             cfg_embedding_args=cfg_embedding_args,
         )
 
@@ -512,6 +758,7 @@ class DiTBackboneWithHeads(nn.Module):
             edge_index_tuple,
             e_embed,
             batch,
+            mols_t.max_seqlen,
         )
 
         out_dict = self.heads(h, batch, e_out)

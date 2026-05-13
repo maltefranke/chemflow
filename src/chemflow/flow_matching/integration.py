@@ -613,4 +613,7 @@ class RateIntegrator:
                     # Fall back to random edge sampling
                     mol = join_molecules_with_atoms(mol, new_atoms, edge_dist)
 
+        # max_seqlen may have shifted from inserts/deletes; recompute once for
+        # the next backbone forward (flash-attn varlen needs a Python int).
+        mol.max_seqlen = int(torch.bincount(mol.batch).max().item())
         return mol
