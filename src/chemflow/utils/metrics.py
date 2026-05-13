@@ -933,6 +933,7 @@ def init_metrics(
     edge_tokens: list[str] | None = None,
     charge_tokens: list[str] | None = None,
     allow_charged: bool = False,
+    distributions=None,
 ):
 
     metrics = {
@@ -985,7 +986,16 @@ def init_metrics(
     stability_metrics = MetricCollection(stability_metrics, compute_groups=False)
     distribution_metrics = MetricCollection(distribution_metrics, compute_groups=False)
 
-    return metrics, stability_metrics, distribution_metrics
+    # Pointcloud-mode metrics — built from training-set target stats stored in
+    # Distributions. The collection may be empty if Distributions lacks them.
+    from chemflow.utils.pointcloud_metrics import build_pointcloud_metrics
+
+    pc_metrics: dict = {}
+    if distributions is not None and atom_tokens is not None:
+        pc_metrics = build_pointcloud_metrics(distributions, len(atom_tokens))
+    pointcloud_metrics = MetricCollection(pc_metrics, compute_groups=False)
+
+    return metrics, stability_metrics, distribution_metrics, pointcloud_metrics
 
 
 # ---------------------------------------------------------------------------

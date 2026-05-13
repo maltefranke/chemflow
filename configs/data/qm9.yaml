@@ -18,12 +18,12 @@ preprocessing:
   _recursive_: false
   root: ${data.root_path}/qm9
   train_dataset: ${data.datamodule.datasets.train}
+  # Canonical (representation-agnostic) cache. One preprocessing per dataset;
+  # representation-specific projection happens at runtime in the wrapper.
   atom_tokens_path: ${data.preprocessing.root}/processed/atom_tokens.txt
   edge_tokens_path: ${data.preprocessing.root}/processed/edge_tokens.txt
   charge_tokens_path: ${data.preprocessing.root}/processed/charge_tokens.txt
   distributions_path: ${data.preprocessing.root}/processed/distributions.pt
-  # Tokens and distributions will be discovered from data and saved to files
-  # On subsequent runs, they will be loaded from the files
 
 vocab: None
 
@@ -50,6 +50,7 @@ datamodule:
 
   vocab: ${data.vocab}
   distributions: None
+  representation: ${representation}
 
   datasets:
     train:

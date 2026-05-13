@@ -6,6 +6,11 @@ from torch.utils.data import Dataset
 
 from chemflow.flow_matching.sampling import sample_prior_graph
 from chemflow.dataset.molecule_data import MoleculeBatch
+from chemflow.dataset.representation import (
+    Representation,
+    project_molecule_to_representation,
+)
+from chemflow.dataset.vocab import Vocab
 
 
 class FlowMatchingDatasetWrapper(Dataset):
@@ -30,6 +35,8 @@ class FlowMatchingDatasetWrapper(Dataset):
         base_dataset,
         distributions,
         interpolator,
+        vocab: Vocab,
+        representation: str | Representation = Representation.GEOMETRIC_GRAPH,
         n_atoms_strategy="flexible",
         time_dist=None,
         stage="train",
@@ -39,6 +46,8 @@ class FlowMatchingDatasetWrapper(Dataset):
         self.base_dataset = base_dataset
         self.distributions = distributions
         self.interpolator = interpolator
+        self.vocab = vocab
+        self.representation = Representation(representation)
         self.n_atoms_strategy = n_atoms_strategy
         self.time_dist = time_dist
         self.stage = stage
@@ -98,6 +107,9 @@ class FlowMatchingDatasetWrapper(Dataset):
 
     def __getitem__(self, index):
         target = self.base_dataset[index]
+        target = project_molecule_to_representation(
+            target, self.vocab, self.representation
+        )
 
         n_atoms = self._get_n_atoms(target)
         sample = sample_prior_graph(self.distributions, n_atoms=n_atoms)

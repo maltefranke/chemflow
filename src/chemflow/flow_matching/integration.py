@@ -195,6 +195,7 @@ class RateIntegrator:
         eps: float = 1e-6,
         h_latent: torch.Tensor = None,
         ins_edge_head=None,
+        force_charge_idx: int | None = None,
     ) -> MoleculeBatch:
         """
         Integrate one step of the stochastic process for GNN models.
@@ -406,6 +407,12 @@ class RateIntegrator:
 
                 t_ins = t[batch_id[do_ins_valid]] + dt
                 new_atoms = self.sample_insertions(ins_gmm_dict, t_ins)
+
+                # In non-charge modes the c_probs sub-head is untrained at this
+                # call site; clamp inserted charges to the neutral index so they
+                # match what training saw (all targets were neutral_idx).
+                if force_charge_idx is not None:
+                    new_atoms.c = torch.full_like(new_atoms.c, force_charge_idx)
 
                 new_atoms.batch = batch_id[do_ins_valid]
 

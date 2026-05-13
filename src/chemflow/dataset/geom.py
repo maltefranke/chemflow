@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from chemflow.dataset.molecule_data import MoleculeData
 from chemflow.dataset.vocab import Distributions, Vocab
+from chemflow.dataset.representation import Capabilities
 from chemflow.utils.rdkit_utils import (
     BOND_IDX_MAP,
     mol_is_valid,
@@ -381,6 +382,8 @@ class GEOM(Dataset):
 
 
 class FlowMatchingGEOMDataset(GEOM):
+    CAPABILITIES = Capabilities(provides_charges=True, provides_topology=True)
+
     def __init__(
         self,
         root,
@@ -398,38 +401,35 @@ class FlowMatchingGEOMDataset(GEOM):
     def __getitem__(self, index):
         data = super().__getitem__(index)
 
-        # remove center of mass
         coord = data.pos - data.pos.mean(dim=0)
         if self.distributions.coordinate_std is not None:
             coord = coord / self.distributions.coordinate_std
 
-        atom_types = data.z
-        atom_types = z_to_atom_types(atom_types.tolist())
-        atom_types = [
-            token_to_index(self.vocab.atom_tokens, token) for token in atom_types
-        ]
-        atom_types = torch.tensor(atom_types, dtype=torch.long)
+        atom_types = z_to_atom_types(data.z.tolist())
+        atom_types = torch.tensor(
+            [token_to_index(self.vocab.atom_tokens, t) for t in atom_types],
+            dtype=torch.long,
+        )
 
-        # add 1 to the edge types to make them 1-indexed
-        # 0 is no bond, 1 is single, 2 is double, 3 is triple, 4 is aromatic
         edge_types = data.edge_attr
         edge_types = edge_types_to_symmetric(
             data.edge_index, edge_types, data.num_nodes
         )
+        edge_types = edge_types[data.edge_index[0], data.edge_index[1]].to(torch.long)
 
-        edge_types = edge_types[data.edge_index[0], data.edge_index[1]]
-        edge_types = edge_types.to(torch.long)
-
-        charges = data.charges.tolist()
         charges = [
-            token_to_index(self.vocab.charge_tokens, str(charge)) for charge in charges
+            token_to_index(self.vocab.charge_tokens, str(c))
+            for c in data.charges.tolist()
         ]
         charges = torch.tensor(charges, dtype=torch.long)
 
-        data = MoleculeData(
-            x=coord, a=atom_types, e=edge_types, c=charges, edge_index=data.edge_index
+        return MoleculeData(
+            x=coord, a=atom_types, e=edge_types, c=charges,
+            edge_index=data.edge_index,
         )
-        return data
 
     def get(self, index):
-        return self.__getitem__(index)
+        # Contract: .get() returns raw source data (PyG fields like z, pos,
+        # edge_attr, charges) so preprocessing can iterate before any vocab
+        # exists. __getitem__ is the canonical-MoleculeData builder.
+        return super().get(index)

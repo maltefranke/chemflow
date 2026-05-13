@@ -8,6 +8,15 @@ from torch_geometric.data import Dataset
 from torch_geometric.utils import to_dense_adj
 
 from chemflow.dataset.vocab import Distributions, Vocab
+from chemflow.dataset.representation import neutral_charge_index
+from chemflow.utils.pointcloud_metrics import (
+    DIST_N_BINS,
+    RG_N_BINS,
+    accumulate_pairwise_distance_hist,
+    accumulate_rog_hist,
+    dist_edges,
+    rg_edges,
+)
 from chemflow.utils.utils import (
     token_to_index,
     z_to_atom_types,
@@ -182,9 +191,14 @@ class Preprocessing:
             atom_types = z_to_atom_types(data.z.tolist())
             all_atom_types.update(atom_types)
 
-            # Extract edge types
-            # QM9 edge_attr is the bond type indices
-            if data.edge_attr.numel() > 0:
+            # Extract edge types — only when the source provides bonds.
+            # Datasets without topology (e.g. TMQM) won't have `edge_attr` at all,
+            # in which case the canonical edge vocab falls back to ["<NO_BOND>"].
+            if (
+                hasattr(data, "edge_attr")
+                and data.edge_attr is not None
+                and data.edge_attr.numel() > 0
+            ):
                 all_edge_type_indices.update(data.edge_attr.tolist())
 
             if hasattr(data, "charges") and data.charges is not None:
@@ -198,13 +212,17 @@ class Preprocessing:
         # Atom tokens: discovered atom types only (no special tokens)
         tokens = atom_types_sorted
 
-        # Create bond type tokens (as strings)
+        # Canonical edge tokens: [NO_BOND] + discovered bond types. Fallback to
+        # [NO_BOND] alone when the source has no bonds (e.g. TMQM) so that
+        # `${len:...}` and head/embedding shapes stay well-defined downstream.
         bond_type_tokens = [str(int(idx)) for idx in edge_type_indices_sorted]
-
-        # Edge tokens order: [NO_BOND_TOKEN] + [bond types]
         edge_tokens = [self.NO_BOND_TOKEN, *bond_type_tokens]
 
+        # Canonical charge tokens: discovered as sorted ints. Fallback to ["0"]
+        # when the source has no charges, for the same reason.
         charge_tokens = [str(int(idx)) for idx in charge_tokens_sorted]
+        if not charge_tokens:
+            charge_tokens = ["0"]
 
         return tokens, edge_tokens, charge_tokens
 
@@ -266,42 +284,52 @@ class Preprocessing:
         all_coords = []
         all_charges = []
 
+        # Pointcloud-mode evaluation targets — computed canonically so the same
+        # cache serves any representation.
+        num_atom_types = len(self.vocab.atom_tokens)
+        pair_hist = torch.zeros(
+            num_atom_types, num_atom_types, DIST_N_BINS, dtype=torch.float32
+        )
+        rog_hist = torch.zeros(RG_N_BINS, dtype=torch.float32)
+        d_edges = dist_edges()
+        r_edges = rg_edges()
+
         for i in range(len(dataset)):
             data = dataset.get(i)
             num_atoms = data.num_nodes
 
             atom_types = z_to_atom_types(data.z.tolist())
-            atom_type_indices = [
-                token_to_index(self.vocab.atom_tokens, token) for token in atom_types
-            ]
-            all_atom_type_indices.append(
-                torch.tensor(atom_type_indices, dtype=torch.long)
+            atom_type_indices_t = torch.tensor(
+                [
+                    token_to_index(self.vocab.atom_tokens, token)
+                    for token in atom_types
+                ],
+                dtype=torch.long,
             )
+            all_atom_type_indices.append(atom_type_indices_t)
 
-            # Convert edge_attr (one-hot) to dense adjacency matrix
-            # This gives: 0=no bond, 1=single, 2=double, 3=triple, 4=aromatic
-            edge_types = data.edge_attr
-            adj_matrix = to_dense_adj(
-                data.edge_index, edge_attr=edge_types, max_num_nodes=num_atoms
-            )
-            adj_matrix = adj_matrix.squeeze(0)  # Remove batch dimension
+            # Edge histogram: built only if the dataset provides bonds. Sources
+            # without topology contribute nothing here (vocab is the singleton
+            # canonical [NO_BOND] for them anyway).
+            if hasattr(data, "edge_attr") and data.edge_attr is not None and data.edge_attr.numel() > 0:
+                edge_types = data.edge_attr
+                adj_matrix = to_dense_adj(
+                    data.edge_index, edge_attr=edge_types, max_num_nodes=num_atoms
+                )
+                adj_matrix = adj_matrix.squeeze(0)
+                triu_indices = torch.triu_indices(
+                    row=num_atoms, col=num_atoms, offset=1
+                )
+                dense_edge_types = adj_matrix[triu_indices[0], triu_indices[1]]
+                all_edge_type_indices.append(dense_edge_types.long())
 
-            # Get all entries from the dense adjacency matrix (including no-bonds)
-            # Flatten the upper triangle (excluding diagonal) to match triu format
-            triu_indices = torch.triu_indices(row=num_atoms, col=num_atoms, offset=1)
-            dense_edge_types = adj_matrix[triu_indices[0], triu_indices[1]]
-
-            # Map edge type values (0-4) to edge token indices
-            # 0 -> NO_BOND_TOKEN (index 0)
-            # 1-4 -> bond type tokens (indices 1-4)
-            # We'll handle MASK separately if needed
-            # 0-4 directly map to indices 0-4
-            edge_token_indices = dense_edge_types.long()
-
-            # Remove center of mass for each molecule
-            # (same as in FlowMatchingQM9Dataset)
             coord = data.pos - data.pos.mean(dim=0)
             all_coords.append(coord)
+
+            accumulate_pairwise_distance_hist(
+                pair_hist, coord, atom_type_indices_t, d_edges
+            )
+            accumulate_rog_hist(rog_hist, coord, r_edges)
 
             if hasattr(data, "charges") and data.charges is not None:
                 charges = data.charges.tolist()
@@ -309,13 +337,11 @@ class Preprocessing:
                     token_to_index(self.vocab.charge_tokens, str(token))
                     for token in charges
                 ]
-                charge_type_indices = torch.tensor(
-                    charge_type_indices, dtype=torch.long
+                all_charges.append(
+                    torch.tensor(charge_type_indices, dtype=torch.long)
                 )
-                all_charges.append(charge_type_indices)
 
             all_num_atoms.append(num_atoms)
-            all_edge_type_indices.append(edge_token_indices)
 
         all_num_atoms = torch.tensor(all_num_atoms, dtype=torch.long)
         n_atoms_distribution = all_num_atoms.bincount()
@@ -327,41 +353,36 @@ class Preprocessing:
         ).float()
         atom_type_distribution = atom_type_distribution / atom_type_distribution.sum()
 
-        # Concatenate all edge type indices and compute distribution
-        all_edge_type_indices = torch.cat(all_edge_type_indices, dim=0)
-
-        # Create distribution over all edge tokens
-        # Edge tokens are: [NO_BOND (0), bond types (1-4), MASK (5)]
+        # Canonical edge distribution. Sources without bonds emit no edge entries;
+        # we fall back to a one-hot at NO_BOND (token 0) so the singleton-canonical
+        # vocab maps to a proper one-hot prior.
         num_edge_tokens = len(self.vocab.edge_tokens)
-        edge_type_distribution = all_edge_type_indices.bincount(
-            minlength=num_edge_tokens
-        )
-        # Normalize (MASK will have 0 count, which is fine)
-        edge_type_distribution = edge_type_distribution.float()
-        if edge_type_distribution.sum() > 0:
+        if all_edge_type_indices:
+            all_edge_type_indices = torch.cat(all_edge_type_indices, dim=0)
+            edge_type_distribution = all_edge_type_indices.bincount(
+                minlength=num_edge_tokens
+            ).float()
             edge_type_distribution = (
-                edge_type_distribution / edge_type_distribution.sum()
+                edge_type_distribution / edge_type_distribution.sum().clamp(min=1.0)
             )
         else:
-            edge_type_distribution = torch.ones(num_edge_tokens) / num_edge_tokens
+            edge_type_distribution = torch.zeros(num_edge_tokens)
+            edge_type_distribution[0] = 1.0
 
-        # Compute charge type distribution
+        # Canonical charge distribution. Sources without charges emit no entries;
+        # fall back to one-hot at the canonical "0" index when available.
+        num_charge_tokens = len(self.vocab.charge_tokens)
         if all_charges:
             all_charges = torch.cat(all_charges, dim=0)
-            charge_type_indices = all_charges.long()
-            charge_type_distribution = charge_type_indices.bincount(
-                minlength=len(self.vocab.charge_tokens)
+            charge_type_distribution = all_charges.long().bincount(
+                minlength=num_charge_tokens
             ).float()
             charge_type_distribution = (
                 charge_type_distribution / charge_type_distribution.sum()
             )
         else:
-            charge_type_distribution = torch.ones(
-                len(self.vocab.charge_tokens), dtype=torch.float32
-            )
-            charge_type_distribution = (
-                charge_type_distribution / charge_type_distribution.sum()
-            )
+            charge_type_distribution = torch.zeros(num_charge_tokens)
+            charge_type_distribution[neutral_charge_index(self.vocab)] = 1.0
 
         # Compute coordinate std across all coordinates in the dataset
         all_coords = torch.cat(all_coords, dim=0)  # Shape: (total_atoms, 3)
@@ -377,6 +398,8 @@ class Preprocessing:
             "charge_type_distribution": charge_type_distribution,
             "n_atoms_distribution": n_atoms_distribution,
             "coordinate_std": coordinate_std,
+            "pairwise_distance_histogram": pair_hist,
+            "radius_of_gyration_histogram": rog_hist,
         }
 
     def _save_distributions(self, distributions: dict[str, torch.Tensor]):

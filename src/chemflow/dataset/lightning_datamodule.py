@@ -10,6 +10,7 @@ from chemflow.dataset.flow_matching_wrapper import (
     eval_collate_fn,
     worker_init_fn,
 )
+from chemflow.dataset.representation import Representation
 
 
 class LightningDataModule(pl.LightningDataModule):
@@ -21,6 +22,7 @@ class LightningDataModule(pl.LightningDataModule):
         interpolator: DictConfig,
         num_workers: DictConfig,
         batch_size: DictConfig,
+        representation: str | Representation = Representation.GEOMETRIC_GRAPH,
         n_atoms_strategy: str = "flexible",
         optimal_transport: str = "equivariant",
         time_dist: DictConfig = None,
@@ -33,6 +35,7 @@ class LightningDataModule(pl.LightningDataModule):
         self.interpolator = interpolator
         self.num_workers = num_workers
         self.batch_size = batch_size
+        self.representation = Representation(representation)
         self.n_atoms_strategy = n_atoms_strategy
         self.optimal_transport = optimal_transport
         self.rotate = rotate
@@ -89,6 +92,8 @@ class LightningDataModule(pl.LightningDataModule):
             base_dataset=base_train,
             distributions=self.distributions,
             interpolator=self.interpolator,
+            vocab=self.vocab,
+            representation=self.representation,
             n_atoms_strategy=self.n_atoms_strategy,
             time_dist=self.time_dist,
             stage="train",
@@ -107,6 +112,8 @@ class LightningDataModule(pl.LightningDataModule):
                     base_dataset=base_val,
                     distributions=self.distributions,
                     interpolator=self.interpolator,
+                    vocab=self.vocab,
+                    representation=self.representation,
                     n_atoms_strategy=self.n_atoms_strategy,
                     time_dist=self.time_dist,
                     stage="val",
@@ -127,6 +134,8 @@ class LightningDataModule(pl.LightningDataModule):
                     base_dataset=base_test,
                     distributions=self.distributions,
                     interpolator=self.interpolator,
+                    vocab=self.vocab,
+                    representation=self.representation,
                     n_atoms_strategy=self.n_atoms_strategy,
                     time_dist=self.time_dist,
                     stage="test",

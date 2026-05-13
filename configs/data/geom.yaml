@@ -50,6 +50,7 @@ datamodule:
 
   vocab: ${data.vocab}
   distributions: None
+  representation: ${representation}
 
   datasets:
     train:
