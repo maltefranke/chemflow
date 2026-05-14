@@ -111,7 +111,7 @@ def setup(cfg: DictConfig):
         if representation.requires_topology and hasattr(base_dataset, "get_all_smiles")
         else None
     )
-    metrics, stability_metrics, distribution_metrics, pointcloud_metrics = init_metrics(
+    metrics, stability_metrics, distribution_metrics, batch_metrics = init_metrics(
         train_smiles=train_smiles,
         target_n_atoms_distribution=loss_weight_distributions.n_atoms_distribution,
         atom_type_distribution=loss_weight_distributions.atom_type_distribution,
@@ -137,7 +137,7 @@ def setup(cfg: DictConfig):
         metrics=metrics,
         stability_metrics=stability_metrics,
         distribution_metrics=distribution_metrics,
-        pointcloud_metrics=pointcloud_metrics,
+        batch_metrics=batch_metrics,
         allow_charged=allow_charged,
         representation=representation.value,
     )

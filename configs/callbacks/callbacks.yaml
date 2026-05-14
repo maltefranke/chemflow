@@ -2,19 +2,19 @@
 
 ## Put your callback args here
 callbacks:
-  monitor_metric: ${if:${eq:${representation},geometric_graph},val/validity,val/pc/pair_dist_l1}
+  monitor_metric: ${if:${eq:${representation},geometric_graph},val/validity,val/batch/pair_dist_l1}
   monitor_metric_mode: ${if:${eq:${representation},geometric_graph},max,min}
 
+  #   model_checkpoints         -> best-by-metric (top-1, monitored)
+  #   every_n_epochs_checkpoint -> latest (no monitor; overwrites every epoch)
   model_checkpoints:
     save_top_k: 1
-    verbose: False
     save_last: False
+    verbose: False
 
-  # Periodic callback only produces `last.ckpt` — it has no `monitor`, so
-  # `save_top_k > 0` would fail Lightning's validation. The main
-  # `model_checkpoints` callback above handles best-by-metric selection.
   every_n_epochs_checkpoint:
     every_n_epochs: 1
-    save_top_k: 0
+    save_top_k: 1
+    save_last: False
     verbose: False
-    save_last: True
+    save_on_train_epoch_end: True # Force per-train-epoch firing

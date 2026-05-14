@@ -89,7 +89,7 @@ class LightningModuleRates(pl.LightningModule):
         metrics: MetricCollection,
         stability_metrics: MetricCollection,
         distribution_metrics: MetricCollection | None = None,
-        pointcloud_metrics: MetricCollection | None = None,
+        batch_metrics: MetricCollection | None = None,
         n_atoms_strategy: str = "fixed",
         ins_noise_scale: float = 0.5,
         use_learnable_loss_weights: bool = False,
@@ -148,7 +148,7 @@ class LightningModuleRates(pl.LightningModule):
         self.distribution_metrics = distribution_metrics
         # Tensor-based metrics for non-topology modes. Updated in validation_step
         # and computed/logged in on_validation_epoch_end.
-        self.pointcloud_metrics = pointcloud_metrics
+        self.batch_metrics = batch_metrics
 
         self.cfg_guidance = hydra.utils.instantiate(
             cfg_guidance,
@@ -714,25 +714,24 @@ class LightningModuleRates(pl.LightningModule):
         # here so each validation cycle starts from a clean state.
         if self.distribution_metrics is not None:
             self.distribution_metrics.reset()
-        if self.pointcloud_metrics is not None:
-            self.pointcloud_metrics.reset()
+        if self.batch_metrics is not None:
+            self.batch_metrics.reset()
 
     def validation_step(self, batch, batch_idx):
         self.model_ema.eval()
         batched_mols = self.sample(batch, batch_idx, return_traj=False)
 
-        # In non-topology modes, runtime edges labeled <NO_BOND> are message-passing
-        # edges rather than chemical bonds, so RDKit mol construction (and the
-        # metrics that depend on it) are skipped. Tensor-based pointcloud metrics run instead — they consume
-        # the batch directly and undo the dataset's coord normalization so that
-        # bin edges (stored in Angstroms) match.
+        # Tensor-based metrics consume the batch directly and work in every
+        # representation, so they always run. In non-topology modes runtime
+        # edges are <NO_BOND> placeholders rather than chemical bonds, so RDKit
+        # mol construction (and the metrics that depend on it) is skipped.
+        if (
+            self.batch_metrics is not None
+            and len(self.batch_metrics) > 0
+        ):
+            self.batch_metrics.update(batched_mols)
+
         if not self.representation.requires_topology:
-            if (
-                self.pointcloud_metrics is not None
-                and len(self.pointcloud_metrics) > 0
-            ):
-                coord_scale = float(self.distributions.coordinate_std)
-                self.pointcloud_metrics.update(batched_mols, coord_scale=coord_scale)
             del batched_mols
             return
 
@@ -794,21 +793,20 @@ class LightningModuleRates(pl.LightningModule):
             )
 
     def on_validation_epoch_end(self):
-        # Pointcloud-metric path runs in non-topology modes and is logged here
-        # so the values land in the same wandb step as everything else.
+        # Tensor-based metrics run in every representation; logged here so the
+        # values land in the same wandb step as everything else.
         if (
-            not self.representation.requires_topology
-            and self.pointcloud_metrics is not None
-            and len(self.pointcloud_metrics) > 0
+            self.batch_metrics is not None
+            and len(self.batch_metrics) > 0
         ):
             try:
-                pc_results = self.pointcloud_metrics.compute()
+                batch_results = self.batch_metrics.compute()
                 self.log_dict(
                     {
-                        f"val/pc/{key}": (
+                        f"val/batch/{key}": (
                             v.detach() if isinstance(v, torch.Tensor) else v
                         )
-                        for key, v in pc_results.items()
+                        for key, v in batch_results.items()
                     },
                     on_step=False,
                     on_epoch=True,
@@ -822,15 +820,15 @@ class LightningModuleRates(pl.LightningModule):
                 # gathered across processes; only rank 0 then reads the synced
                 # histograms and logs (mirrors the RDKit-marginal pattern above).
                 with ExitStack() as stack:
-                    for m in self.pointcloud_metrics.values():
+                    for m in self.batch_metrics.values():
                         stack.enter_context(m.sync_context())
 
                     if self.trainer.is_global_zero and hasattr(self.logger, "log_image"):
-                        from chemflow.utils.pointcloud_metrics import (
-                            build_pointcloud_marginal_plots,
+                        from chemflow.utils.batch_metrics import (
+                            build_batch_marginal_plots,
                         )
-                        figs = build_pointcloud_marginal_plots(
-                            self.pointcloud_metrics,
+                        figs = build_batch_marginal_plots(
+                            self.batch_metrics,
                             atom_tokens=list(self.vocab.atom_tokens),
                         )
                         for name, fig in figs.items():
@@ -844,11 +842,16 @@ class LightningModuleRates(pl.LightningModule):
                             for fig in figs.values():
                                 plt.close(fig)
             except Exception as e:
-                print(f"Error in pointcloud-metric epoch-end logging: {e}")
+                print(f"Error in batch-metric epoch-end logging: {e}")
             finally:
-                self.pointcloud_metrics.reset()
-            return
+                self.batch_metrics.reset()
 
+        # RDKit-mol-based distribution metrics only accumulate in topology mode
+        # (validation_step returns before mol construction otherwise). Falling
+        # through here in pointcloud mode would log phantom 0.0 KLs from
+        # never-updated histograms — guard explicitly.
+        if not self.representation.requires_topology:
+            return
         if self.distribution_metrics is None:
             return
 

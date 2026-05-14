@@ -1,15 +1,21 @@
-"""Tensor-based generative metrics for pointcloud-mode evaluation.
+"""Tensor-based generative metrics, consumed directly from ``MoleculeBatch``.
 
-The metrics in ``metrics.py`` consume RDKit molecules and therefore can't operate
-in pointcloud modes (runtime edges labeled ``<NO_BOND>`` are not chemical bonds). These mirror the
-KL / distribution-distance ideas but work directly on ``MoleculeBatch`` tensors,
-so no bond perception is required.
+These mirror the KL / distribution-distance ideas in ``metrics.py`` but operate
+on the batch tensors (``x``, ``a``, ``batch``) rather than on RDKit molecules,
+so they work in every representation — including pointcloud modes where runtime
+edges are ``<NO_BOND>`` placeholders rather than real bonds.
+
+All metrics here run in every representation. The 1D atom-count / atom-type
+KLs intentionally coexist with their RDKit-mol counterparts in ``metrics.py``:
+the RDKit versions are *conditional* on samples being RDKit-convertible (they
+silently drop ``None`` mols), while the ones here are *marginal* over every
+generated sample. The gap between them is itself diagnostic.
 
 Target stats (per-element-pair distance histogram, RoG histogram) are computed
 once at preprocessing time on training-set coords in Angstroms and stored in
-``Distributions``. Generated coords arrive normalized (divided by
-``coordinate_std`` in the dataset's ``__getitem__``); each metric undoes that
-scaling internally so it can compare like-for-like.
+``Distributions``. Generated coords are expected to arrive in Angstroms too —
+``sample()`` in the LightningModule already multiplies by ``coordinate_std``
+before returning the final ``MoleculeBatch``.
 """
 
 import torch
@@ -97,18 +103,20 @@ def accumulate_rog_hist(
     return overflow, 1
 
 
-class PointCloudMetric(Metric):
-    """Base class for tensor-based pointcloud metrics."""
+class BatchMetric(Metric):
+    """Base class for metrics that consume a ``MoleculeBatch`` directly."""
 
-    def update(self, batch: MoleculeBatch, coord_scale: float = 1.0) -> None:
+    def update(self, batch: MoleculeBatch) -> None:
         raise NotImplementedError
 
     def compute(self) -> torch.Tensor:
         raise NotImplementedError
 
 
-class PCAtomCountKL(PointCloudMetric):
-    """KL(gen || target) over atom counts per molecule."""
+class AtomCountMarginalKL(BatchMetric):
+    """KL(gen || target) over atom counts per molecule, marginal over all generated
+    samples (no RDKit-validity conditioning, unlike ``AtomCountDistributionMetric``).
+    """
 
     def __init__(self, target_distribution: torch.Tensor, eps: float = 1e-8, **kwargs):
         super().__init__(**kwargs)
@@ -122,7 +130,7 @@ class PCAtomCountKL(PointCloudMetric):
             dist_reduce_fx="sum",
         )
 
-    def update(self, batch: MoleculeBatch, coord_scale: float = 1.0) -> None:
+    def update(self, batch: MoleculeBatch) -> None:
         counts = torch.bincount(batch.batch, minlength=batch.num_graphs).clamp(
             0, self.K - 1
         )
@@ -134,8 +142,10 @@ class PCAtomCountKL(PointCloudMetric):
         return _kl(self.gen_hist, self.target, self.eps)
 
 
-class PCAtomTypeKL(PointCloudMetric):
-    """KL(gen || target) over atom-type histogram."""
+class AtomTypeMarginalKL(BatchMetric):
+    """KL(gen || target) over atom-type histogram, marginal over all generated
+    samples (no RDKit-validity conditioning, unlike ``AtomTypeDistributionMetric``).
+    """
 
     def __init__(self, target_distribution: torch.Tensor, eps: float = 1e-8, **kwargs):
         super().__init__(**kwargs)
@@ -149,7 +159,7 @@ class PCAtomTypeKL(PointCloudMetric):
             dist_reduce_fx="sum",
         )
 
-    def update(self, batch: MoleculeBatch, coord_scale: float = 1.0) -> None:
+    def update(self, batch: MoleculeBatch) -> None:
         a = batch.a.clamp(0, self.K - 1)
         self.gen_hist += torch.bincount(a, minlength=self.K).to(torch.float32)
 
@@ -159,7 +169,7 @@ class PCAtomTypeKL(PointCloudMetric):
         return _kl(self.gen_hist, self.target, self.eps)
 
 
-class PCPairwiseDistanceL1(PointCloudMetric):
+class PairwiseDistanceL1(BatchMetric):
     """Mean per-element-pair L1 distance between gen and target distance histograms.
 
     For every ordered (lo, hi) atom-type pair the *target* has meaningful mass
@@ -183,12 +193,11 @@ class PCPairwiseDistanceL1(PointCloudMetric):
             dist_reduce_fx="sum",
         )
 
-    def update(self, batch: MoleculeBatch, coord_scale: float = 1.0) -> None:
-        x = batch.x * coord_scale
+    def update(self, batch: MoleculeBatch) -> None:
         for g in batch.batch.unique():
             mask = batch.batch == g
             accumulate_pairwise_distance_hist(
-                self.gen_hist, x[mask], batch.a[mask], self.edges
+                self.gen_hist, batch.x[mask], batch.a[mask], self.edges
             )
 
     def compute(self) -> torch.Tensor:
@@ -207,7 +216,7 @@ class PCPairwiseDistanceL1(PointCloudMetric):
         return l1[populated].mean()
 
 
-class PCMinDistanceViolation(PointCloudMetric):
+class MinDistanceViolation(BatchMetric):
     """Fraction of generated molecules whose smallest pairwise distance is below
     a physical threshold (default 0.5 Å). Catches collapse and overlap."""
 
@@ -219,11 +228,10 @@ class PCMinDistanceViolation(PointCloudMetric):
         )
         self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
 
-    def update(self, batch: MoleculeBatch, coord_scale: float = 1.0) -> None:
-        x = batch.x * coord_scale
+    def update(self, batch: MoleculeBatch) -> None:
         for g in batch.batch.unique():
             mask = batch.batch == g
-            coord = x[mask]
+            coord = batch.x[mask]
             n = coord.shape[0]
             if n < 2:
                 continue
@@ -239,7 +247,7 @@ class PCMinDistanceViolation(PointCloudMetric):
         return self.violations / self.total
 
 
-class PCRangeOverflow(PointCloudMetric):
+class RangeOverflow(BatchMetric):
     """Fraction of generated values that landed outside the histogram range.
 
     If this is non-trivial (say >1%), the fixed range in this module is too
@@ -256,13 +264,12 @@ class PCRangeOverflow(PointCloudMetric):
         self.add_state("rog_over", default=torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("rog_total", default=torch.tensor(0.0), dist_reduce_fx="sum")
 
-    def update(self, batch: MoleculeBatch, coord_scale: float = 1.0) -> None:
-        x = batch.x * coord_scale
+    def update(self, batch: MoleculeBatch) -> None:
         d_max = self.dist_edges_buf[-1]
         r_max = self.rog_edges_buf[-1]
         for g in batch.batch.unique():
             mask = batch.batch == g
-            coord = x[mask]
+            coord = batch.x[mask]
             n = coord.shape[0]
             if n >= 2:
                 i_idx, j_idx = torch.triu_indices(n, n, offset=1, device=coord.device)
@@ -280,7 +287,7 @@ class PCRangeOverflow(PointCloudMetric):
         return torch.maximum(d, r)
 
 
-class PCRoGL1(PointCloudMetric):
+class RoGL1(BatchMetric):
     """L1 distance between gen and target normalized radius-of-gyration histograms."""
 
     def __init__(self, target_hist: torch.Tensor, **kwargs):
@@ -293,11 +300,10 @@ class PCRoGL1(PointCloudMetric):
             dist_reduce_fx="sum",
         )
 
-    def update(self, batch: MoleculeBatch, coord_scale: float = 1.0) -> None:
-        x = batch.x * coord_scale
+    def update(self, batch: MoleculeBatch) -> None:
         for g in batch.batch.unique():
             mask = batch.batch == g
-            accumulate_rog_hist(self.gen_hist, x[mask], self.edges)
+            accumulate_rog_hist(self.gen_hist, batch.x[mask], self.edges)
 
     def compute(self) -> torch.Tensor:
         gen = self.gen_hist
@@ -309,9 +315,9 @@ class PCRoGL1(PointCloudMetric):
         return (gen_n - tgt_n).abs().sum()
 
 
-def build_pointcloud_marginal_plots(metrics, atom_tokens: list[str] | None = None):
+def build_batch_marginal_plots(metrics, atom_tokens: list[str] | None = None):
     """Produce a small set of GT-vs-generated marginal plots from a populated
-    ``PointCloudMetric`` collection. Returns ``{wandb_key: matplotlib.Figure}``.
+    ``BatchMetric`` collection. Returns ``{wandb_key: matplotlib.Figure}``.
 
     v1 covers the three 1D marginals — atom count, atom type, radius of gyration.
     Per-pair distance plots are deferred; with ``A`` atom types you'd get up to
@@ -334,31 +340,38 @@ def build_pointcloud_marginal_plots(metrics, atom_tokens: list[str] | None = Non
         figs[key] = plot_marginal_comparison(gen, tgt, labels, title, xlabel)
 
     _maybe_plot(
-        "atom_count_kl", "gen_hist", "target",
-        labels=None, title="Atom count", xlabel="num atoms",
-        key="val/pc/plots/atom_count",
+        "atom_count_marginal_kl", "gen_hist", "target",
+        labels=None, title="Atom count (all samples)", xlabel="num atoms",
+        key="val/batch/plots/atom_count_marginal",
     )
     _maybe_plot(
-        "atom_type_kl", "gen_hist", "target",
+        "atom_type_marginal_kl", "gen_hist", "target",
         labels=list(atom_tokens) if atom_tokens is not None else None,
-        title="Atom type", xlabel="token",
-        key="val/pc/plots/atom_type",
+        title="Atom type (all samples)", xlabel="token",
+        key="val/batch/plots/atom_type_marginal",
     )
     _maybe_plot(
         "rog_l1", "gen_hist", "target_hist",
         labels=None, title="Radius of gyration",
         xlabel=f"RoG bin (Å in [{RG_RANGE[0]}, {RG_RANGE[1]}])",
-        key="val/pc/plots/rog",
+        key="val/batch/plots/rog",
     )
     return figs
 
 
-def build_pointcloud_metrics(distributions, num_atom_types: int) -> dict[str, PointCloudMetric]:
-    """Construct the v1 pointcloud metric set from training-side target stats.
+def build_batch_metrics(
+    distributions,
+    num_atom_types: int,
+) -> dict[str, BatchMetric]:
+    """Construct the batch-side metric set from training-side target stats.
 
-    Returns an empty dict if Distributions lacks either pointcloud target stat
-    (e.g. preprocessing was run in geometric_graph mode and skipped them). Both
-    are checked independently in case one is added without the other later.
+    All metrics run in every representation. The 1D atom-count / atom-type KLs
+    coexist with the RDKit-mol equivalents in ``metrics.py`` on purpose — see
+    module docstring.
+
+    Returns an empty dict if Distributions lacks either geometric target stat
+    (e.g. an older cache built before these were added). Both are checked
+    independently in case one is added without the other later.
     """
     if (
         distributions.pairwise_distance_histogram is None
@@ -366,10 +379,10 @@ def build_pointcloud_metrics(distributions, num_atom_types: int) -> dict[str, Po
     ):
         return {}
     return {
-        "min_dist_violation": PCMinDistanceViolation(threshold=0.5),
-        "range_overflow": PCRangeOverflow(),
-        "atom_count_kl": PCAtomCountKL(distributions.n_atoms_distribution),
-        "atom_type_kl": PCAtomTypeKL(distributions.atom_type_distribution),
-        "pair_dist_l1": PCPairwiseDistanceL1(distributions.pairwise_distance_histogram),
-        "rog_l1": PCRoGL1(distributions.radius_of_gyration_histogram),
+        "min_dist_violation": MinDistanceViolation(threshold=0.5),
+        "range_overflow": RangeOverflow(),
+        "pair_dist_l1": PairwiseDistanceL1(distributions.pairwise_distance_histogram),
+        "rog_l1": RoGL1(distributions.radius_of_gyration_histogram),
+        "atom_count_marginal_kl": AtomCountMarginalKL(distributions.n_atoms_distribution),
+        "atom_type_marginal_kl": AtomTypeMarginalKL(distributions.atom_type_distribution),
     }
