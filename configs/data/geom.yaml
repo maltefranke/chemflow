@@ -1,7 +1,7 @@
 ## Put your data args here
 
 root_path: ${oc.env:PROJECT_ROOT}/data
-preprocess_workers: 0
+preprocess_workers: 10
 
 n_atoms_strategy: "uniform" # "fixed", "approx"
 optimal_transport: "equivariant"
@@ -16,7 +16,7 @@ allow_charged: true
 preprocessing:
   _target_: chemflow.dataset.preprocessing.Preprocessing
   _recursive_: false
-  root: ${data.root_path}/geom
+  root: ${data.root_path}/geom_new
   train_dataset: ${data.datamodule.datasets.train}
   atom_tokens_path: ${data.preprocessing.root}/processed/atom_tokens.txt
   edge_tokens_path: ${data.preprocessing.root}/processed/edge_tokens.txt
@@ -54,19 +54,19 @@ datamodule:
   datasets:
     train:
       _target_: chemflow.dataset.geom.FlowMatchingGEOMDataset
-      root: ${data.root_path}/geom
+      root: ${data.preprocessing.root}
       vocab: ${data.vocab}
       distributions: None
 
     val:
       - _target_: chemflow.dataset.geom.FlowMatchingGEOMDataset
-        root: ${data.root_path}/geom
+        root: ${data.preprocessing.root}
         vocab: ${data.vocab}
         distributions: None
 
     test:
       - _target_: chemflow.dataset.geom.FlowMatchingGEOMDataset
-        root: ${data.root_path}/geom
+        root: ${data.preprocessing.root}
         vocab: ${data.vocab}
         distributions: None
 
@@ -76,14 +76,14 @@ datamodule:
   n_augmentations: ${model.n_augmentations}
 
   num_workers:
-    train: 2
+    train: 10
     val: 0
     test: 0
     predict: 0
 
   batch_size:
     train: 256
-    val: 64
+    val: 80
     test: 32
 
   n_atoms_strategy: ${data.n_atoms_strategy}
