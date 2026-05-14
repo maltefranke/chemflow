@@ -168,7 +168,7 @@ configs/local/default.yaml
 outputs/
 logs/
 
-data/
+/data/
 
 slurm-*.out
 
