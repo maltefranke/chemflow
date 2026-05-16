@@ -116,8 +116,10 @@ class PairBias(nn.Module):
 
     ``down_proj`` is zero-init so the bias is exactly 0 on valid pairs at
     init; blocks gate via adaLN-Zero so contribution gates in during training.
-    Padding handling is left to the consumer (we return ``pad_mask``
-    separately) because per-block gating times ``-inf`` would NaN out.
+    Padded pairs are ``-inf``-masked here once so the bias can be shared by
+    reference across all blocks (one ``(B, H, N, N)`` allocation per forward,
+    not per layer). ``down_proj`` is left at its Xavier init (inherited from
+    the parent backbone's ``_basic_init``).
     """
 
     def __init__(
@@ -135,7 +137,6 @@ class PairBias(nn.Module):
         self.edge_to_hidden = nn.Linear(edge_nf, hidden_dim, bias=False)
         self.act = nn.GELU(approximate="tanh")
         self.down_proj = nn.Linear(hidden_dim, num_heads, bias=False)
-        nn.init.zeros_(self.down_proj.weight)
 
     def forward(
         self,
@@ -145,15 +146,13 @@ class PairBias(nn.Module):
         batch: torch.Tensor,
         batch_size: int,
         max_seqlen: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
-            bias: (B, num_heads, max_seqlen, max_seqlen) raw bias values
-                (no -inf masking — see ``pad_mask``).
+            bias: (B, num_heads, max_seqlen, max_seqlen) additive attention
+                bias, already ``-inf`` at padded pairs so softmax masks them.
             atom_mask: (B, max_seqlen) True at valid atoms (cached for the
                 attention path so it doesn't repad).
-            pad_mask: (B, max_seqlen, max_seqlen) True at padded pairs.
-                Applied AFTER the per-block gate to avoid ``gate * -inf = NaN``.
         """
         x_dense, atom_mask = to_dense_batch(
             x, batch, batch_size=batch_size, max_num_nodes=max_seqlen
@@ -181,7 +180,8 @@ class PairBias(nn.Module):
         bias = bias.permute(0, 3, 1, 2).contiguous()  # (B, H, N, N)
 
         pad_mask = ~(atom_mask.unsqueeze(2) & atom_mask.unsqueeze(1))
-        return bias, atom_mask, pad_mask
+        bias.masked_fill_(pad_mask.unsqueeze(1), float("-inf"))
+        return bias, atom_mask
 
 
 # ---------------------------------------------------------------------------
@@ -270,16 +270,9 @@ class DiTBlock(nn.Module):
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(), nn.Linear(hidden_dim, 6 * hidden_dim, bias=True)
         )
-        # Per-head pair-bias gate, conditioned on ``c`` (adaLN-Zero style).
-        # No shift — softmax is invariant to adding a constant per row, so a
-        # shift on the bias would be a free parameter. Zero-init so the model
-        # ignores the pair bias at init.
-        self.bias_gate_proj = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_dim, num_heads, bias=True)
-        )
 
     def forward(self, x, c, batch_idx, cu_seqlens, max_seqlen,
-                pair_bias=None, pad_mask=None, atom_mask=None):
+                pair_bias=None, atom_mask=None):
         """
         Args:
             x: (total_N, d) packed token features
@@ -287,10 +280,8 @@ class DiTBlock(nn.Module):
             batch_idx: (total_N,) batch assignment
             cu_seqlens: (B+1,) int32 cumulative sequence lengths
             max_seqlen: largest sequence length in the batch (Python int)
-            pair_bias: optional (B, H, max_seqlen, max_seqlen) raw pair bias
-                from ``PairBias`` (no -inf masking yet).
-            pad_mask: (B, max_seqlen, max_seqlen) True at padded pairs;
-                required iff ``pair_bias`` is given.
+            pair_bias: optional (B, H, max_seqlen, max_seqlen) pair bias
+                already ``-inf``-masked at padded pairs.
             atom_mask: (B, max_seqlen) True at valid atoms; required iff
                 ``pair_bias`` is given.
         """
@@ -298,23 +289,11 @@ class DiTBlock(nn.Module):
             self.adaLN_modulation(c).chunk(6, dim=1)
         )
 
-        if pair_bias is not None:
-            # Per-(graph, head) gate from c; zero-init means no contribution
-            # until the model learns it. Apply gate before -inf masking to
-            # avoid 0 * -inf = NaN at padded positions. In-place masked_fill
-            # saves the ~(B, H, N, N) buffer that an out-of-place version
-            # would keep for backward.
-            bias_gate = self.bias_gate_proj(c)  # (B, num_heads)
-            attn_bias = pair_bias * bias_gate[:, :, None, None]
-            attn_bias.masked_fill_(pad_mask.unsqueeze(1), float("-inf"))
-        else:
-            attn_bias = None
-
         _x = modulate(self.norm1(x), shift_msa, scale_msa, batch_idx)
         qkv = self.qkv(_x).view(-1, 3, self.num_heads, self.head_dim)
         attn_out = _attn_varlen(
             qkv, cu_seqlens, max_seqlen, batch_idx,
-            attn_bias=attn_bias, atom_mask=atom_mask,
+            attn_bias=pair_bias, atom_mask=atom_mask,
         )
         attn_out = attn_out.reshape(-1, self.hidden_dim)
         attn_out = self.proj(attn_out)
@@ -453,16 +432,11 @@ class DiTBackbone(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-        # PairBias warm-start: zero-init the final down-projection so the
-        # raw bias is exactly zero at init (analogous to adaLN-Zero).
-        # ``self.apply`` above Xavier-inits every Linear, so re-zero here.
-        nn.init.zeros_(self.pair_bias.down_proj.weight)
-
-        # Per-block pair-bias gates zero-init so each block also starts with
-        # no pair-bias contribution.
-        for block in self.blocks:
-            nn.init.constant_(block.bias_gate_proj[-1].weight, 0)
-            nn.init.constant_(block.bias_gate_proj[-1].bias, 0)
+        # Pair-bias init: ``down_proj`` keeps the Xavier init from
+        # ``_basic_init`` above, so the bias is non-trivial from step 0. The
+        # bias is added inside softmax and the whole attention output is then
+        # gated by ``gate_msa(c)`` (adaLN-Zero) downstream, so we don't need
+        # an extra per-block bias gate.
 
     def encode(
         self,
@@ -547,14 +521,14 @@ class DiTBackbone(nn.Module):
             e_out: (E, out_node_nf) edge features
         """
         h, cu_seqlens, c = self.encode(a_embed, x, cond, batch)
-        pair_bias, atom_mask, pad_mask = self.pair_bias(
+        pair_bias, atom_mask = self.pair_bias(
             x, edge_index, e_embed, batch, cond.shape[0], max_seqlen,
         )
 
         for block in self.blocks:
             h = block(
                 h, c, batch, cu_seqlens, max_seqlen,
-                pair_bias=pair_bias, pad_mask=pad_mask, atom_mask=atom_mask,
+                pair_bias=pair_bias, atom_mask=atom_mask,
             )
 
         return self.decode(h, c, batch, x, edge_index, e_embed)

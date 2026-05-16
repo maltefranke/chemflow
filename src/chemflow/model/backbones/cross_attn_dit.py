@@ -292,7 +292,7 @@ class CrossAttnDiTBackbone(nn.Module):
                 )
 
         batch_size = cond.shape[0]
-        pair_bias, atom_mask, pad_mask = self.dit.pair_bias(
+        pair_bias, atom_mask = self.dit.pair_bias(
             x, edge_index, e_embed, batch, batch_size, max_seqlen,
         )
         for cross_attn, block in zip(self.cross_attn_blocks, self.dit.blocks):
@@ -310,7 +310,7 @@ class CrossAttnDiTBackbone(nn.Module):
                 h = h_dense[atom_mask]
             h = block(
                 h, c, batch, cu_seqlens, max_seqlen,
-                pair_bias=pair_bias, pad_mask=pad_mask, atom_mask=atom_mask,
+                pair_bias=pair_bias, atom_mask=atom_mask,
             )
 
         if edge_cond is not None:
