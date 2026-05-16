@@ -111,7 +111,7 @@ def setup(cfg: DictConfig):
         log_grad_norms_every_n_steps=0 # disable loss gradient checking 
     )
 
-    #module.compile()
+    module.compile()
 
     # Setup logging and callbacks
     wandb_logger = WandbLogger(**cfg.logging)

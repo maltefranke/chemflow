@@ -389,7 +389,8 @@ def predict_insertion_density(
     preds = model(
         mol_t_batch,
         t.view(-1, 1),
-        cfg_inputs={},
+        overrides={},
+        drop_masks=None,
     )
     return preds["gmm_head"], preds["ins_rate_head"]
 

@@ -101,8 +101,8 @@ def _run_property_guidance_eval(
     n_batches: int,
     device,
 ) -> tuple[int, int]:
-    """Custom predict loop that overrides ``mol_t.y`` with a fixed target
-    property value and returns (n_valid, n_total)."""
+    """Custom predict loop that injects a fixed target property value via
+    ``overrides["properties"]`` and returns (n_valid, n_total)."""
     from chemflow.utils import rdkit_utils as chemflowRD
 
     n_valid_total = 0
@@ -117,18 +117,19 @@ def _run_property_guidance_eval(
             mol_t = mol_t.to(device)
             mol_1 = mol_1.to(device)
 
-            # Override the conditioned property columns with the target value.
-            if mol_t.y is not None and mol_t.y.ndim >= 2:
-                new_y = mol_t.y.clone().float()
-                for idx in property_indices:
-                    if idx < new_y.shape[1]:
-                        new_y[:, idx] = target_val
-                mol_t.y = new_y
+            # Build a [B, num_properties_used] override matching the
+            # PropertySignal's expected shape (one column per used index).
+            bs = mol_t.batch_size
+            target_tensor = torch.full(
+                (bs, len(property_indices)), float(target_val),
+                dtype=torch.float, device=device,
+            )
 
             gen_mols = module.sample(
                 (mol_t, mol_1),
                 batch_idx,
                 return_traj=True,
+                overrides={"properties": target_tensor},
             )
 
             for traj in gen_mols:
@@ -557,15 +558,17 @@ def _print_cfg_diagnostics(module, state_dict, test_dl, device):
     print(f"  n_atoms_strategy: {module.n_atoms_strategy}")
     print(f"  use_ema_for_eval: {module.use_ema_for_eval}")
 
-    adapter = module.cfg_adapter
-    has_natoms = adapter._has_natoms_cfg
-    has_mw = adapter._has_mw_cfg
-    has_props = adapter._has_property_conditioning
-    print(f"  _has_property_conditioning: {has_props}")
-    print(f"  _has_natoms_cfg:            {has_natoms}")
-    print(f"  _has_mw_cfg:                {has_mw}")
-    print(f"  natoms_cfg_guidance_scale:   {adapter.natoms_cfg_guidance_scale}")
-    print(f"  mw_cfg_guidance_scale:       {adapter.mw_cfg_guidance_scale}")
+    guidance = module.cfg_guidance
+    has_natoms = guidance.has_signal("n_atoms")
+    has_mw = guidance.has_signal("mw")
+    has_props = guidance.has_signal("properties")
+    print(f"  has_signal(properties): {has_props}")
+    print(f"  has_signal(n_atoms):    {has_natoms}")
+    print(f"  has_signal(mw):         {has_mw}")
+    if has_natoms:
+        print(f"  n_atoms guidance_scale: {guidance.get_signal('n_atoms').guidance_scale}")
+    if has_mw:
+        print(f"  mw guidance_scale:      {guidance.get_signal('mw').guidance_scale}")
 
     eval_model = module._get_model()
     cfg_emb = getattr(
@@ -576,15 +579,8 @@ def _print_cfg_diagnostics(module, state_dict, test_dl, device):
     if cfg_emb is not None:
         n_params = sum(p.numel() for p in cfg_emb.parameters())
         print(f"  cfg_embedding total params:  {n_params}")
-        """if hasattr(cfg_emb, "_natoms_null"):
-            print(
-                f"  _natoms_null norm:           "
-                f"{cfg_emb._natoms_null.norm().item():.4f}"
-            )"""
-        if hasattr(cfg_emb, "_mw_null"):
-            print(
-                f"  _mw_null norm:               {cfg_emb._mw_null.norm().item():.4f}"
-            )
+        for s in cfg_emb.signals:
+            print(f"  signal[{s.name}].null_emb norm: {s.null_emb.norm().item():.4f}")
 
         ckpt_cfg_keys = [
             k for k in state_dict if "model_ema" in k and "cfg_embedding" in k
@@ -610,32 +606,30 @@ def _print_cfg_diagnostics(module, state_dict, test_dl, device):
     with torch.no_grad():
         bs = mol_t.batch_size
         t_diag = torch.zeros(bs, device=device)
+        # Drop every signal → unconditional pass.
+        all_drop = {
+            s.name: torch.ones(bs, dtype=torch.bool, device=device)
+            for s in guidance.signals
+        }
         preds_uncond = eval_model(
             mol_t,
             t_diag.view(-1, 1),
-            cfg_inputs={},
+            overrides={},
+            drop_masks=all_drop,
         )
-        target_10 = torch.full(
-            (bs,),
-            10,
-            dtype=torch.long,
-            device=device,
-        )
+        target_10 = torch.full((bs,), 10, dtype=torch.long, device=device)
         preds_cond_10 = eval_model(
             mol_t,
             t_diag.view(-1, 1),
-            cfg_inputs={"target_n_atoms": target_10},
+            overrides={"n_atoms": target_10},
+            drop_masks=None,
         )
-        target_28 = torch.full(
-            (bs,),
-            28,
-            dtype=torch.long,
-            device=device,
-        )
+        target_28 = torch.full((bs,), 28, dtype=torch.long, device=device)
         preds_cond_28 = eval_model(
             mol_t,
             t_diag.view(-1, 1),
-            cfg_inputs={"target_n_atoms": target_28},
+            overrides={"n_atoms": target_28},
+            drop_masks=None,
         )
 
     print("\n  Comparing uncond vs cond(10) vs cond(28):")
@@ -659,16 +653,11 @@ def _print_cfg_diagnostics(module, state_dict, test_dl, device):
             f"|c10-c28|={d_1028:.6f}"
         )
 
-    adapter.natoms_cfg_guidance_scale = 5.0
-    print(
-        f"\n  should_use_natoms_cfg(t=10, s=5.0): "
-        f"{adapter.should_use_natoms_cfg(target_10)}"
-    )
-    adapter.natoms_cfg_guidance_scale = 0.0
-    print(
-        f"  should_use_natoms_cfg(t=10, s=0.0): "
-        f"{adapter.should_use_natoms_cfg(target_10)}"
-    )
+    n_sig = guidance.get_signal("n_atoms")
+    n_sig.guidance_scale = 5.0
+    print(f"\n  n_atoms signal active @ scale=5.0: {n_sig.guidance_scale > 0}")
+    n_sig.guidance_scale = 0.0
+    print(f"  n_atoms signal active @ scale=0.0: {n_sig.guidance_scale > 0}")
     print("--- End Diagnostic ---\n")
 
 
@@ -765,18 +754,22 @@ def eval_cfg(cfg: DictConfig):
     device = next(module.parameters()).device
     _print_cfg_diagnostics(module, state_dict, test_dl, device)
 
-    adapter = module.cfg_adapter
+    guidance = module.cfg_guidance
     atom_tokens = list(vocab.atom_tokens)
     module.predict_return_traj = True
 
+    natoms_signal = guidance.get_signal("n_atoms")
+    mw_signal = guidance.get_signal("mw")
+
     # ── sweep n_atoms guidance ──
-    if adapter._has_natoms_cfg:
+    if natoms_signal is not None:
         all_natoms_results: dict[tuple[float, int], dict] = {}
-        original_mw_scale = adapter.mw_cfg_guidance_scale
-        adapter.mw_cfg_guidance_scale = 0.0
+        original_mw_scale = mw_signal.guidance_scale if mw_signal is not None else None
+        if mw_signal is not None:
+            mw_signal.guidance_scale = 0.0
 
         for scale in GUIDANCE_SCALES:
-            adapter.natoms_cfg_guidance_scale = scale
+            natoms_signal.guidance_scale = scale
             print(f"\n{'=' * 60}")
             print(f"n_atoms guidance scale = {scale}")
             print(f"{'=' * 60}")
@@ -788,8 +781,7 @@ def eval_cfg(cfg: DictConfig):
                     end="",
                     flush=True,
                 )
-                module.predict_target_n_atoms_override = n_atoms
-                module.predict_target_mw_override = None
+                module.predict_overrides = {"n_atoms": n_atoms}
                 predictions = trainer.predict(
                     module,
                     dataloaders=test_dl,
@@ -813,7 +805,8 @@ def eval_cfg(cfg: DictConfig):
                         f"(n={result['n_molecules']})"
                     )
 
-        adapter.mw_cfg_guidance_scale = original_mw_scale
+        if mw_signal is not None and original_mw_scale is not None:
+            mw_signal.guidance_scale = original_mw_scale
         torch.save(
             all_natoms_results,
             "cfg_natoms_steering_results.pt",
@@ -825,16 +818,19 @@ def eval_cfg(cfg: DictConfig):
             output_path="cfg_natoms_steering_distributions.png",
         )
     else:
-        print("Skipping n_atoms sweep (natoms_encoder disabled)")
+        print("Skipping n_atoms sweep (natoms signal not configured)")
 
     # ── sweep MW guidance ──
-    if adapter._has_mw_cfg:
+    if mw_signal is not None:
         all_mw_results: dict[tuple[float, float], dict] = {}
-        original_natoms_scale = adapter.natoms_cfg_guidance_scale
-        adapter.natoms_cfg_guidance_scale = 0.0
+        original_natoms_scale = (
+            natoms_signal.guidance_scale if natoms_signal is not None else None
+        )
+        if natoms_signal is not None:
+            natoms_signal.guidance_scale = 0.0
 
         for scale in MW_GUIDANCE_SCALES:
-            adapter.mw_cfg_guidance_scale = scale
+            mw_signal.guidance_scale = scale
             print(f"\n{'=' * 60}")
             print(f"MW guidance scale = {scale}")
             print(f"{'=' * 60}")
@@ -846,8 +842,7 @@ def eval_cfg(cfg: DictConfig):
                     end="",
                     flush=True,
                 )
-                module.predict_target_n_atoms_override = None
-                module.predict_target_mw_override = mw
+                module.predict_overrides = {"mw": mw}
                 predictions = trainer.predict(
                     module,
                     dataloaders=test_dl,
@@ -871,7 +866,8 @@ def eval_cfg(cfg: DictConfig):
                         f"(n={result['n_molecules']})"
                     )
 
-        adapter.natoms_cfg_guidance_scale = original_natoms_scale
+        if natoms_signal is not None and original_natoms_scale is not None:
+            natoms_signal.guidance_scale = original_natoms_scale
         torch.save(
             all_mw_results,
             "cfg_mw_steering_results.pt",
@@ -882,17 +878,18 @@ def eval_cfg(cfg: DictConfig):
             output_path="cfg_mw_steering_distributions.png",
         )
     else:
-        print("Skipping MW sweep (mw_encoder disabled)")
+        print("Skipping MW sweep (mw signal not configured)")
 
     # ── sweep property guidance ──
-    if adapter._has_property_conditioning:
+    prop_signal = guidance.get_signal("properties")
+    if prop_signal is not None:
         # Derive property name(s) from the hydra config.
         try:
             property_names_list = list(cfg.cfg.cfg.property_names)
         except Exception:
             property_names_list = ["gap"]
         primary_prop = property_names_list[0] if property_names_list else "gap"
-        prop_indices: list[int] = adapter.property_indices or [4]  # 4 = gap fallback
+        prop_indices: list[int] = list(prop_signal.property_indices) or [4]
 
         # Collect target values from the test-data distribution.
         all_prop_vals: list[float] = []
@@ -925,11 +922,11 @@ def eval_cfg(cfg: DictConfig):
                 + ", ".join(str(v) for v in target_prop_values)
             )
 
-        original_prop_scale = adapter.cfg_guidance_scale
+        original_prop_scale = prop_signal.guidance_scale
         all_prop_results: dict[tuple[float, float], dict] = {}
 
         for scale in PROPERTY_GUIDANCE_SCALES:
-            adapter.cfg_guidance_scale = scale
+            prop_signal.guidance_scale = scale
             print(f"\n{'=' * 60}")
             print(f"Property ({primary_prop}) guidance scale = {scale}")
             print(f"{'=' * 60}")
@@ -967,7 +964,7 @@ def eval_cfg(cfg: DictConfig):
                         f"(n={n_valid}/{n_total})"
                     )
 
-        adapter.cfg_guidance_scale = original_prop_scale
+        prop_signal.guidance_scale = original_prop_scale
         torch.save(all_prop_results, "cfg_property_steering_results.pt")
         print("\nResults saved to cfg_property_steering_results.pt")
         plot_property_guidance_grid(

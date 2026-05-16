@@ -202,10 +202,9 @@ class EmpiricalNAtomsSampler(pl.Callback):
         idx = torch.multinomial(
             self.probs, num_samples=bs, replacement=True, generator=self.generator
         )
-        pl_module.predict_target_n_atoms_override = idx.to(
-            dtype=torch.long, device=pl_module.device
-        )
-        pl_module.predict_target_mw_override = None
+        pl_module.predict_overrides = {
+            "n_atoms": idx.to(dtype=torch.long, device=pl_module.device),
+        }
         self.sampled_targets.extend(int(x) for x in idx.tolist())
 
 
@@ -385,8 +384,7 @@ def _run_one_seed(
     trainer_kwargs["limit_predict_batches"] = n_predict_batches
 
     callbacks: list = []
-    adapter = module.cfg_adapter
-    if adapter._has_natoms_cfg:
+    if module.cfg_guidance.has_signal("n_atoms"):
         callbacks.append(
             EmpiricalNAtomsSampler(
                 n_atoms_distribution=distributions.n_atoms_distribution, seed=seed
@@ -401,8 +399,7 @@ def _run_one_seed(
     )
 
     module.predict_return_traj = True
-    module.predict_target_n_atoms_override = None
-    module.predict_target_mw_override = None
+    module.predict_overrides = None
 
     print(
         f"\n[seed={seed}] generating ~{n_mols} molecules "

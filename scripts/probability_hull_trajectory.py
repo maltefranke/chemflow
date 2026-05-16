@@ -103,25 +103,16 @@ def run_trajectory(
     model = module._get_model()
     model.eval()
 
-    cfg_adapter = module.cfg_adapter
+    guidance = module.cfg_guidance
     integrator = module.integrator
     step_sizes = integrator.get_time_steps(num_steps)
 
     t = torch.zeros(1, device=DEVICE)
     preds = None
 
-    cfg_inputs = {
-        "properties": None,
-        "property_drop_mask": None,
-        "target_n_atoms": (
-            torch.tensor([target_n_atoms], device=DEVICE)
-            if target_n_atoms is not None
-            else None
-        ),
-        "natoms_drop_mask": None,
-        "target_mw": None,
-        "mw_drop_mask": None,
-    }
+    overrides: dict = {}
+    if target_n_atoms is not None and guidance.has_signal("n_atoms"):
+        overrides["n_atoms"] = torch.tensor([target_n_atoms], device=DEVICE)
 
     frames = []
 
@@ -129,8 +120,8 @@ def run_trajectory(
         batch_id = mol_t.batch
         prev_preds = preds
 
-        preds = cfg_adapter.guided_predict(
-            model, mol_t, t, prev_preds, cfg_inputs,
+        preds = guidance.guided_predict(
+            model, mol_t, t, prev_preds, overrides,
         )
 
         gmm_pred = preds["gmm_head"]

@@ -171,3 +171,6 @@ logs/
 data/
 
 slurm-*.out
+
+submission_scripts/
+notebooks/

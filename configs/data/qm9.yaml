@@ -76,13 +76,13 @@ datamodule:
   n_augmentations: ${model.n_augmentations}
 
   num_workers:
-    train: 4
+    train: 10
     val: 0
     test: 0
     predict: 0
 
   batch_size:
-    train: 256
+    train: 1024
     val: 128
     test: 32
 

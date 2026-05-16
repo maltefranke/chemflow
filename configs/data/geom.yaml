@@ -16,7 +16,7 @@ allow_charged: true
 preprocessing:
   _target_: chemflow.dataset.preprocessing.Preprocessing
   _recursive_: false
-  root: ${data.root_path}/geom_new
+  root: ${data.root_path}/geom
   train_dataset: ${data.datamodule.datasets.train}
   atom_tokens_path: ${data.preprocessing.root}/processed/atom_tokens.txt
   edge_tokens_path: ${data.preprocessing.root}/processed/edge_tokens.txt
@@ -82,7 +82,7 @@ datamodule:
     predict: 0
 
   batch_size:
-    train: 256
+    train: 384
     val: 80
     test: 32
 
