@@ -430,7 +430,17 @@ class LightningModuleRates(pl.LightningModule):
 
             # 3. Handle insertions
             # Poisson NLL over all nodes (including those with zero insertions).
-            ins_loss_gmm = torch.tensor(0.0, device=self.device)
+            # DDP keep-alive: if this rank's batch has zero spawn nodes the GMM
+            # branch below is skipped. A bare `torch.tensor(0.0)` leaves
+            # ins_gmm_head with no gradient on that rank, so under
+            # find_unused_parameters_false the gradient all-reduce desyncs
+            # across ranks (hang on 4090 / NaN on A100). Initialise with the
+            # same 0-weighted head reference the requires_topology=False branch
+            # already uses, so the head is always in the autograd graph
+            # regardless of data. Overwritten by the real loss when spawns > 0.
+            ins_loss_gmm = 0.0 * sum(
+                p.sum() for p in self.model.ins_gmm_head.parameters()
+            )
             ins_loss_rate, ins_batch_mask = rate_loss(
                 ins_rate_pred,
                 mols_t.n_ins,
