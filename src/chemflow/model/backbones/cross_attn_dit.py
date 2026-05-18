@@ -1,5 +1,5 @@
 """
-Cross-attention DiT backbone for atom-wise + edge-wise conditioning.
+Cross-attention DiT backbone for atom-wise + edge-wise + graph-wise conditioning.
 
 * **Atom-wise (sequence-form) conditioning** is injected via gated
   cross-attention layers (Flamingo-style) inserted before each ``DiTBlock``
@@ -15,6 +15,15 @@ Cross-attention DiT backbone for atom-wise + edge-wise conditioning.
   conditioning is already 1-1 aligned with edges no attention is needed;
   cost is ``O(E · d_edge_ctx · d)``. The gate is initialised to 0 so the
   identity-on-init property is preserved.
+
+* **Graph-wise (property) conditioning** is injected via a tanh-gated residual
+  added to the AdaLN conditioning vector ``c`` right after ``self.dit.encode``:
+  ``c <- c + tanh(prop_gate) * prop_proj(target_props)``. This re-uses the
+  (possibly frozen) DiT's AdaLN modulators downstream — same Flamingo-style
+  ramp-in as the cross-attention path, so a freshly loaded checkpoint is
+  bit-identical to its unconditional baseline at init. ``target_props=None``
+  skips the injection entirely (free pass-through for callers that don't use
+  this path).
 
 Composition (not inheritance): :class:`CrossAttnDiTBackbone` *holds* a
 :class:`chemflow.model.backbones.dit.DiTBackbone` instance as ``self.dit`` and
@@ -198,6 +207,8 @@ class CrossAttnDiTBackbone(nn.Module):
         rbf_embedding_args: DictConfig | None = None,
         pair_bias_hidden_dim: int = 32,
         edge_ctx_dim: int | None = None,
+        prop_dim: int | None = None,
+        prop_hidden_dim: int = 256,
     ):
         super().__init__()
         self.ctx_dim = ctx_dim
@@ -236,6 +247,19 @@ class CrossAttnDiTBackbone(nn.Module):
             self.edge_cond_proj = None
             self.register_parameter("edge_cond_gate", None)
 
+        self.prop_dim = prop_dim
+        if prop_dim is not None:
+            self.prop_proj = nn.Sequential(
+                nn.Linear(prop_dim, prop_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(prop_hidden_dim, d_model),
+            )
+            self.prop_gate = nn.Parameter(torch.zeros(1))
+            self._init_prop_weights()
+        else:
+            self.prop_proj = None
+            self.register_parameter("prop_gate", None)
+
     def _init_edge_cond_weights(self):
         for module in self.edge_cond_proj.modules():
             if isinstance(module, nn.Linear):
@@ -243,6 +267,14 @@ class CrossAttnDiTBackbone(nn.Module):
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
         nn.init.zeros_(self.edge_cond_gate)
+
+    def _init_prop_weights(self):
+        for module in self.prop_proj.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        nn.init.zeros_(self.prop_gate)
 
     def forward(
         self,
@@ -257,10 +289,11 @@ class CrossAttnDiTBackbone(nn.Module):
         cond_token_mask: torch.Tensor | None = None,
         cond_token_attn_bias: torch.Tensor | None = None,
         edge_cond: torch.Tensor | None = None,
+        target_props: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Same as :meth:`DiTBackbone.forward` plus cross-attention and
-        edge-conditioning kwargs.
+        Same as :meth:`DiTBackbone.forward` plus cross-attention,
+        edge-conditioning, and graph-wise property-conditioning kwargs.
 
         Args:
             cond_tokens: (B, K, ctx_dim) per-token conditioning sequence. If
@@ -277,10 +310,34 @@ class CrossAttnDiTBackbone(nn.Module):
                 identity-equivalent to omitting it on a freshly loaded DiT.
                 Requires the backbone to have been constructed with
                 ``edge_ctx_dim`` set.
+            target_props: (B, prop_dim) graph-wise property conditioning. Added
+                as a tanh-gated residual to the AdaLN ``c`` vector. ``None``
+                skips the injection entirely (equivalent to gate=0).  Requires
+                the backbone to have been constructed with ``prop_dim`` set.
 
         See ``DiTBackbone.forward`` for the remaining arguments.
         """
         h, cu_seqlens, c = self.dit.encode(a_embed, x, cond, batch)
+
+        if target_props is not None:
+            if self.prop_proj is None:
+                raise ValueError(
+                    "target_props was provided but the backbone was constructed "
+                    "without prop_dim. Set prop_dim to enable property conditioning."
+                )
+            if target_props.shape[-1] != self.prop_dim:
+                raise ValueError(
+                    f"target_props last dim {target_props.shape[-1]} != "
+                    f"backbone prop_dim {self.prop_dim}."
+                )
+            if target_props.shape[0] != c.shape[0]:
+                raise ValueError(
+                    f"target_props batch dim {target_props.shape[0]} != "
+                    f"graph batch size {c.shape[0]}."
+                )
+            c = c + torch.tanh(self.prop_gate) * self.prop_proj(
+                target_props.to(dtype=c.dtype)
+            )
 
         if cond_tokens is not None and cond_token_attn_bias is not None:
             if cond_token_attn_bias.shape[-1] != max_seqlen:
@@ -370,6 +427,7 @@ class CrossAttnDiTBackboneWithHeads(DiTBackboneWithHeads):
         cond_token_mask: torch.Tensor | None = None,
         cond_token_attn_bias: torch.Tensor | None = None,
         edge_cond: torch.Tensor | None = None,
+        target_props: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         x, a, _c, e, edge_index, batch = mols_t.unpack()
 
@@ -394,6 +452,7 @@ class CrossAttnDiTBackboneWithHeads(DiTBackboneWithHeads):
             cond_token_mask=cond_token_mask,
             cond_token_attn_bias=cond_token_attn_bias,
             edge_cond=edge_cond,
+            target_props=target_props,
         )
 
         out_dict = self.heads(h, batch, e_out)

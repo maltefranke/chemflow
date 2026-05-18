@@ -132,6 +132,248 @@ def distance_and_class_based_assignment(
     return row_ind, col_ind
 
 
+def match_branches(
+    i_s: int,
+    i_t: int,
+    src_branches: list[list[int]],
+    tgt_branches: list[list[int]],
+    x0: np.ndarray,
+    x1: np.ndarray,
+) -> tuple[list[tuple[int, int]], list[int], list[int]]:
+    """Match substituent branches by spatial direction (post-Kabsch).
+
+    Cost between branches is the Euclidean distance of their root atoms.
+    Returns ``(matched, unmatched_src, unmatched_tgt)``.
+    """
+    n_s = len(src_branches)
+    n_t = len(tgt_branches)
+
+    if n_s == 0 and n_t == 0:
+        return [], [], []
+    if n_s == 0:
+        return [], [], list(range(n_t))
+    if n_t == 0:
+        return [], list(range(n_s)), []
+
+    cost = np.zeros((n_s, n_t), dtype=float)
+    for bi, branch_s in enumerate(src_branches):
+        for bj, branch_t in enumerate(tgt_branches):
+            cost[bi, bj] = np.linalg.norm(x0[branch_s[0]] - x1[branch_t[0]])
+
+    row_ind, col_ind = linear_sum_assignment(cost)
+    matched = list(zip(row_ind.tolist(), col_ind.tolist()))
+    matched_src = set(row_ind.tolist())
+    matched_tgt = set(col_ind.tolist())
+    unmatched_src = [i for i in range(n_s) if i not in matched_src]
+    unmatched_tgt = [j for j in range(n_t) if j not in matched_tgt]
+    return matched, unmatched_src, unmatched_tgt
+
+
+def substituent_constrained_assignment(
+    x0,
+    x1,
+    a0,
+    a1,
+    scaffold_pairs: list[tuple[int, int]],
+    src_subs: dict[int, list[list[int]]],
+    tgt_subs: dict[int, list[list[int]]],
+    c_move=1.0,
+    c_sub=10.0,
+    c_ins=5.0,
+    c_del=10.0,
+):
+    """Run per-scaffold-position OT on substituent branches with fixed scaffold pairs.
+
+    For each scaffold atom pair, runs independent partial OT on the
+    corresponding substituent groups. Non-scaffold atoms not in any
+    substituent group are processed as an unconstrained partial OT fallback.
+    """
+    N = x0.shape[0]
+    M = x1.shape[0]
+
+    valid_pairs = []
+    used_src = set()
+    used_tgt = set()
+    for i_s, i_t in scaffold_pairs:
+        if not (0 <= i_s < N and 0 <= i_t < M):
+            continue
+        if i_s in used_src or i_t in used_tgt:
+            continue
+        valid_pairs.append((i_s, i_t))
+        used_src.add(i_s)
+        used_tgt.add(i_t)
+
+    global_pairs: list[tuple[int, int]] = []
+
+    for i_s, i_t in valid_pairs:
+        global_pairs.append((i_s, i_t))
+    for i_s, i_t in valid_pairs:
+        global_pairs.append((N + i_t, M + i_s))
+
+    def _ot_branch(sub0, sub1):
+        n_u, m_u = len(sub0), len(sub1)
+        if n_u == 0 and m_u == 0:
+            return
+        if n_u == 0:
+            global_pairs.extend((N + j, j) for j in sub1)
+            return
+        if m_u == 0:
+            global_pairs.extend((i, M + i) for i in sub0)
+            return
+        row_u, col_u = distance_and_class_based_assignment(
+            x0[np.array(sub0)],
+            x1[np.array(sub1)],
+            a0[np.array(sub0)],
+            a1[np.array(sub1)],
+            c_move=c_move,
+            c_sub=c_sub,
+            c_ins=c_ins,
+            c_del=c_del,
+        )
+        for r_loc, c_loc in zip(row_u.tolist(), col_u.tolist(), strict=True):
+            r_glob = sub0[r_loc] if r_loc < n_u else N + sub1[r_loc - n_u]
+            c_glob = sub1[c_loc] if c_loc < m_u else M + sub0[c_loc - m_u]
+            global_pairs.append((r_glob, c_glob))
+
+    for i_s, i_t in valid_pairs:
+        src_branches = src_subs.get(i_s, [])
+        tgt_branches = tgt_subs.get(i_t, [])
+
+        matched, unmatched_src_b, unmatched_tgt_b = match_branches(
+            i_s, i_t, src_branches, tgt_branches, x0, x1
+        )
+
+        for bi_s, bi_t in matched:
+            sub0 = [a for a in src_branches[bi_s] if a not in used_src]
+            sub1 = [b for b in tgt_branches[bi_t] if b not in used_tgt]
+            used_src.update(sub0)
+            used_tgt.update(sub1)
+            _ot_branch(sub0, sub1)
+
+        for bi_s in unmatched_src_b:
+            sub0 = [a for a in src_branches[bi_s] if a not in used_src]
+            used_src.update(sub0)
+            global_pairs.extend((a, M + a) for a in sub0)
+
+        for bi_t in unmatched_tgt_b:
+            sub1 = [b for b in tgt_branches[bi_t] if b not in used_tgt]
+            used_tgt.update(sub1)
+            global_pairs.extend((N + b, b) for b in sub1)
+
+    unowned_src = [i for i in range(N) if i not in used_src]
+    unowned_tgt = [j for j in range(M) if j not in used_tgt]
+    n_u = len(unowned_src)
+    m_u = len(unowned_tgt)
+
+    if n_u > 0 and m_u > 0:
+        row_u, col_u = distance_and_class_based_assignment(
+            x0[np.array(unowned_src)],
+            x1[np.array(unowned_tgt)],
+            a0[np.array(unowned_src)],
+            a1[np.array(unowned_tgt)],
+            c_move=c_move,
+            c_sub=c_sub,
+            c_ins=c_ins,
+            c_del=c_del,
+        )
+        for r_loc, c_loc in zip(row_u.tolist(), col_u.tolist(), strict=True):
+            r_glob = (
+                unowned_src[r_loc] if r_loc < n_u else N + unowned_tgt[r_loc - n_u]
+            )
+            c_glob = (
+                unowned_tgt[c_loc] if c_loc < m_u else M + unowned_src[c_loc - m_u]
+            )
+            global_pairs.append((r_glob, c_glob))
+    elif n_u == 0 and m_u > 0:
+        global_pairs.extend((N + j, j) for j in unowned_tgt)
+    elif n_u > 0 and m_u == 0:
+        global_pairs.extend((i, M + i) for i in unowned_src)
+
+    if len(global_pairs) != N + M:
+        raise ValueError(
+            "Substituent-constrained assignment did not produce a complete matching "
+            f"(got {len(global_pairs)}, expected {N + M})."
+        )
+
+    row_ind = np.array([p[0] for p in global_pairs], dtype=int)
+    col_ind = np.array([p[1] for p in global_pairs], dtype=int)
+    if len(np.unique(row_ind)) != (N + M) or len(np.unique(col_ind)) != (N + M):
+        raise ValueError("Substituent-constrained assignment produced duplicate indices.")
+    return row_ind, col_ind
+
+
+def scaffold_based_assignment_single(
+    sample_mol: MoleculeData,
+    target_mol: MoleculeData,
+    scaffold_pairs: list[tuple[int, int]],
+    src_subs: dict[int, list[list[int]]] | None = None,
+    tgt_subs: dict[int, list[list[int]]] | None = None,
+    c_move: float = 1.0,
+    c_sub: float = 10.0,
+    c_ins: float = 5.0,
+    c_del: float = 10.0,
+    optimal_transport: str = "equivariant",
+) -> tuple[AugmentedMoleculeData, AugmentedMoleculeData]:
+    """Scaffold-aware partial OT alignment.
+
+    Locks the given ``scaffold_pairs`` (no MCS / SMILES computation) and
+    runs OT on the rest. When ``src_subs`` and ``tgt_subs`` are provided,
+    uses substituent-aware OT (branch-aware), otherwise falls back to
+    ``mcs_constrained_assignment``.
+
+    The first ``len(scaffold_pairs)`` rows of the resulting permutation are
+    the scaffold-fixed pairs, so a ``scaffold_mask`` of shape ``[N]`` with
+    ones at indices ``[:n_scaffold]`` correctly marks scaffold atoms in the
+    returned objects.
+    """
+    sample = AugmentedMoleculeData.from_molecule(sample_mol)
+    target = AugmentedMoleculeData.from_molecule(target_mol)
+
+    N, M = sample.x.shape[0], target.x.shape[0]
+    x0 = sample.x.detach().cpu().numpy()
+    x1 = target.x.detach().cpu().numpy()
+    a0 = sample.a.detach().cpu().numpy()
+    a1 = target.a.detach().cpu().numpy()
+
+    # Kabsch pre-alignment using the scaffold anchors.
+    if len(scaffold_pairs) >= 3:
+        s_idxs = [p[0] for p in scaffold_pairs]
+        t_idxs = [p[1] for p in scaffold_pairs]
+        pts_s = torch.tensor(x0[s_idxs], dtype=torch.float32)
+        pts_t = torch.tensor(x1[t_idxs], dtype=torch.float32)
+        R, t = rigid_alignment(pts_s, pts_t)
+        x0 = (torch.tensor(x0, dtype=torch.float32) @ R.T + t).numpy()
+        sample.x = torch.tensor(x0, dtype=sample.x.dtype, device=sample.x.device)
+
+    if src_subs is not None and tgt_subs is not None:
+        row_ind, col_ind = substituent_constrained_assignment(
+            x0, x1, a0, a1, scaffold_pairs, src_subs, tgt_subs,
+            c_move, c_sub, c_ins, c_del,
+        )
+    else:
+        row_ind, col_ind = mcs_constrained_assignment(
+            x0, x1, a0, a1, scaffold_pairs, c_move, c_sub, c_ins, c_del,
+        )
+
+    sample.pad(num_auxiliary=M).permute_nodes(row_ind)
+    target.pad(num_auxiliary=N).permute_nodes(col_ind)
+
+    sample_is_aux = sample.is_auxiliary.squeeze()
+    target_is_aux = target.is_auxiliary.squeeze()
+    valid_mask = ~(sample_is_aux & target_is_aux)
+
+    if optimal_transport == "equivariant":
+        match_mask = (~sample_is_aux) & (~target_is_aux)
+        if match_mask.sum() > 0:
+            R, t = rigid_alignment(sample.x[match_mask], target.x[match_mask])
+            sample.x = sample.x @ R.T + t
+
+    sample = filter_nodes(sample, valid_mask)
+    target = filter_nodes(target, valid_mask)
+
+    return sample, target
+
+
 def mcs_constrained_assignment(
     x0,
     x1,

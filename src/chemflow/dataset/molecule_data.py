@@ -471,7 +471,7 @@ def filter_nodes(
         batch = mol.batch[mask]
 
     if isinstance(mol, MoleculeBatch):
-        return MoleculeBatch(
+        result = MoleculeBatch(
             x=x,
             a=a,
             c=c,
@@ -479,6 +479,11 @@ def filter_nodes(
             edge_index=edge_index,
             batch=batch,
         )
+        if getattr(mol, "scaffold_mask", None) is not None:
+            result.scaffold_mask = mol.scaffold_mask[mask]
+        if getattr(mol, "target_props", None) is not None:
+            result.target_props = mol.target_props
+        return result
 
     elif isinstance(mol, AugmentedMoleculeData):
         return AugmentedMoleculeData(
@@ -523,6 +528,9 @@ def sort_nodes_by_batch(data):
 
     # Apply to batch last so we still have the original for reference if needed
     data.batch = data.batch[perm]
+
+    if getattr(data, "scaffold_mask", None) is not None:
+        data.scaffold_mask = data.scaffold_mask[perm]
 
     # 3. Remap edge_index
     if hasattr(data, "edge_index") and data.edge_index is not None:
@@ -678,6 +686,18 @@ def join_molecules_with_atoms(
         batch=new_batch,
     )
 
+    if getattr(mol, "scaffold_mask", None) is not None:
+        n_new = atoms.x.shape[0]
+        result.scaffold_mask = torch.cat(
+            [
+                mol.scaffold_mask,
+                torch.zeros(n_new, dtype=mol.scaffold_mask.dtype, device=device),
+            ]
+        )
+
+    if getattr(mol, "target_props", None) is not None:
+        result.target_props = mol.target_props
+
     result = sort_nodes_by_batch(result)
 
     return result
@@ -820,6 +840,18 @@ def join_molecules_with_predicted_edges(
         edge_index=combined_edge_index,
         batch=new_batch,
     )
+
+    if getattr(mol, "target_props", None) is not None:
+        result.target_props = mol.target_props
+
+    if getattr(mol, "scaffold_mask", None) is not None:
+        n_new = new_atoms.x.shape[0]
+        result.scaffold_mask = torch.cat(
+            [
+                mol.scaffold_mask,
+                torch.zeros(n_new, dtype=mol.scaffold_mask.dtype, device=device),
+            ]
+        )
 
     # Ensure this function correctly updates edge_index permutations!
     result = sort_nodes_by_batch(result)

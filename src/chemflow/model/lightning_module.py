@@ -259,6 +259,38 @@ class LightningModuleRates(pl.LightningModule):
     def forward(self, x):
         pass
 
+    # ------------------------------------------------------------------
+    # Hooks for fine-tuning subclasses (e.g. scaffold-decoration).
+    # Default implementations are no-ops so the base behaviour is unchanged.
+    # ------------------------------------------------------------------
+
+    def _node_loss_exclusion_mask(self, mols_t) -> torch.Tensor | None:
+        """Optional per-node bool mask: True = drop this node from
+        non-deletion / substitution / position losses.
+
+        Used by scaffold fine-tuning to exclude scaffold atoms from losses
+        that they can't meaningfully contribute to (since they are frozen
+        during inference). Default ``None`` keeps all nodes.
+        """
+        return None
+
+    def _apply_inference_edit_masks(
+        self,
+        mol_t,
+        do_sub_a_probs: torch.Tensor,
+        do_sub_e_probs: torch.Tensor,
+        do_del_probs: torch.Tensor,
+        num_ins_pred: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Optional hook to zero out edit probabilities at certain positions
+        before they reach the integrator. Default returns inputs unchanged.
+
+        Subclasses override to hard-zero del / sub-a / sub-e (scaffold-scaffold)
+        probabilities at scaffold positions while leaving insertions intact so
+        decorations can still grow.
+        """
+        return do_sub_a_probs, do_sub_e_probs, do_del_probs, num_ins_pred
+
     def shared_step(self, batch, batch_idx):
         self.model.set_training()
         # Define the training step logic here
@@ -307,6 +339,14 @@ class LightningModuleRates(pl.LightningModule):
         # supervising against them would bias predictions towards the prior distribution.
         to_delete_mask = mols_t.lambda_del > 0.0
         non_del_mask = ~to_delete_mask
+
+        # Optional per-node exclusion (e.g. scaffold atoms in fine-tuning).
+        # ``_excl_mask`` is True at nodes that should NOT contribute to non-del /
+        # substitution / position losses; defaults to ``None`` (no exclusion).
+        _excl_mask = self._node_loss_exclusion_mask(mols_t)
+        if _excl_mask is not None:
+            _excl_mask = _excl_mask.bool()
+            non_del_mask = non_del_mask & ~_excl_mask
 
         # NOTE take loss on all non-deletion nodes
         c_loss, c_batch_mask = class_loss(
@@ -357,6 +397,12 @@ class LightningModuleRates(pl.LightningModule):
         _src_idx = edge_infos["edge_index"][0][0]
         _dst_idx = edge_infos["edge_index"][0][1]
         non_del_edge_mask = ~to_delete_mask[_src_idx] & ~to_delete_mask[_dst_idx]
+        if _excl_mask is not None:
+            # Exclude edges where BOTH endpoints are excluded (matches inference
+            # masking: scaffold-scaffold edges can never change).
+            non_del_edge_mask = non_del_edge_mask & ~(
+                _excl_mask[_src_idx] & _excl_mask[_dst_idx]
+            )
 
         # NOTE As per EditFlow, only count class loss for edges that need modification
         do_sub_e_loss = do_action_loss(
@@ -773,6 +819,30 @@ class LightningModuleRates(pl.LightningModule):
 
     def predict_step(self, batch, batch_idx):
         return_traj = bool(getattr(self, "predict_return_traj", True))
+
+        # Optional graph-wise property override (e.g. QED delta for the
+        # molecule-optimization fine-tune). When set, replaces the
+        # dataset-supplied ``target_props`` on the input batch with a
+        # user-chosen value broadcast across the batch.
+        prop_override = getattr(self, "predict_target_props_override", None)
+        if prop_override is not None:
+            mol_t, mol_1 = batch
+            if isinstance(prop_override, (int, float)):
+                prop_override = torch.tensor(
+                    [[float(prop_override)]], dtype=torch.float
+                )
+            elif not torch.is_tensor(prop_override):
+                prop_override = torch.tensor(prop_override, dtype=torch.float)
+            if prop_override.dim() == 1:
+                prop_override = prop_override.unsqueeze(0)
+            B = int(mol_t.num_graphs)
+            if prop_override.shape[0] == 1 and B > 1:
+                prop_override = prop_override.expand(B, -1).contiguous()
+            mol_t.target_props = prop_override.to(
+                device=mol_t.x.device, dtype=mol_t.x.dtype
+            )
+            batch = (mol_t, mol_1)
+
         gen_mols = self.sample(
             batch,
             batch_idx,
@@ -927,22 +997,26 @@ class LightningModuleRates(pl.LightningModule):
             # Extract predictions
             x1_pred = preds["pos_head"]  # (N_total, D)
 
-            a_pred = preds["atom_type_head"]  # (N_total, num_classes)
+            # Pass logits directly to Categorical instead of softmax(...) -> probs.
+            # The softmax-then-Categorical(probs=) path produces rows that miss the
+            # simplex by ~1e-3 under fp16/bf16 (validate_args raises), and is also
+            # numerically lossy compared to the internal log-sum-exp path.
             T_a = 1.0
-            a_pred = F.softmax(a_pred / T_a, dim=-1)
-            a_pred = torch.distributions.Categorical(probs=a_pred).sample()
+            a_pred = torch.distributions.Categorical(
+                logits=(preds["atom_type_head"] / T_a).float()
+            ).sample()
 
-            c_pred = preds["charge_head"]  # (N_total, num_classes)
             T_c = 1.0
-            c_pred = F.softmax(c_pred / T_c, dim=-1)
-            c_pred = torch.distributions.Categorical(probs=c_pred).sample()
+            c_pred = torch.distributions.Categorical(
+                logits=(preds["charge_head"] / T_c).float()
+            ).sample()
 
             # NOTE: predictions are for full adj matrix.
             # NOTE: Will take triu and resymmetrize in integration step
             T_e = 1.0
-            e_pred = preds["edge_type_head"]
-            e_pred = F.softmax(e_pred / T_e, dim=-1)
-            e_pred = torch.distributions.Categorical(probs=e_pred).sample()
+            e_pred = torch.distributions.Categorical(
+                logits=(preds["edge_type_head"] / T_e).float()
+            ).sample()
 
             mol_1_pred = MoleculeBatch(
                 x=x1_pred,
@@ -967,6 +1041,15 @@ class LightningModuleRates(pl.LightningModule):
             if self.n_atoms_strategy == "fixed":
                 num_ins_pred = torch.zeros_like(num_ins_pred)
                 do_del_probs = torch.zeros_like(do_del_probs)
+
+            # Subclass hook: scaffold fine-tuning hard-zeros del / sub-a / sub-e
+            # (scaffold-scaffold) probs at scaffold positions, leaving insertions
+            # alone so decorations can still grow.
+            do_sub_a_probs, do_sub_e_probs, do_del_probs, num_ins_pred = (
+                self._apply_inference_edit_masks(
+                    mol_t, do_sub_a_probs, do_sub_e_probs, do_del_probs, num_ins_pred
+                )
+            )
 
             # Get insertion edge head if available
             ins_edge_head = getattr(model, "ins_edge_head", None)

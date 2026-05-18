@@ -1,0 +1,20 @@
+# @package _global_
+# QM9 **molecule optimization** fine-tune preset.
+#
+# Source and target are full molecules sharing a scaffold; the model
+# learns substituent-level edits. Pair this preset with a cross-attn DiT
+# fine-tune backbone that loads the pretrained unconditional checkpoint.
+#
+# For the bare-scaffold → full-molecule "scaffold decoration" task use
+# ``defaults=qm9_scaffold_decoration`` instead.
+#
+# Differences from qm9.yaml:
+#   - data   → qm9_scaffold (ScaffoldLightningDataModule, wrapper_kind=molecule_optimization)
+#   - model  → cross_attn_dit_finetune (pretrained + cross-attn + scaffold encoder)
+#   - cfg    → scaffold (no property CFG; scaffold conditioning goes through the backbone)
+defaults:
+  - core
+  - /data: qm9_scaffold
+  - /embeddings: qm9
+  - override /model: cross_attn_dit_finetune
+  - override /cfg: scaffold
