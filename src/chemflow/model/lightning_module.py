@@ -18,6 +18,7 @@ from external_code.egnn import unsorted_segment_mean
 
 from chemflow.dataset.molecule_data import MoleculeBatch
 from chemflow.dataset.vocab import Vocab, Distributions
+from chemflow.dataset.representation import Representation, neutral_charge_index
 from chemflow.utils.metrics import (
     calc_metrics_,
     MetricCollection,
@@ -88,6 +89,7 @@ class LightningModuleRates(pl.LightningModule):
         metrics: MetricCollection,
         stability_metrics: MetricCollection,
         distribution_metrics: MetricCollection | None = None,
+        batch_metrics: MetricCollection | None = None,
         n_atoms_strategy: str = "fixed",
         ins_noise_scale: float = 0.5,
         use_learnable_loss_weights: bool = False,
@@ -98,6 +100,7 @@ class LightningModuleRates(pl.LightningModule):
         allow_charged: bool = False,
         log_grad_norms_every_n_steps: int = 100,
         grad_norms_granularity: str = "component",
+        representation: str | Representation = Representation.GEOMETRIC_GRAPH,
     ):
         super().__init__()
 
@@ -113,6 +116,9 @@ class LightningModuleRates(pl.LightningModule):
         # Whether charged species are considered chemically valid for the dataset
         # (e.g. QM9 contains only neutral molecules; GEOM contains charged ones).
         self.allow_charged = allow_charged
+
+        # Controls mode-aware losses, validation metrics, and prediction cleanup.
+        self.representation = Representation(representation)
 
         # setup ema scheduler
         self.ema_decay = float(ema_decay)
@@ -140,6 +146,9 @@ class LightningModuleRates(pl.LightningModule):
         # Distribution metrics accumulate over the entire validation epoch so we
         # can log a single pooled KL and render marginal plots at epoch end.
         self.distribution_metrics = distribution_metrics
+        # Tensor-based metrics for non-topology modes. Updated in validation_step
+        # and computed/logged in on_validation_epoch_end.
+        self.batch_metrics = batch_metrics
 
         self.cfg_guidance = hydra.utils.instantiate(
             cfg_guidance,
@@ -349,15 +358,26 @@ class LightningModuleRates(pl.LightningModule):
             non_del_mask = non_del_mask & ~_excl_mask
 
         # NOTE take loss on all non-deletion nodes
-        c_loss, c_batch_mask = class_loss(
-            c_pred,
-            mols_1.c,
-            self.charge_token_weights,
-            non_del_mask,
-            mols_t.batch,
-            mols_t.num_graphs,
-            reduction="none",
-        )
+        if self.representation.requires_charges:
+            c_loss, c_batch_mask = class_loss(
+                c_pred,
+                mols_1.c,
+                self.charge_token_weights,
+                non_del_mask,
+                mols_t.batch,
+                mols_t.num_graphs,
+                reduction="none",
+            )
+        else:
+            # Pointcloud mode: c is the neutral dummy charge. Skip the loss
+            # entirely (no information content) but keep charge_head in the graph.
+            c_loss = (
+                torch.zeros(mols_t.num_graphs, 1, device=self.device)
+                + 0.0 * c_pred.sum()
+            )
+            c_batch_mask = torch.zeros(
+                mols_t.num_graphs, dtype=torch.bool, device=self.device
+            )
 
         # 1. Handle substitutions
 
@@ -382,48 +402,64 @@ class LightningModuleRates(pl.LightningModule):
             reduction="none",
         )
         #### Handle edge type substitutions
-        edge_infos = self.edge_aligner.align_edges(
-            source_group=(mols_t.edge_index, [e_pred, do_sub_e_head]),
-            target_group=(mols_1.edge_index, [mols_1.e, mols_t.lambda_e_sub]),
-        )
-        e_batch_triu = mols_t.batch[edge_infos["edge_index"][0][0]]
-        e_pred_triu, do_sub_e_head_triu = edge_infos["edge_attr"][:2]
-        e_target_triu, do_sub_e_target_triu = edge_infos["edge_attr"][2:]
+        if self.representation.requires_topology:
+            edge_infos = self.edge_aligner.align_edges(
+                source_group=(mols_t.edge_index, [e_pred, do_sub_e_head]),
+                target_group=(mols_1.edge_index, [mols_1.e, mols_t.lambda_e_sub]),
+            )
+            e_batch_triu = mols_t.batch[edge_infos["edge_index"][0][0]]
+            e_pred_triu, do_sub_e_head_triu = edge_infos["edge_attr"][:2]
+            e_target_triu, do_sub_e_target_triu = edge_infos["edge_attr"][2:]
 
-        # Supervise e_pred on all non-deletion edges (same fix as sub_a_class_loss).
-        # Edges where either endpoint is scheduled for deletion are excluded:
-        # their targets are frozen to the source value, so supervising e_pred on them
-        # would train it to predict prior edge types — the wrong signal.
-        _src_idx = edge_infos["edge_index"][0][0]
-        _dst_idx = edge_infos["edge_index"][0][1]
-        non_del_edge_mask = ~to_delete_mask[_src_idx] & ~to_delete_mask[_dst_idx]
-        if _excl_mask is not None:
-            # Exclude edges where BOTH endpoints are excluded (matches inference
-            # masking: scaffold-scaffold edges can never change).
-            non_del_edge_mask = non_del_edge_mask & ~(
-                _excl_mask[_src_idx] & _excl_mask[_dst_idx]
+            # Supervise e_pred on all non-deletion edges (same fix as sub_a_class_loss).
+            # Edges where either endpoint is scheduled for deletion are excluded:
+            # their targets are frozen to the source value, so supervising e_pred on them
+            # would train it to predict prior edge types — the wrong signal.
+            _src_idx = edge_infos["edge_index"][0][0]
+            _dst_idx = edge_infos["edge_index"][0][1]
+            non_del_edge_mask = ~to_delete_mask[_src_idx] & ~to_delete_mask[_dst_idx]
+            if _excl_mask is not None:
+                # Exclude edges where BOTH endpoints are excluded (matches inference
+                # masking: scaffold-scaffold edges can never change).
+                non_del_edge_mask = non_del_edge_mask & ~(
+                    _excl_mask[_src_idx] & _excl_mask[_dst_idx]
+                )
+
+            do_sub_e_loss = do_action_loss(
+                do_sub_e_head_triu,
+                do_sub_e_target_triu,
+                e_batch_triu,
+                mols_t.num_graphs,
+                reduction="none",
             )
 
-        # NOTE As per EditFlow, only count class loss for edges that need modification
-        do_sub_e_loss = do_action_loss(
-            do_sub_e_head_triu,
-            do_sub_e_target_triu,
-            e_batch_triu,
-            mols_t.num_graphs,
-            reduction="none",
-        )
-
-        # NOTE take loss on all non-deletion & to-be-substituted edges
-        to_sub_edge_mask = (non_del_edge_mask) & (do_sub_e_target_triu > 0.0)
-        sub_e_class_loss, sub_e_batch_mask = class_loss(
-            e_pred_triu,
-            e_target_triu,
-            self.edge_token_weights,
-            to_sub_edge_mask,
-            e_batch_triu,
-            mols_t.num_graphs,
-            reduction="none",
-        )
+            to_sub_edge_mask = (non_del_edge_mask) & (do_sub_e_target_triu > 0.0)
+            sub_e_class_loss, sub_e_batch_mask = class_loss(
+                e_pred_triu,
+                e_target_triu,
+                self.edge_token_weights,
+                to_sub_edge_mask,
+                e_batch_triu,
+                mols_t.num_graphs,
+                reduction="none",
+            )
+        else:
+            # Non-topology modes: runtime edges carry the inert <NO_BOND> token
+            # and lambda_e_sub is identically zero, so the supervised edge-loss
+            # path is both informationless and a DDP risk (the class_loss
+            # short-circuit would drop edge_type_head from the autograd graph).
+            # Use explicit graph-preserving dummies on the head outputs instead.
+            do_sub_e_loss = (
+                torch.zeros(mols_t.num_graphs, 1, device=self.device)
+                + 0.0 * do_sub_e_head.sum()
+            )
+            sub_e_class_loss = (
+                torch.zeros(mols_t.num_graphs, 1, device=self.device)
+                + 0.0 * e_pred.sum()
+            )
+            sub_e_batch_mask = torch.zeros(
+                mols_t.num_graphs, dtype=torch.bool, device=self.device
+            )
 
         do_del_loss = torch.tensor(0.0, device=self.device)
 
@@ -450,7 +486,17 @@ class LightningModuleRates(pl.LightningModule):
 
             # 3. Handle insertions
             # Poisson NLL over all nodes (including those with zero insertions).
-            ins_loss_gmm = torch.tensor(0.0, device=self.device)
+            # DDP keep-alive: if this rank's batch has zero spawn nodes the GMM
+            # branch below is skipped. A bare `torch.tensor(0.0)` leaves
+            # ins_gmm_head with no gradient on that rank, so under
+            # find_unused_parameters_false the gradient all-reduce desyncs
+            # across ranks (hang on 4090 / NaN on A100). Initialise with the
+            # same 0-weighted head reference the requires_topology=False branch
+            # already uses, so the head is always in the autograd graph
+            # regardless of data. Overwritten by the real loss when spawns > 0.
+            ins_loss_gmm = 0.0 * sum(
+                p.sum() for p in self.model.ins_gmm_head.parameters()
+            )
             ins_loss_rate, ins_batch_mask = rate_loss(
                 ins_rate_pred,
                 mols_t.n_ins,
@@ -488,9 +534,13 @@ class LightningModuleRates(pl.LightningModule):
                     self.atom_type_weights,
                     self.charge_token_weights,
                     reduction="none",
+                    include_c=self.representation.requires_charges,
                 )
 
                 ins_loss_gmm = gmm_loss.view(-1)
+                # Keep c_probs in the autograd graph for DDP when its term is dropped.
+                if not self.representation.requires_charges:
+                    ins_loss_gmm = ins_loss_gmm + 0.0 * gmm_dict_pred["c_probs"].sum()
 
                 # reduce the loss to per-graph level
                 ins_loss_gmm = unsorted_segment_mean(
@@ -507,7 +557,15 @@ class LightningModuleRates(pl.LightningModule):
                 spawn_idx = ins_targets.ins_edge_spawn_idx
                 existing_idx = ins_targets.ins_edge_existing_idx
 
-                if spawn_idx.numel() > 0 and existing_idx.numel() > 0:
+                # Insertion-edge prediction is only meaningful when chemical bonds
+                # are part of the representation. In non-topology modes, skip the
+                # head call entirely and emit a parameter-sum dummy so DDP still
+                # sees ins_edge_head as participating.
+                if (
+                    self.representation.requires_topology
+                    and spawn_idx.numel() > 0
+                    and existing_idx.numel() > 0
+                ):
                     ins_edge_non_del = (
                         non_del_mask[spawn_idx] & non_del_mask[existing_idx]
                     )
@@ -537,11 +595,10 @@ class LightningModuleRates(pl.LightningModule):
                                 mols_t.num_graphs,
                                 reduction="none",
                             )
-
-                # Compute ins -> ins edge loss
+                # Compute ins -> ins edge loss (gated on topology for the same reason).
                 spawn_src_ii = ins_targets.ins_to_ins_edge_spawn_src_idx
                 spawn_dst_ii = ins_targets.ins_to_ins_edge_spawn_dst_idx
-                if spawn_src_ii.numel() > 0:
+                if self.representation.requires_topology and spawn_src_ii.numel() > 0:
                     ii_non_del = non_del_mask[spawn_src_ii] & non_del_mask[spawn_dst_ii]
                     if ii_non_del.any():
                         edges_ii_src = ins_targets.ins_to_ins_edge_src_local_idx
@@ -574,6 +631,16 @@ class LightningModuleRates(pl.LightningModule):
                 # loss accumulator's mask path stays consistent with ndim-0 dummy losses.
                 ins_loss_e = torch.tensor(0.0, device=self.device)
                 ins_loss_e_ii = torch.tensor(0.0, device=self.device)
+
+            # In non-topology modes ins_edge_head is never invoked through the real
+            # supervised path, so attach a parameter-sum dummy to keep every one of
+            # its parameters in the autograd graph for DDP.
+            if not self.representation.requires_topology:
+                ins_edge_head_dummy = 0.0 * sum(
+                    p.sum() for p in self.model.ins_edge_head.parameters()
+                )
+                ins_loss_e = ins_loss_e + ins_edge_head_dummy
+                ins_loss_e_ii = ins_loss_e_ii + ins_edge_head_dummy
 
         else:
             # NOTE ins_rate_head, edge_head, gmm_head unused, throws an error (unused_params)
@@ -713,10 +780,26 @@ class LightningModuleRates(pl.LightningModule):
         # here so each validation cycle starts from a clean state.
         if self.distribution_metrics is not None:
             self.distribution_metrics.reset()
+        if self.batch_metrics is not None:
+            self.batch_metrics.reset()
 
     def validation_step(self, batch, batch_idx):
         self.model_ema.eval()
         batched_mols = self.sample(batch, batch_idx, return_traj=False)
+
+        # Tensor-based metrics consume the batch directly and work in every
+        # representation, so they always run. In non-topology modes runtime
+        # edges are <NO_BOND> placeholders rather than chemical bonds, so RDKit
+        # mol construction (and the metrics that depend on it) is skipped.
+        if (
+            self.batch_metrics is not None
+            and len(self.batch_metrics) > 0
+        ):
+            self.batch_metrics.update(batched_mols)
+
+        if not self.representation.requires_topology:
+            del batched_mols
+            return
 
         # List of MoleculeData objects
         mols = batched_mols.to_data_list()
@@ -776,6 +859,65 @@ class LightningModuleRates(pl.LightningModule):
             )
 
     def on_validation_epoch_end(self):
+        # Tensor-based metrics run in every representation; logged here so the
+        # values land in the same wandb step as everything else.
+        if (
+            self.batch_metrics is not None
+            and len(self.batch_metrics) > 0
+        ):
+            try:
+                batch_results = self.batch_metrics.compute()
+                self.log_dict(
+                    {
+                        f"val/batch/{key}": (
+                            v.detach() if isinstance(v, torch.Tensor) else v
+                        )
+                        for key, v in batch_results.items()
+                    },
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    logger=True,
+                    sync_dist=False,
+                )
+
+                # GT-vs-generated marginal plots. `sync_context()` is DDP-collective:
+                # *all* ranks must enter the block so each metric's local state is
+                # gathered across processes; only rank 0 then reads the synced
+                # histograms and logs (mirrors the RDKit-marginal pattern above).
+                with ExitStack() as stack:
+                    for m in self.batch_metrics.values():
+                        stack.enter_context(m.sync_context())
+
+                    if self.trainer.is_global_zero and hasattr(self.logger, "log_image"):
+                        from chemflow.utils.batch_metrics import (
+                            build_batch_marginal_plots,
+                        )
+                        figs = build_batch_marginal_plots(
+                            self.batch_metrics,
+                            atom_tokens=list(self.vocab.atom_tokens),
+                        )
+                        for name, fig in figs.items():
+                            try:
+                                self.logger.log_image(key=name, images=[fig])
+                            except Exception as e:
+                                print(f"Error logging {name}: {e}")
+                        if figs:
+                            import matplotlib.pyplot as plt
+
+                            for fig in figs.values():
+                                plt.close(fig)
+            except Exception as e:
+                print(f"Error in batch-metric epoch-end logging: {e}")
+            finally:
+                self.batch_metrics.reset()
+
+        # RDKit-mol-based distribution metrics only accumulate in topology mode
+        # (validation_step returns before mol construction otherwise). Falling
+        # through here in pointcloud mode would log phantom 0.0 KLs from
+        # never-updated histograms — guard explicitly.
+        if not self.representation.requires_topology:
+            return
         if self.distribution_metrics is None:
             return
 
@@ -849,6 +991,11 @@ class LightningModuleRates(pl.LightningModule):
             return_traj=return_traj,
             overrides=getattr(self, "predict_overrides", None),
         )
+
+        # In non-topology modes, runtime edges labeled <NO_BOND> are not chemical
+        # bonds. Skip the validity pipeline and return the raw samples.
+        if not self.representation.requires_topology:
+            return {"valid_mols": [], "invalid_mols": list(gen_mols), "invalid_mols_rdkit": []}
 
         # do quick validity check of the generated molecules
         # take the last state of the trajectory and check validity
@@ -1034,6 +1181,17 @@ class LightningModuleRates(pl.LightningModule):
             do_sub_e_probs = torch.sigmoid(preds["do_sub_e_head"].view(-1))
             do_del_probs = torch.sigmoid(preds["do_del_head"].view(-1))
 
+            # Inference-side clamping for heads that were gated at training. Those
+            # heads stayed at near-init weights and would otherwise produce random
+            # samples over the full canonical vocab. See refactor doc §4.8(e).
+            if not self.representation.requires_topology:
+                e_pred.fill_(0)            # all <NO_BOND>
+                do_sub_e_probs.zero_()     # never substitute an edge
+                mol_1_pred.e = e_pred
+            if not self.representation.requires_charges:
+                c_pred.fill_(neutral_charge_index(self.vocab))
+                mol_1_pred.c = c_pred
+
             # Extract insertion rate prediction (number of insertions per node)
             num_ins_pred = preds["ins_rate_head"].view(-1)
 
@@ -1051,8 +1209,22 @@ class LightningModuleRates(pl.LightningModule):
                 )
             )
 
-            # Get insertion edge head if available
-            ins_edge_head = getattr(model, "ins_edge_head", None)
+            # Get insertion edge head if available. In non-topology modes all
+            # inserted/runtime edges use the inert <NO_BOND> prior; pass None to
+            # take the integrator's fallback path instead of spending a head on
+            # outputs with no chemical meaning.
+            ins_edge_head = (
+                getattr(model, "ins_edge_head", None)
+                if self.representation.requires_topology
+                else None
+            )
+            # In non-charge modes c_probs is untrained — force inserted charges
+            # to the neutral index so they match training-time targets (§4.8(e)).
+            force_charge_idx = (
+                None
+                if self.representation.requires_charges
+                else neutral_charge_index(self.vocab)
+            )
             h_latent = preds["h_latent"]
 
             # Integrate one step (edge prediction happens inside if head is provided)
@@ -1068,6 +1240,7 @@ class LightningModuleRates(pl.LightningModule):
                 dt=step_size,
                 h_latent=h_latent,
                 ins_edge_head=ins_edge_head,
+                force_charge_idx=force_charge_idx,
             )
 
             # Drop per-step intermediates before the next forward pass so the peak

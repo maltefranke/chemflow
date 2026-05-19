@@ -249,6 +249,7 @@ class RateIntegrator:
         eps: float = 1e-6,
         h_latent: torch.Tensor = None,
         ins_edge_head=None,
+        force_charge_idx: int | None = None,
     ) -> MoleculeBatch:
         """
         Integrate one step of the stochastic process for GNN models.
@@ -482,6 +483,12 @@ class RateIntegrator:
                 # Mirrors the e_t_ins renoising done a few blocks below.
                 if self.renoise_insertions:
                     new_atoms = self._renoise_insertions(new_atoms, t_ins)
+
+                # In non-charge modes the c_probs sub-head is untrained at this
+                # call site; clamp inserted charges to the neutral index so they
+                # match what training saw (all targets were neutral_idx).
+                if force_charge_idx is not None:
+                    new_atoms.c = torch.full_like(new_atoms.c, force_charge_idx)
 
                 new_atoms.batch = batch_id[do_ins_valid]
 

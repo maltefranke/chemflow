@@ -83,59 +83,47 @@ def typed_gmm_loss(
     class_weights_a,
     class_weights_c,
     reduction="mean",
+    include_c: bool = True,
 ):
     """
     Computes the NLL loss using the get_typed_gmm_components helper.
 
-    Strategy:
-    1. Filter invalid nodes.
-    2. Expand the global GMM params (B) to node-level params (N) using indices.
-    3. Use the helper to create distributions of shape [N, 1, K].
-    4. Compute loss.
+    When ``include_c=False`` the joint log-probability omits the charge term
+    (non-charge modes; see refactor doc §4.8(a)). The c sub-head's outputs
+    still need a DDP-safe dummy elsewhere — see the lightning module.
     """
 
-    # --- 3. Create Distributions using Helper ---
-    # The helper treats the first dimension as "Batch".
-    # Here, our "Batch" is N_valid.
-    # Returns distributions with batch_shape=[N, 1, K]
-
+    # Create component distributions. The helper treats the first dimension as
+    # batch; here that "batch" is the valid insertion targets, so returned
+    # distributions have batch_shape [N, 1, K].
     mix_dist, x_dist, a_dist, c_dist = get_typed_gmm_components(gmm_output)
 
     N = mix_dist.logits.shape[0]
     D = target_x.shape[-1]
 
+    # Spatial target: [N, D] -> [N, 1, 1, D], broadcasting against K components.
     target_x = target_x.view(N, 1, 1, -1)
 
-    # --- 4. Compute Log-Probabilities ---
-
-    # A. Spatial Log-Prob
-    # Target: [N, 3] -> [N, 1, 3] to broadcast against dist [N, 1, K]
-    log_prob_x = x_dist.log_prob(target_x) / D  # Result: [N, 1, K]
-
-
-    # B. Type Log-Prob
-    # TODO maybe we have to implement a weighted log_prob for the types
-    # Target: [N] -> [N, 1] to broadcast against dist [N, 1, K]
+    # Per-component log-probabilities, all shaped [N, 1, K].
+    log_prob_x = x_dist.log_prob(target_x) / D
     log_prob_a = _type_log_prob_from_ce(
         target_a, a_dist, class_weights_a, "target_a", N
     )
-    log_prob_c = _type_log_prob_from_ce(
-        target_c, c_dist, class_weights_c, "target_c", N
-    )
+    # The mixture distribution already stores normalized log pi for each component.
+    log_prob_mix = mix_dist.logits
 
-    # C. Mixture Log-Prob
-    # Categorical log_prob expects values, but here we only need log(pi)
-    # for each mixture component before log-sum-exp over K.
-    # The helper returns a Categorical, so we can just grab the logits (normalized).
-    log_prob_mix = mix_dist.logits  # Result: [N, 1, K]
+    # Joint log-prob before marginalizing over mixture components. In non-charge
+    # modes, omit the c term rather than training on neutral dummy targets.
+    log_joint = log_prob_mix + log_prob_x + log_prob_a
+    if include_c:
+        log_prob_c = _type_log_prob_from_ce(
+            target_c, c_dist, class_weights_c, "target_c", N
+        )
+        log_joint = log_joint + log_prob_c
 
-    # --- 5. Combine spatial + type + mixture terms ---
-    log_joint = log_prob_mix + log_prob_x + log_prob_a + log_prob_c
-
-    # LogSumExp over components (dim=-1): [N, 1]
+    # Marginalize over components: log sum_k p(k, x, a[, c]).
     log_likelihood = torch.logsumexp(log_joint, dim=-1)
 
-    # Average over nodes
     if reduction == "mean":
         nll = -torch.mean(log_likelihood)
     elif reduction == "sum":
@@ -235,9 +223,16 @@ def class_loss(
         ins_e : class_loss is applied to all edges between ins & non-del nodes.
         ins_e_ii: class_loss is applied to all edges between ins & ins nodes.
     """
-    # 1. Safety check for empty actions to prevent NaNs or crashes
+    # 1. Safety check for empty actions to prevent NaNs or crashes.
+    # The 0.0 * class_pred.sum() term keeps class_pred in the autograd graph so
+    # that any downstream head depending on this path still receives a populated
+    # (zero-valued) gradient — required for DDP, which rejects parameters with
+    # grad=None after backward.
     if not do_action_mask.any():
-        zero_loss = torch.zeros(num_graphs, 1, device=class_pred.device)
+        zero_loss = (
+            torch.zeros(num_graphs, 1, device=class_pred.device)
+            + 0.0 * class_pred.sum()
+        )
         zero_mask = torch.zeros(
             num_graphs, dtype=torch.bool, device=class_pred.device
         )
