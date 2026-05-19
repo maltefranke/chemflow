@@ -126,6 +126,7 @@ def _setup_eval_components(cfg, predict_batch_size: int):
         charge_tokens=list(vocab.charge_tokens),
         allow_charged=allow_charged,
         distributions=loss_weight_distributions,
+        representation=representation,
     )
 
     tw = cfg.model.token_weighting
@@ -394,7 +395,6 @@ def _compute_rdkit_metrics(
     rdkit_mols: list,
     metrics,
     stability_metrics,
-    distribution_metrics,
     *,
     run_posebusters: bool,
 ) -> dict:
@@ -419,14 +419,8 @@ def _compute_rdkit_metrics(
         for k, v in stability_metrics.compute().items():
             results[k] = v.item() if isinstance(v, torch.Tensor) else v
     else:
-        for key in ("atom-stability", "molecule-stability"):
+        for key in ("rdkit-atom-stability", "rdkit-molecule-stability"):
             results[key] = float("nan")
-
-    if distribution_metrics is not None:
-        distribution_metrics.reset()
-        distribution_metrics.update(rdkit_mols)
-        for k, v in distribution_metrics.compute().items():
-            results[k] = v.item() if isinstance(v, torch.Tensor) else v
 
     if run_posebusters:
         try:
@@ -441,8 +435,15 @@ def _compute_rdkit_metrics(
     }
 
 
-def _compute_batch_metrics(trajectories: list, batch_metrics) -> dict:
-    if batch_metrics is None or len(batch_metrics) == 0 or not trajectories:
+def _compute_batch_metrics(
+    trajectories: list, batch_metrics, distribution_metrics=None
+) -> dict:
+    """Tensor-native metrics, computed from the generated batch in every
+    representation. Covers both the geometric ``batch_metrics`` (``batch/``
+    prefixed) and the distribution KLs (unprefixed)."""
+    have_batch = batch_metrics is not None and len(batch_metrics) > 0
+    have_dist = distribution_metrics is not None and len(distribution_metrics) > 0
+    if (not have_batch and not have_dist) or not trajectories:
         return {}
 
     final_mols = [_final_mol(t) for t in trajectories if _final_mol(t) is not None]
@@ -450,12 +451,19 @@ def _compute_batch_metrics(trajectories: list, batch_metrics) -> dict:
         return {}
 
     batch = MoleculeBatch.from_data_list(final_mols)
-    batch_metrics.reset()
-    batch_metrics.update(batch)
     out = {}
-    for k, v in batch_metrics.compute().items():
-        out[f"batch/{k}"] = float(v.item() if isinstance(v, torch.Tensor) else v)
-    batch_metrics.reset()
+    if have_batch:
+        batch_metrics.reset()
+        batch_metrics.update(batch)
+        for k, v in batch_metrics.compute().items():
+            out[f"batch/{k}"] = float(v.item() if isinstance(v, torch.Tensor) else v)
+        batch_metrics.reset()
+    if have_dist:
+        distribution_metrics.reset()
+        distribution_metrics.update(batch)
+        for k, v in distribution_metrics.compute().items():
+            out[k] = float(v.item() if isinstance(v, torch.Tensor) else v)
+        distribution_metrics.reset()
     return out
 
 
@@ -554,7 +562,9 @@ def _run_one_seed(
         print(f"[seed={seed}] saved n_atoms trajectories to: {natoms_traj_path}")
 
     seed_metrics: dict[str, float] = {}
-    seed_metrics.update(_compute_batch_metrics(all_trajs, batch_metrics))
+    seed_metrics.update(
+        _compute_batch_metrics(all_trajs, batch_metrics, distribution_metrics)
+    )
 
     if representation.requires_topology:
         rdkit_mols = _trajectories_to_rdkit(all_trajs, vocab)
@@ -567,7 +577,6 @@ def _run_one_seed(
                 rdkit_mols=rdkit_mols,
                 metrics=metrics,
                 stability_metrics=stability_metrics,
-                distribution_metrics=distribution_metrics,
                 run_posebusters=run_posebusters,
             )
         )

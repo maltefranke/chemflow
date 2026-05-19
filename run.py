@@ -123,6 +123,7 @@ def setup(cfg: DictConfig):
         charge_tokens=list(vocab.charge_tokens),
         allow_charged=allow_charged,
         distributions=loss_weight_distributions,
+        representation=representation,
     )
 
     # Instantiate module

@@ -79,7 +79,7 @@ def load_model(cfg, vocab, distributions, token_prior, ckpt_path):
         type_loss_token_weights=tw.type_loss_token_weights,
     )
 
-    metrics, stability_metrics, distribution_metrics = init_metrics(
+    metrics, stability_metrics, distribution_metrics, batch_metrics = init_metrics(
         train_smiles=None,
         target_n_atoms_distribution=distributions.n_atoms_distribution,
         atom_type_distribution=distributions.atom_type_distribution,
@@ -102,6 +102,7 @@ def load_model(cfg, vocab, distributions, token_prior, ckpt_path):
         metrics=metrics,
         stability_metrics=stability_metrics,
         distribution_metrics=distribution_metrics,
+        batch_metrics=batch_metrics,
     )
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)

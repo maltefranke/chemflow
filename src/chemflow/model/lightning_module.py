@@ -20,6 +20,7 @@ from chemflow.dataset.molecule_data import MoleculeBatch
 from chemflow.dataset.vocab import Vocab, Distributions
 from chemflow.dataset.representation import Representation, neutral_charge_index
 from chemflow.utils.metrics import (
+    calc_atom_stabilities,
     calc_metrics_,
     MetricCollection,
     calc_posebusters_metrics,
@@ -776,26 +777,27 @@ class LightningModuleRates(pl.LightningModule):
         )
 
     def on_validation_epoch_start(self):
-        # Distribution metrics accumulate histograms across the epoch; reset them
-        # here so each validation cycle starts from a clean state.
+        # Tensor-style collections accumulate raw counts/histograms across the
+        # epoch so the reported metric is computed from the full epoch's atoms
+        # (not a per-batch rate averaged with the wrong weighting).
         if self.distribution_metrics is not None:
             self.distribution_metrics.reset()
         if self.batch_metrics is not None:
             self.batch_metrics.reset()
+        if self.stability_metrics is not None:
+            self.stability_metrics.reset()
 
     def validation_step(self, batch, batch_idx):
         self.model_ema.eval()
         batched_mols = self.sample(batch, batch_idx, return_traj=False)
 
-        # Tensor-based metrics consume the batch directly and work in every
-        # representation, so they always run. In non-topology modes runtime
-        # edges are <NO_BOND> placeholders rather than chemical bonds, so RDKit
-        # mol construction (and the metrics that depend on it) is skipped.
-        if (
-            self.batch_metrics is not None
-            and len(self.batch_metrics) > 0
-        ):
+        # Tensor / distribution metrics consume the batch directly and work in
+        # every representation, so they always run — no early return. Only the
+        # RDKit-mol chemistry metrics below require real topology.
+        if self.batch_metrics is not None and len(self.batch_metrics) > 0:
             self.batch_metrics.update(batched_mols)
+        if self.distribution_metrics is not None and len(self.distribution_metrics) > 0:
+            self.distribution_metrics.update(batched_mols)
 
         if not self.representation.requires_topology:
             del batched_mols
@@ -836,9 +838,21 @@ class LightningModuleRates(pl.LightningModule):
             batch_size=n_mols,
         )
 
-        # Accumulate marginal histograms across the epoch without resetting.
-        if self.distribution_metrics is not None:
-            self.distribution_metrics.update(rdkit_mols)
+        # RDKit per-atom stability — fed precomputed bools (not RDKit mols).
+        # Accumulate only here; compute/log/reset happens in
+        # on_validation_epoch_end so the rate is weighted by atom count across
+        # the full epoch, not molecule count per batch.
+        if self.stability_metrics is not None and len(self.stability_metrics) > 0:
+            stabilities = []
+            for mol in rdkit_mols:
+                if mol is None:
+                    continue
+                try:
+                    stabilities.append(calc_atom_stabilities(mol))
+                except Exception:
+                    continue
+            if stabilities:
+                self.stability_metrics.update(stabilities)
 
         try:
             # pb_metrics = calc_posebusters_metrics(rdkit_mols)
@@ -859,6 +873,27 @@ class LightningModuleRates(pl.LightningModule):
             )
 
     def on_validation_epoch_end(self):
+        # RDKit per-atom stability — accumulated across the full epoch in
+        # validation_step; compute the atom-weighted rate once here.
+        if self.stability_metrics is not None and len(self.stability_metrics) > 0:
+            try:
+                stab_results = self.stability_metrics.compute()
+                self.log_dict(
+                    {
+                        f"val/{k}": (v.detach() if isinstance(v, torch.Tensor) else v)
+                        for k, v in stab_results.items()
+                    },
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    logger=True,
+                    sync_dist=False,
+                )
+            except Exception as e:
+                print(f"Error in stability-metric epoch-end logging: {e}")
+            finally:
+                self.stability_metrics.reset()
+
         # Tensor-based metrics run in every representation; logged here so the
         # values land in the same wandb step as everything else.
         if (
@@ -890,7 +925,7 @@ class LightningModuleRates(pl.LightningModule):
                         stack.enter_context(m.sync_context())
 
                     if self.trainer.is_global_zero and hasattr(self.logger, "log_image"):
-                        from chemflow.utils.batch_metrics import (
+                        from chemflow.utils.metrics.plotting import (
                             build_batch_marginal_plots,
                         )
                         figs = build_batch_marginal_plots(
@@ -912,13 +947,10 @@ class LightningModuleRates(pl.LightningModule):
             finally:
                 self.batch_metrics.reset()
 
-        # RDKit-mol-based distribution metrics only accumulate in topology mode
-        # (validation_step returns before mol construction otherwise). Falling
-        # through here in pointcloud mode would log phantom 0.0 KLs from
-        # never-updated histograms — guard explicitly.
-        if not self.representation.requires_topology:
-            return
-        if self.distribution_metrics is None:
+        # Distribution KLs are tensor-native and accumulate in every
+        # representation; edge/charge KLs are only registered when meaningful
+        # (see init_metrics), so an empty/absent collection just no-ops.
+        if self.distribution_metrics is None or len(self.distribution_metrics) == 0:
             return
 
         try:

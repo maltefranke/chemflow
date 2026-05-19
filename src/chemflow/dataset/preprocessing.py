@@ -9,7 +9,7 @@ from torch_geometric.utils import to_dense_adj
 
 from chemflow.dataset.vocab import Distributions, Vocab
 from chemflow.dataset.representation import neutral_charge_index
-from chemflow.utils.batch_metrics import (
+from chemflow.utils.metrics.tensor import (
     DIST_N_BINS,
     RG_N_BINS,
     accumulate_pairwise_distance_hist,
