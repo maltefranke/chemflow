@@ -100,7 +100,7 @@ class LightningModuleRates(pl.LightningModule):
         allow_charged: bool = False,
         log_grad_norms_every_n_steps: int = 100,
         grad_norms_granularity: str = "component",
-        representation: str | Representation = Representation.GEOMETRIC_GRAPH,
+        representation: str | Representation = Representation.MOLECULE,
     ):
         super().__init__()
 

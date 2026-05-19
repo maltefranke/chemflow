@@ -2,8 +2,8 @@
 
 ## Put your callback args here
 callbacks:
-  monitor_metric: ${if:${eq:${representation},geometric_graph},val/validity,val/batch/pair_dist_l1}
-  monitor_metric_mode: ${if:${eq:${representation},geometric_graph},max,min}
+  monitor_metric: ${if:${oc.eval:"'${representation}' in ('geometric_graph', 'molecule')"},val/validity,val/batch/pair_dist_l1}
+  monitor_metric_mode: ${if:${oc.eval:"'${representation}' in ('geometric_graph', 'molecule')"},max,min}
 
   #   model_checkpoints         -> best-by-metric (top-1, monitored)
   #   every_n_epochs_checkpoint -> latest (no monitor; overwrites every epoch)

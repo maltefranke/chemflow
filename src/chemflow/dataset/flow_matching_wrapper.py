@@ -36,7 +36,7 @@ class FlowMatchingDatasetWrapper(Dataset):
         distributions,
         interpolator,
         vocab: Vocab,
-        representation: str | Representation = Representation.GEOMETRIC_GRAPH,
+        representation: str | Representation = Representation.MOLECULE,
         n_atoms_strategy="flexible",
         time_dist=None,
         stage="train",

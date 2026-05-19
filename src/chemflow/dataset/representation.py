@@ -3,7 +3,8 @@
 Declares what subset of (x, a, c, edge_index, e) a run should train on:
 - POINTCLOUD: x, a only (c and edges projected to dummies)
 - CHARGED_POINTCLOUD: x, a, c (edges projected to dummies)
-- GEOMETRIC_GRAPH: full chemistry (no projection)
+- GEOMETRIC_GRAPH: x, a, edge_index, e (charges projected to neutral dummies)
+- MOLECULE: full chemistry (no projection)
 
 A dataset's Capabilities declares what fields it provides. ``validate_representation``
 checks the requested mode is achievable by the dataset.
@@ -30,14 +31,21 @@ class Representation(str, Enum):
     POINTCLOUD = "pointcloud"
     CHARGED_POINTCLOUD = "charged_pointcloud"
     GEOMETRIC_GRAPH = "geometric_graph"
+    MOLECULE = "molecule"
 
     @property
     def requires_charges(self) -> bool:
-        return self != Representation.POINTCLOUD
+        return self in {
+            Representation.CHARGED_POINTCLOUD,
+            Representation.MOLECULE,
+        }
 
     @property
     def requires_topology(self) -> bool:
-        return self == Representation.GEOMETRIC_GRAPH
+        return self in {
+            Representation.GEOMETRIC_GRAPH,
+            Representation.MOLECULE,
+        }
 
 
 @dataclass(frozen=True)
@@ -89,11 +97,8 @@ def project_molecule_to_representation(
     - non-topology modes: ``edge_index = fully_connected(N)``, ``e = zeros(E)``
       (token 0 of canonical edge vocab is ``<NO_BOND>`` by construction).
     - non-charge modes: ``c = neutral_idx(N)`` (canonical index of ``"0"``).
-    - geometric_graph: unchanged.
+    - molecule: unchanged.
     """
-    if mode == Representation.GEOMETRIC_GRAPH:
-        return mol
-
     n = mol.x.shape[0]
     device = mol.x.device
 
@@ -119,9 +124,6 @@ def project_distributions_to_representation(
     and ``charge_type_distribution`` to one-hot at the neutral charge index in
     non-charge modes. Other fields pass through untouched.
     """
-    if mode == Representation.GEOMETRIC_GRAPH:
-        return distributions
-
     new = replace(distributions)
     if not mode.requires_topology:
         new.edge_type_distribution = F.one_hot(

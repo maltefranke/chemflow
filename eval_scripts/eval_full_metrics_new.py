@@ -21,7 +21,7 @@ Examples
 
     python eval_scripts/eval_full_metrics_new.py \
         --checkpoint outputs/qm9/uncond/2026-05-13/q0vvoie3/every_n_epochs/epoch=91-step=8924.ckpt \
-        --overrides data=qm9 model=semla cfg=uncond representation=geometric_graph
+        --overrides data=qm9 model=semla cfg=uncond representation=molecule
 """
 
 from __future__ import annotations
