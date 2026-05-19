@@ -7,8 +7,12 @@ integrator:
   # strategy used for sampling time during **integration**
   # NOTE can be different from the time strategy used for the model (see below)
   time_strategy: log # "linear" or "log"
-  num_integration_steps: 200
+  num_integration_steps: 100
   ins_noise_scale: ${data.ins_noise_scale}
+  # When true, freshly-inserted nodes are pushed to the t+dt marginal (kappa-mix
+  # on a/c, (1-t)*ins_noise on x) to match training. When false they enter at
+  # the model's clean GMM prediction. Mirrors the existing inserted-edge renoise.
+  renoise_insertions: true
   del_schedule: ${data.interpolator.del_schedule}
   ins_schedule: ${data.interpolator.ins_schedule}
   sub_schedule: ${data.interpolator.sub_schedule}

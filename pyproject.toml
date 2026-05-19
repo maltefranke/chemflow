@@ -10,15 +10,29 @@ dependencies = [
     "pandas>=2.3.3",
     "rdkit>=2025.9.1",
     "scipy>=1.15.0",
-    #"torch>=2.8.0 , <2.9.0",
+    "torch>=2.8.0 , <2.8.1",
     "torch-geometric>=2.7.0",
+    "torch-cluster",
     "wandb>=0.22.2",
     "posebusters>=0.6.0",
-    "flash-attn>=2.8.3, <2.8.4"
+    "flash-attn>=2.8.3, <2.8.4",
+    "matplotlib>=3.10.8",
+    "lmdb>=2.2.0",
+    "py3dmol>=2.5.4",
+    "ipykernel>=7.2.0",
 ]
 
- [tool.uv.extra-build-dependencies]
-      torch-cluster = ["torch"]
+[tool.uv.extra-build-dependencies]
+torch-cluster = ["torch"]
+
+[[tool.uv.index]]
+name = "pyg"
+url = "https://data.pyg.org/whl/torch-2.8.0+cu128.html"
+format = "flat"
+explicit = true
+
+[tool.uv.sources]
+torch-cluster = { index = "pyg" }
 
 [build-system]
 requires = ["hatchling"]

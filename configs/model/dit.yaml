@@ -11,18 +11,7 @@ rotate: true
 n_augmentations: 1
 
 
-integrator:
-  _target_: chemflow.flow_matching.integration.RateIntegrator
-  vocab: ${data.vocab}
-  distributions: None
-  gmm_params: ${model.gmm_params}
-  n_atoms_strategy: ${data.n_atoms_strategy}
-  time_strategy: log
-  num_integration_steps: 100
-  del_schedule: ${data.interpolator.del_schedule}
-  ins_schedule: ${data.interpolator.ins_schedule}
-  sub_schedule: ${data.interpolator.sub_schedule}
-  sub_e_schedule: ${data.interpolator.sub_e_schedule}
+integrator: ${integrator.integrator}
 
 beta_sched:
   _target_: torch.distributions.Beta
