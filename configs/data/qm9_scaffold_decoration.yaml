@@ -1,0 +1,35 @@
+# QM9 data config for the **scaffold decoration** task.
+#
+# Source is the bare Bemis-Murcko scaffold of each target molecule (just
+# the scaffold heavy atoms, no decorations); target is the full molecule.
+# The model learns to grow the molecule by inserting decoration atoms
+# around the fixed scaffold. For the full-molecule → full-molecule
+# "molecule optimization" task use configs/data/qm9_scaffold.yaml.
+#
+# Inherits from configs/data/qm9.yaml and overrides:
+#   - datamodule._target_ → ScaffoldLightningDataModule
+#   - wrapper_kind = "scaffold_decoration"
+#
+# Notes:
+#   - QED-delta conditioning is meaningless here (a bare scaffold has no
+#     QED), so compute_qed_delta is forced off.
+#   - The model config should NOT set ``model.backbone.prop_dim`` for this
+#     task — there's no per-graph property tensor in the batch.
+#
+# The scaffold cache is shared with qm9_scaffold.yaml (same directory).
+defaults:
+  - qm9
+  - _self_
+
+scaffold_groups_dir: ${data.root_path}/qm9/processed/scaffold_groups
+wrapper_kind: scaffold_decoration
+# assignment_method is unused for scaffold_decoration but kept for schema parity.
+assignment_method: mcs_constrained
+compute_qed_delta: false
+
+datamodule:
+  _target_: chemflow.dataset.scaffold_datamodule.ScaffoldLightningDataModule
+  scaffold_groups_dir: ${data.scaffold_groups_dir}
+  wrapper_kind: ${data.wrapper_kind}
+  assignment_method: ${data.assignment_method}
+  compute_qed_delta: ${data.compute_qed_delta}

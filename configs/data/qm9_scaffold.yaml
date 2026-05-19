@@ -1,0 +1,32 @@
+# QM9 data config for the **molecule optimization** task.
+#
+# Source and target are both full molecules sharing the same Bemis-Murcko
+# scaffold; the model learns to edit substituents while preserving the
+# scaffold. For the bare-scaffold growth task (build a molecule from just
+# its scaffold via insertions) use configs/data/qm9_scaffold_decoration.yaml
+# instead.
+#
+# Inherits from configs/data/qm9.yaml and overrides:
+#   - datamodule._target_ → ScaffoldLightningDataModule
+#   - wrapper_kind = "molecule_optimization"
+#
+# The scaffold cache is built lazily into ``scaffold_groups_dir`` on first run
+# (one file per split). Subsequent runs reuse the cache.
+defaults:
+  - qm9
+  - _self_
+
+scaffold_groups_dir: ${data.root_path}/qm9/processed/scaffold_groups
+wrapper_kind: molecule_optimization
+assignment_method: mcs_constrained  # or "substituent"
+# When true, attaches ``target_props = [[QED(target) - QED(source)]]`` to
+# ``mol_t`` (train) and ``source`` (eval). Must match
+# ``model.backbone.prop_dim`` (= 1 for a single scalar) on the model side.
+compute_qed_delta: true
+
+datamodule:
+  _target_: chemflow.dataset.scaffold_datamodule.ScaffoldLightningDataModule
+  scaffold_groups_dir: ${data.scaffold_groups_dir}
+  wrapper_kind: ${data.wrapper_kind}
+  assignment_method: ${data.assignment_method}
+  compute_qed_delta: ${data.compute_qed_delta}
