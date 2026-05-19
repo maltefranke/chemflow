@@ -101,14 +101,15 @@ def setup(cfg: DictConfig):
     # Defaults to False (e.g. QM9) if the data config does not set it.
     allow_charged = bool(cfg.data.get("allow_charged", False))
 
-    # Build metrics (including novelty against the training set). SMILES are only
-    # used by RDKit-side metrics (e.g. Novelty), which are themselves gated off
-    # in non-topology modes — and a true pointcloud-only dataset like TMQM may
-    # not implement get_all_smiles() at all. Fetch defensively.
+    # Build metrics (including novelty against the training set). Fetched
+    # whenever the dataset can provide SMILES, independent of representation, so
+    # downstream RDKit-side metrics (e.g. Novelty) work even if bonds are later
+    # inferred in non-topology modes. A pointcloud-only dataset like TMQM may not
+    # implement get_all_smiles() at all, so fetch defensively.
     base_dataset = datamodule.train_dataset.base_dataset
     train_smiles = (
         base_dataset.get_all_smiles()
-        if representation.requires_topology and hasattr(base_dataset, "get_all_smiles")
+        if hasattr(base_dataset, "get_all_smiles")
         else None
     )
     metrics, stability_metrics, distribution_metrics, batch_metrics = init_metrics(
