@@ -933,6 +933,7 @@ def init_metrics(
     edge_tokens: list[str] | None = None,
     charge_tokens: list[str] | None = None,
     allow_charged: bool = False,
+    distributions=None,
 ):
 
     metrics = {
@@ -985,7 +986,20 @@ def init_metrics(
     stability_metrics = MetricCollection(stability_metrics, compute_groups=False)
     distribution_metrics = MetricCollection(distribution_metrics, compute_groups=False)
 
-    return metrics, stability_metrics, distribution_metrics
+    # Batch-side metrics — built from training-set target stats stored in
+    # Distributions. Run in every representation. The atom-count / atom-type
+    # KLs here are *marginal* over all samples and coexist with the
+    # RDKit-mol *conditional* versions above (see batch_metrics docstring).
+    # The collection may be empty if Distributions lacks the geometric target
+    # stats.
+    from chemflow.utils.batch_metrics import build_batch_metrics
+
+    batch_metrics_dict: dict = {}
+    if distributions is not None and atom_tokens is not None:
+        batch_metrics_dict = build_batch_metrics(distributions, len(atom_tokens))
+    batch_metrics = MetricCollection(batch_metrics_dict, compute_groups=False)
+
+    return metrics, stability_metrics, distribution_metrics, batch_metrics
 
 
 # ---------------------------------------------------------------------------

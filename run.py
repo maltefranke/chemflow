@@ -12,6 +12,11 @@ from pytorch_lightning.strategies import DDPStrategy
 
 from chemflow.utils.utils import build_callbacks, init_uniform_prior, bootstrap_run_id
 from chemflow.dataset.vocab import setup_token_weights
+from chemflow.dataset.representation import (
+    Representation,
+    project_distributions_to_representation,
+    validate_representation,
+)
 from chemflow.model.lightning_module import LightningModuleRates
 from chemflow.utils.metrics import init_metrics
 from rdkit import Chem
@@ -33,6 +38,13 @@ pl.seed_everything(42)
 def setup(cfg: DictConfig):
     OmegaConf.set_struct(cfg, False)
 
+    # Validate the run's representation against the chosen dataset's class-level
+    # CAPABILITIES before doing any data work. Imports the class only — no
+    # instantiation, no I/O.
+    representation = Representation(cfg.representation)
+    dataset_cls = hydra.utils.get_class(cfg.data.datamodule.datasets.train._target_)
+    validate_representation(dataset_cls.CAPABILITIES, representation)
+
     # Instantiate preprocessing to compute distributions from training dataset
     hydra.utils.log.info("Instantiating preprocessing...")
     preprocessing = hydra.utils.instantiate(cfg.data.preprocessing)
@@ -41,9 +53,18 @@ def setup(cfg: DictConfig):
     vocab = preprocessing.vocab
     distributions = preprocessing.distributions
 
-    # Keep training-frequency distributions for loss weighting.
+    # Channel A — canonical real frequencies, for loss weighting + metrics.
     loss_weight_distributions = deepcopy(distributions)
+
+    # Channel B — priors used by sample_prior_graph / interpolator / integrator.
+    # Project edge/charge priors onto the representation so sampled tokens match
+    # the all-zero targets produced by project_molecule_to_representation
+    # (otherwise non-topology runs would draw real bond tokens at t=0 and trip
+    # the edge-substitution path the gating relies on being inactive).
     token_prior_distribution = init_uniform_prior(distributions)
+    token_prior_distribution = project_distributions_to_representation(
+        token_prior_distribution, vocab, representation
+    )
 
     cfg.data.vocab = vocab
 
@@ -80,9 +101,17 @@ def setup(cfg: DictConfig):
     # Defaults to False (e.g. QM9) if the data config does not set it.
     allow_charged = bool(cfg.data.get("allow_charged", False))
 
-    # Build metrics (including novelty against the training set)
-    train_smiles = datamodule.train_dataset.base_dataset.get_all_smiles()
-    metrics, stability_metrics, distribution_metrics = init_metrics(
+    # Build metrics (including novelty against the training set). SMILES are only
+    # used by RDKit-side metrics (e.g. Novelty), which are themselves gated off
+    # in non-topology modes — and a true pointcloud-only dataset like TMQM may
+    # not implement get_all_smiles() at all. Fetch defensively.
+    base_dataset = datamodule.train_dataset.base_dataset
+    train_smiles = (
+        base_dataset.get_all_smiles()
+        if representation.requires_topology and hasattr(base_dataset, "get_all_smiles")
+        else None
+    )
+    metrics, stability_metrics, distribution_metrics, batch_metrics = init_metrics(
         train_smiles=train_smiles,
         target_n_atoms_distribution=loss_weight_distributions.n_atoms_distribution,
         atom_type_distribution=loss_weight_distributions.atom_type_distribution,
@@ -92,6 +121,7 @@ def setup(cfg: DictConfig):
         edge_tokens=list(vocab.edge_tokens),
         charge_tokens=list(vocab.charge_tokens),
         allow_charged=allow_charged,
+        distributions=loss_weight_distributions,
     )
 
     # Instantiate module
@@ -107,8 +137,10 @@ def setup(cfg: DictConfig):
         metrics=metrics,
         stability_metrics=stability_metrics,
         distribution_metrics=distribution_metrics,
+        batch_metrics=batch_metrics,
         allow_charged=allow_charged,
-        log_grad_norms_every_n_steps=0 # disable loss gradient checking 
+        log_grad_norms_every_n_steps=0,  # disable loss gradient checking
+        representation=representation.value,
     )
 
     module.compile()

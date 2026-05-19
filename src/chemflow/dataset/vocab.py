@@ -20,6 +20,12 @@ class Distributions:
     charge_type_distribution: torch.Tensor
     n_atoms_distribution: torch.Tensor
     coordinate_std: torch.Tensor
+    # Pointcloud-mode evaluation targets in Angstroms (computed on centered,
+    # un-normalized training coords). Shape (A, A, B) with the (lo, hi)
+    # atom-type-index convention; None if not computed.
+    pairwise_distance_histogram: torch.Tensor | None = None
+    # Shape (B,). None if not computed.
+    radius_of_gyration_histogram: torch.Tensor | None = None
 
     def _to_primitive_types(self):
         return self(

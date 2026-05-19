@@ -8,7 +8,8 @@ optimal_transport: "equivariant"
 ins_noise_scale: 0.25
 move_noise_scale: 0.2
 
-# QM9 contains only neutral molecules; charged species are treated as invalid.
+# tmQM contains charged complexes (q in {-1, 0, 1}) but we run pointcloud-only
+# and ignore the per-molecule charge — leave validity gating off.
 allow_charged: false
 
 
@@ -16,10 +17,11 @@ allow_charged: false
 preprocessing:
   _target_: chemflow.dataset.preprocessing.Preprocessing
   _recursive_: false
-  root: ${data.root_path}/qm9
+  root: ${data.root_path}/tmQM
   train_dataset: ${data.datamodule.datasets.train}
-  # Canonical (representation-agnostic) cache. One preprocessing per dataset;
-  # representation-specific projection happens at runtime in the wrapper.
+  # Canonical (representation-agnostic) cache. tmQM has no source bonds and no
+  # per-atom formal charges, so the canonical edge / charge vocabs fall back to
+  # singleton tokens (see preprocessing._compute_tokens_from_data).
   atom_tokens_path: ${data.preprocessing.root}/processed/atom_tokens.txt
   edge_tokens_path: ${data.preprocessing.root}/processed/edge_tokens.txt
   charge_tokens_path: ${data.preprocessing.root}/processed/charge_tokens.txt
@@ -40,7 +42,7 @@ interpolator:
   sub_schedule:
     _target_: chemflow.flow_matching.schedules.SmoothstepSchedule
     shift: 1.5
-  sub_e_schedule: 
+  sub_e_schedule:
     _target_: chemflow.flow_matching.schedules.SmoothstepSchedule
     shift: 1.5
 
@@ -54,20 +56,20 @@ datamodule:
 
   datasets:
     train:
-      _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
-      root: ${data.root_path}/qm9
+      _target_: chemflow.dataset.tmqm.FlowMatchingTMQMDataset
+      root: ${data.root_path}/tmQM
       vocab: ${data.vocab}
       distributions: None
 
     val:
-      - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
-        root: ${data.root_path}/qm9
+      - _target_: chemflow.dataset.tmqm.FlowMatchingTMQMDataset
+        root: ${data.root_path}/tmQM
         vocab: ${data.vocab}
         distributions: None
 
     test:
-      - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
-        root: ${data.root_path}/qm9
+      - _target_: chemflow.dataset.tmqm.FlowMatchingTMQMDataset
+        root: ${data.root_path}/tmQM
         vocab: ${data.vocab}
         distributions: None
 
@@ -77,17 +79,19 @@ datamodule:
   n_augmentations: ${model.n_augmentations}
 
   num_workers:
-    train: 10
+    train: 4
     val: 0
     test: 0
     predict: 0
 
+  # tmQM molecules are much larger than QM9 (cap 120 atoms vs ~29) and the
+  # pointcloud wrapper builds a fully-connected graph (O(N^2) edges). Batch
+  # sizes are sized for a 40–48 GB GPU; raise if you have more headroom.
   batch_size:
-    train: 1024
-    val: 128
-    test: 32
+    train: 64
+    val: 32
+    test: 16
 
   n_atoms_strategy: ${data.n_atoms_strategy}
   optimal_transport: ${data.optimal_transport}
   time_dist: ${model.module.time_dist}
-  

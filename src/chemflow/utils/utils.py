@@ -41,16 +41,21 @@ def build_callbacks(cfg: DictConfig) -> list[Callback]:
         )
 
     if "every_n_epochs_checkpoint" in cfg.callbacks:
+        cb_cfg = cfg.callbacks.every_n_epochs_checkpoint
         hydra.utils.log.info(
-            f"Adding callback <ModelCheckpoint> for every {cfg.callbacks.every_n_epochs_checkpoint.every_n_epochs} epochs"
+            f"Adding callback <ModelCheckpoint> for every {cb_cfg.every_n_epochs} epochs"
         )
+        # Keep best-by-validation separate from latest-for-resume. Lightning only saves
+        # train-epoch checkpoints when save_on_train_epoch_end=True if validation is not
+        # run every epoch.
         callbacks.append(
             ModelCheckpoint(
                 dirpath="every_n_epochs",
-                every_n_epochs=cfg.callbacks.every_n_epochs_checkpoint.every_n_epochs,
-                save_top_k=cfg.callbacks.every_n_epochs_checkpoint.save_top_k,
-                verbose=cfg.callbacks.every_n_epochs_checkpoint.verbose,
-                save_last=cfg.callbacks.every_n_epochs_checkpoint.save_last,
+                every_n_epochs=cb_cfg.every_n_epochs,
+                save_top_k=cb_cfg.save_top_k,
+                verbose=cb_cfg.verbose,
+                save_last=cb_cfg.save_last,
+                save_on_train_epoch_end=cb_cfg.get("save_on_train_epoch_end", None),
             )
         )
 

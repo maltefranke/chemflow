@@ -25,6 +25,7 @@ from torch_geometric.data import InMemoryDataset, download_url, extract_zip
 
 from chemflow.dataset.molecule_data import MoleculeData
 from chemflow.dataset.vocab import Vocab, Distributions
+from chemflow.dataset.representation import Capabilities
 from chemflow.utils.rdkit_utils import (
     mol_is_valid,
     sanitize_mol_correctly,
@@ -231,6 +232,8 @@ class RevisedQM9(InMemoryDataset):
 
 
 class FlowMatchingQM9Dataset(RevisedQM9):
+    CAPABILITIES = Capabilities(provides_charges=True, provides_topology=True)
+
     def __init__(
         self,
         root,
@@ -262,24 +265,22 @@ class FlowMatchingQM9Dataset(RevisedQM9):
         ]
         atom_types = torch.tensor(atom_types, dtype=torch.long)
 
-        # add 1 to the edge types to make them 1-indexed
-        # 0 is no bond, 1 is single, 2 is double, 3 is triple, 4 is aromatic
+        # Canonical edge resolution (0=no bond, 1..4 = bond types).
         edge_types = data.edge_attr
         edge_types = edge_types_to_symmetric(
             data.edge_index, edge_types, data.num_nodes
         )
+        edge_types = edge_types[data.edge_index[0], data.edge_index[1]].to(torch.long)
 
-        edge_types = edge_types[data.edge_index[0], data.edge_index[1]]
-        edge_types = edge_types.to(torch.long)
-
-        charges = data.charges.tolist()
         charges = [
-            token_to_index(self.vocab.charge_tokens, str(charge)) for charge in charges
+            token_to_index(self.vocab.charge_tokens, str(charge))
+            for charge in data.charges.tolist()
         ]
         charges = torch.tensor(charges, dtype=torch.long)
 
         mol = MoleculeData(
-            x=coord, a=atom_types, e=edge_types, c=charges, edge_index=data.edge_index
+            x=coord, a=atom_types, e=edge_types, c=charges,
+            edge_index=data.edge_index,
         )
 
         # Carry through molecular properties if available (shape: [1, num_properties])
