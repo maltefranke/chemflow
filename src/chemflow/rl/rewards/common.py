@@ -17,17 +17,22 @@ RDLogger.DisableLog("rdApp.*")
 def _iter_valid_mols(
     module, trajectory,
 ) -> Iterator[tuple[Optional[Chem.Mol], bool]]:
-    """Yield (rdkit_mol_or_None, is_valid) for each graph in `mol_final`."""
+    """Yield (rdkit_mol_or_None, is_valid) for each graph in `mol_final`.
+
+    Honors ``module.allow_charged`` so RL validity matches pretraining's
+    configured policy (default False).
+    """
     from chemflow.utils import rdkit_utils as chemflowRD  # noqa: N812
 
     v = module.vocab
+    allow_charged = bool(getattr(module, "allow_charged", False))
     for mol_i in trajectory.mol_final.to_data_list():
         rd = mol_i.to_rdkit_mol(v.atom_tokens, v.edge_tokens, v.charge_tokens)
         if rd is None:
             yield None, False
             continue
         try:
-            ok = chemflowRD.mol_is_valid(rd)
+            ok = chemflowRD.mol_is_valid(rd, allow_charged=allow_charged)
         except Exception:
             ok = False
         yield rd, ok

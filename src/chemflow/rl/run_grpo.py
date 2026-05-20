@@ -359,6 +359,7 @@ def run_from_cfg(cfg: DictConfig):
             best_save_path=save_best_path,
             best_ema_beta=float(cfg.rl.best.ema_beta),
             best_warmup_steps=int(cfg.rl.best.warmup_steps),
+            diagnostics_every=int(cfg.rl.get("diagnostics_every", 0)),
         )
     finally:
         if wandb_run is not None:

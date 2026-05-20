@@ -22,6 +22,7 @@ from chemflow.dataset.molecule_data import (
     join_molecules_with_atoms,
     join_molecules_with_predicted_edges,
 )
+from chemflow.dataset.representation import neutral_charge_index
 from chemflow.utils.utils import EDGE_ALIGNER
 
 
@@ -155,6 +156,36 @@ def _scatter_sum(src: torch.Tensor, index: torch.Tensor, dim_size: int) -> torch
 def _to_per_element_mean(per_graph_sum: torch.Tensor, denom: torch.Tensor) -> torch.Tensor:
     """`per_graph_sum / max(denom,1)` — safe when denom==0 (numerator is zero there)."""
     return per_graph_sum / denom.clamp(min=1.0)
+
+
+@torch.no_grad()
+def _rl_diagnostics(module, mol_final) -> dict[str, float]:
+    """Run the module's batch + distribution metric collections on the final batch.
+
+    Coords are stored normalized during the rollout; pretraining's metrics expect
+    Angstroms, so scale a clone before updating. Reset before and after to keep
+    metric state local to this call.
+    """
+    out: dict[str, float] = {}
+    mol = mol_final.clone()
+    coord_std = getattr(module.distributions, "coordinate_std", None)
+    if coord_std is not None:
+        mol.x = mol.x * coord_std
+
+    bm = getattr(module, "batch_metrics", None)
+    if bm is not None and len(bm) > 0:
+        bm.reset()
+        bm.update(mol)
+        out.update({f"diag/batch/{k}": float(v.detach().cpu()) for k, v in bm.compute().items()})
+        bm.reset()
+
+    dm = getattr(module, "distribution_metrics", None)
+    if dm is not None and len(dm) > 0:
+        dm.reset()
+        dm.update(mol)
+        out.update({f"diag/{k}": float(v.detach().cpu()) for k, v in dm.compute().items()})
+        dm.reset()
+    return out
 
 
 def _sync_model_ema_to_live(module) -> None:
@@ -303,6 +334,7 @@ def gmm_marginal_logprob(
     ins_x: torch.Tensor,         # (n, D)
     ins_a: torch.Tensor,         # (n,)
     ins_c: torch.Tensor,         # (n,)
+    include_c: bool = True,
 ) -> torch.Tensor:
     """log pi^GMM per inserted atom; logsumexp over K components."""
     if ins_x.numel() == 0:
@@ -312,7 +344,6 @@ def gmm_marginal_logprob(
     sigma = gmm_dict["sigma"]                          # (n, K)
     pi = gmm_dict["pi"]                                # (n, K)
     a_probs = gmm_dict["a_probs"]                      # (n, K, |A|)
-    c_probs = gmm_dict["c_probs"]                      # (n, K, |C|)
 
     # Spatial: Normal with isotropic sigma.  Sum log-density over D, broadcast (n,1,D) - (n,K,D).
     loc = mu
@@ -321,10 +352,13 @@ def gmm_marginal_logprob(
 
     # Types: gather at ins_a / ins_c, then log.
     log_pa = torch.log(a_probs.clamp(min=EPS)).gather(-1, ins_a.view(-1, 1, 1).expand(-1, a_probs.size(1), 1)).squeeze(-1)
-    log_pc = torch.log(c_probs.clamp(min=EPS)).gather(-1, ins_c.view(-1, 1, 1).expand(-1, c_probs.size(1), 1)).squeeze(-1)
 
     log_pi = torch.log(pi.clamp(min=EPS))
-    logits = log_pi + log_N + log_pa + log_pc               # (n, K)
+    logits = log_pi + log_N + log_pa                        # (n, K)
+    if include_c:
+        c_probs = gmm_dict["c_probs"]                      # (n, K, |C|)
+        log_pc = torch.log(c_probs.clamp(min=EPS)).gather(-1, ins_c.view(-1, 1, 1).expand(-1, c_probs.size(1), 1)).squeeze(-1)
+        logits = logits + log_pc
     return torch.logsumexp(logits, dim=-1)                  # (n,)
 
 
@@ -408,6 +442,8 @@ def _per_channel_logprob(
     prior_edge_probs = integrator._cat_edge.probs.to(device)  # (|E|,)
 
     survive_mask = step.a_choice != 2                # (N_orig,) bool
+    requires_charges = module.representation.requires_charges
+    requires_topology = module.representation.requires_topology
 
     # ─── Positions ──────────────────────────────────────────────────────
     x1_pred = preds["pos_head"]
@@ -433,32 +469,38 @@ def _per_channel_logprob(
     )
 
     # ─── Edge sub (upper-tri of mol_t) ──────────────────────────────────
-    q_sub_e_full = torch.sigmoid(preds["do_sub_e_head"].view(-1))
-    edge_probs_full = F.softmax(preds["edge_type_head"], dim=-1)
-    triu_idx, (q_sub_e_triu, edge_probs_triu) = _extract_triu(
-        mol_t.edge_index, [q_sub_e_full, edge_probs_full],
-    )
-    # triu order: rollout vs logp must share EDGE_ALIGNER permutation
-    assert torch.equal(triu_idx, step.edge_triu_idx), (
-        "edge aligner ordering drifted between rollout and scoring"
-    )
-    edge_batch_id = batch_id[triu_idx[0]]
-    sub_e_rate_triu = sub_e_rate[edge_batch_id]
-    p_sub_e_triu = _q_to_p(q_sub_e_triu, sub_e_rate_triu, dt)
-    # Surviving edges: both endpoints survive.
-    edge_survive_mask = survive_mask[triu_idx[0]] & survive_mask[triu_idx[1]]
-    lp_edge = edge_sub_logprob(
-        p_sub_e_triu, edge_probs_triu,
-        step.e_triu_sub, step.hat_e_triu,
-        edge_batch_id, num_graphs,
-        survive_mask=edge_survive_mask,
-    )
+    if requires_topology:
+        q_sub_e_full = torch.sigmoid(preds["do_sub_e_head"].view(-1))
+        edge_probs_full = F.softmax(preds["edge_type_head"], dim=-1)
+        triu_idx, (q_sub_e_triu, edge_probs_triu) = _extract_triu(
+            mol_t.edge_index, [q_sub_e_full, edge_probs_full],
+        )
+        # triu order: rollout vs logp must share EDGE_ALIGNER permutation
+        assert torch.equal(triu_idx, step.edge_triu_idx), (
+            "edge aligner ordering drifted between rollout and scoring"
+        )
+        edge_batch_id = batch_id[triu_idx[0]]
+        sub_e_rate_triu = sub_e_rate[edge_batch_id]
+        p_sub_e_triu = _q_to_p(q_sub_e_triu, sub_e_rate_triu, dt)
+        # Surviving edges: both endpoints survive.
+        edge_survive_mask = survive_mask[triu_idx[0]] & survive_mask[triu_idx[1]]
+        lp_edge = edge_sub_logprob(
+            p_sub_e_triu, edge_probs_triu,
+            step.e_triu_sub, step.hat_e_triu,
+            edge_batch_id, num_graphs,
+            survive_mask=edge_survive_mask,
+        )
+    else:
+        lp_edge = torch.zeros(num_graphs, device=device)
 
     # ─── Charge (surviving existing nodes only) ─────────────────────────
-    charge_probs = F.softmax(preds["charge_head"], dim=-1)
-    lp_charge = charge_logprob(
-        charge_probs, step.hat_c, survive_mask, batch_id, num_graphs,
-    )
+    if requires_charges:
+        charge_probs = F.softmax(preds["charge_head"], dim=-1)
+        lp_charge = charge_logprob(
+            charge_probs, step.hat_c, survive_mask, batch_id, num_graphs,
+        )
+    else:
+        lp_charge = torch.zeros(num_graphs, device=device)
 
     # ─── Insertion gate (all nodes) ─────────────────────────────────────
     num_ins_pred = preds["ins_rate_head"].view(-1)
@@ -474,13 +516,14 @@ def _per_channel_logprob(
         gmm_sub = {k: v[step.do_ins] for k, v in gmm_full.items()}
         gmm_per_ins = gmm_marginal_logprob(
             gmm_sub, step.ins_x, step.ins_a, step.ins_c,
+            include_c=requires_charges,
         )                                                # (N_ins,)
         ins_batch_id = batch_id[step.do_ins]
         lp_gmm = _scatter_sum(gmm_per_ins, ins_batch_id, num_graphs)
 
     # ─── Ins -> existing edges ──────────────────────────────────────────
     lp_ins_edge_ext = torch.zeros(num_graphs, device=device)
-    if step.do_ins.any() and step.ins_edge_spawn_orig_full.numel() > 0:
+    if requires_topology and step.do_ins.any() and step.ins_edge_spawn_orig_full.numel() > 0:
         ins_edge_head = getattr(module._get_model(), "ins_edge_head", None)
         if ins_edge_head is not None:
             # Rebuild the post-sub atom types exactly as rollout did, so the
@@ -529,7 +572,7 @@ def _per_channel_logprob(
 
     # ─── Ins -> ins edges ───────────────────────────────────────────────
     lp_ins_edge_ii = torch.zeros(num_graphs, device=device)
-    if step.hat_e_ins_ii.numel() > 0:
+    if requires_topology and step.hat_e_ins_ii.numel() > 0:
         ins_edge_head = getattr(module._get_model(), "ins_edge_head", None)
         if ins_edge_head is not None:
             new_atoms_a = step.ins_a
@@ -565,11 +608,12 @@ def _per_channel_logprob(
         lp_node = _to_per_element_mean(lp_node, n_nodes)
         lp_charge = _to_per_element_mean(lp_charge, n_surv)
         lp_ins_gate = _to_per_element_mean(lp_ins_gate, n_nodes)
-        assert edge_survive_mask.shape == edge_batch_id.shape, (
-            "edge_survive_mask and edge_batch_id must both be (E_triu,)"
-        )
-        edge_denom = _scatter_sum(edge_survive_mask.float(), edge_batch_id, num_graphs).to(dtype=dtype)
-        lp_edge = _to_per_element_mean(lp_edge, edge_denom)
+        if requires_topology:
+            assert edge_survive_mask.shape == edge_batch_id.shape, (
+                "edge_survive_mask and edge_batch_id must both be (E_triu,)"
+            )
+            edge_denom = _scatter_sum(edge_survive_mask.float(), edge_batch_id, num_graphs).to(dtype=dtype)
+            lp_edge = _to_per_element_mean(lp_edge, edge_denom)
         if step.do_ins.any():
             ins_batch_id = batch_id[step.do_ins]
             n_ins = torch.bincount(ins_batch_id, minlength=num_graphs).to(device=device, dtype=dtype)
@@ -655,6 +699,9 @@ def _rollout_step(module, mol_t, t: torch.Tensor, dt: float, cfg: GRPOConfig):
     N_orig = mol_t.x.size(0)
     n_atoms_strategy = getattr(module, "n_atoms_strategy", "fixed")
     prior_edge_probs = integrator._cat_edge.probs.to(device)
+    requires_charges = module.representation.requires_charges
+    requires_topology = module.representation.requires_topology
+    neutral_c = None if requires_charges else neutral_charge_index(module.vocab)
 
     # ─── Positions (fixed-Gaussian exploration) ──────────────────────────
     x1_pred = preds["pos_head"]
@@ -670,6 +717,11 @@ def _rollout_step(module, mol_t, t: torch.Tensor, dt: float, cfg: GRPOConfig):
     hat_a = Categorical(probs=atom_probs).sample()
     hat_c = Categorical(probs=charge_probs).sample()
     hat_e_full = Categorical(probs=edge_probs_full).sample()
+    # Mirror main sample(): force dummies for channels the representation doesn't carry.
+    if not requires_charges:
+        hat_c.fill_(neutral_c)
+    if not requires_topology:
+        hat_e_full.fill_(0)  # <NO_BOND> at canonical edge-vocab index 0
 
     # ─── 3-way node action (noop / sub / del) ───────────────────────────
     q_sub = torch.sigmoid(preds["do_sub_a_head"].view(-1))
@@ -698,6 +750,8 @@ def _rollout_step(module, mol_t, t: torch.Tensor, dt: float, cfg: GRPOConfig):
 
     # ─── Edge sub on triu ───────────────────────────────────────────────
     q_sub_e_full = torch.sigmoid(preds["do_sub_e_head"].view(-1))
+    if not requires_topology:
+        q_sub_e_full = torch.zeros_like(q_sub_e_full)  # never substitute dummy edges
     triu_idx, (q_sub_e_triu, edge_probs_triu, hat_e_triu, e_triu_current) = _extract_triu(
         mol_t.edge_index, [q_sub_e_full, edge_probs_full, hat_e_full, mol_t.e],
     )
@@ -730,6 +784,8 @@ def _rollout_step(module, mol_t, t: torch.Tensor, dt: float, cfg: GRPOConfig):
         t_ins = t[batch_id[do_ins]] + dt
         new_atoms = integrator.sample_insertions(gmm_sub, t_ins)
         ins_x, ins_a, ins_c = new_atoms.x, new_atoms.a, new_atoms.c
+        if not requires_charges:
+            ins_c = torch.full_like(ins_c, neutral_c)
 
     # ─── Build next molecule state before topology edits ────────────────
     a_next = mol_t.a.clone()
@@ -747,7 +803,9 @@ def _rollout_step(module, mol_t, t: torch.Tensor, dt: float, cfg: GRPOConfig):
     )
 
     # ─── Ins -> existing edges: sample via two-stage marginalisation ────
-    ins_edge_head = getattr(module._get_model(), "ins_edge_head", None)
+    ins_edge_head = (
+        getattr(module._get_model(), "ins_edge_head", None) if requires_topology else None
+    )
     hat_e_ins_full = torch.zeros(0, dtype=torch.long, device=device)
     ins_edge_spawn_full = torch.zeros(0, dtype=torch.long, device=device)
     ins_edge_existing_full = torch.zeros(0, dtype=torch.long, device=device)
@@ -1029,6 +1087,7 @@ def grpo_step(
     optimizer: torch.optim.Optimizer,
     reward_fn: Callable = validity_reward,
     ref_module: Optional[torch.nn.Module] = None,
+    do_diagnostics: bool = False,
 ) -> dict:
     """One GRPO update: rollout -> reward -> per-step clipped loss -> step.
 
@@ -1189,6 +1248,8 @@ def grpo_step(
         # Unscaled k3: same as (step loss KL term) / β, i.e. mean_batch(sum_c k3_c) averaged over time.
         out["kl/total"] = (loss_kl_sum / (n_steps * n_passes)) / cfg.kl_coef
         out.update({f"kl/{k}": v for k, v in kl_mean.items()})
+    if do_diagnostics:
+        out.update(_rl_diagnostics(module, trajectory.mol_final))
     return out
 
 
@@ -1210,6 +1271,7 @@ def train(
     best_save_path: str | None = None,
     best_ema_beta: float = 0.9,
     best_warmup_steps: int = 3,
+    diagnostics_every: int = 0,
     ) -> None:
     """GRPO training loop.
 
@@ -1269,8 +1331,10 @@ def train(
             batch = next(it)
 
         batch = _batch_to_device(batch, device)
+        do_diag = diagnostics_every > 0 and step % diagnostics_every == 0
         info = grpo_step(
             module, batch, cfg, optimizer, reward_fn=reward_fn, ref_module=ref_module,
+            do_diagnostics=do_diag,
         )
 
         r_mean = info["reward_mean"]

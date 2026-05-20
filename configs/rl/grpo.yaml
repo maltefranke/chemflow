@@ -34,6 +34,9 @@ rl:
   log_every: 1
   seed: 0
   max_atoms: 100
+  # Run module.batch_metrics + module.distribution_metrics on the final rollout
+  # batch every N updates. 0 disables.
+  diagnostics_every: 10
 
   # Best-checkpoint tracking inside rl.grpo.train
   best:
