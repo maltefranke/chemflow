@@ -8,7 +8,10 @@ from typing import Callable, Optional
 import torch
 from rdkit import Chem
 
+from chemflow.dataset.representation import Representation
+
 from .common import _iter_valid_mols
+from .spec import WrapperSpec
 
 
 class ScaffoldBucketMemory:
@@ -193,3 +196,11 @@ def scaffold_diversity_wrapper(
         return r_gated, diag_out
 
     return wrapped
+
+
+# Scaffold bucketing reads Murcko scaffolds / canonical SMILES off RDKit
+# molecules, so it only applies in full-chemistry mode.
+SCAFFOLD_DIVERSITY_SPEC = WrapperSpec(
+    make=scaffold_diversity_wrapper,
+    supported_representations=frozenset({Representation.MOLECULE}),
+)

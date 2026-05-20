@@ -61,12 +61,17 @@ def register_resolvers() -> None:
 
 register_resolvers()
 
+from chemflow.dataset.representation import (  # noqa: E402
+    Representation,
+    project_distributions_to_representation,
+    validate_representation,
+)
 from chemflow.dataset.vocab import setup_token_weights  # noqa: E402
 from chemflow.utils.metrics import init_metrics  # noqa: E402
 from chemflow.utils.utils import bootstrap_run_id, init_uniform_prior  # noqa: E402
 
-from chemflow.rl.grpo import GRPOConfig, train  # noqa: E402
-from chemflow.rl.rewards import REWARDS, scaffold_diversity_wrapper  # noqa: E402
+from chemflow.rl.grpo import GRPOConfig, _sync_model_ema_to_live, train  # noqa: E402
+from chemflow.rl.rewards import build_reward as build_reward_from_spec  # noqa: E402
 
 
 def compose_cfg(config_path: str, config_name: str, overrides: list[str]):
@@ -78,11 +83,18 @@ def compose_cfg(config_path: str, config_name: str, overrides: list[str]):
 
 
 def build_module_and_datamodule(cfg):
+    representation = Representation(cfg.representation)
+    dataset_cls = hydra.utils.get_class(cfg.data.datamodule.datasets.train._target_)
+    validate_representation(dataset_cls.CAPABILITIES, representation)
+
     preprocessing = hydra.utils.instantiate(cfg.data.preprocessing)
     vocab = preprocessing.vocab
     distributions = preprocessing.distributions
     loss_weight_distributions = deepcopy(distributions)
     token_prior = init_uniform_prior(distributions)
+    token_prior = project_distributions_to_representation(
+        token_prior, vocab, representation
+    )
     cfg.data.vocab = vocab
     datamodule = hydra.utils.instantiate(
         cfg.data.datamodule,
@@ -98,8 +110,14 @@ def build_module_and_datamodule(cfg):
         weight_alpha=tw.weight_alpha,
         type_loss_token_weights=tw.type_loss_token_weights,
     )
-    train_smiles = datamodule.train_dataset.base_dataset.get_all_smiles()
-    metrics, stability_metrics, distribution_metrics = init_metrics(
+    base_dataset = datamodule.train_dataset.base_dataset
+    train_smiles = (
+        base_dataset.get_all_smiles()
+        if hasattr(base_dataset, "get_all_smiles")
+        else None
+    )
+    allow_charged = bool(cfg.data.get("allow_charged", False))
+    metrics, stability_metrics, distribution_metrics, batch_metrics = init_metrics(
         train_smiles=train_smiles,
         target_n_atoms_distribution=loss_weight_distributions.n_atoms_distribution,
         atom_type_distribution=loss_weight_distributions.atom_type_distribution,
@@ -108,6 +126,9 @@ def build_module_and_datamodule(cfg):
         atom_tokens=list(vocab.atom_tokens),
         edge_tokens=list(vocab.edge_tokens),
         charge_tokens=list(vocab.charge_tokens),
+        allow_charged=allow_charged,
+        distributions=loss_weight_distributions,
+        representation=representation,
     )
     module = hydra.utils.instantiate(
         cfg.model.module,
@@ -120,15 +141,61 @@ def build_module_and_datamodule(cfg):
         metrics=metrics,
         stability_metrics=stability_metrics,
         distribution_metrics=distribution_metrics,
+        batch_metrics=batch_metrics,
+        allow_charged=allow_charged,
+        representation=representation.value,
     )
     return module, datamodule
 
 
-def load_ckpt_into_module(module, ckpt_path: str):
+def load_ckpt_into_module(module, ckpt_path: str, *, representation: Representation):
+    """Load weights into ``module`` after enforcing checkpoint↔RL rep equality.
+
+    RL must run under the same representation the checkpoint was trained on:
+    going up (e.g. POINTCLOUD-trained → MOLECULE RL) leaves edge / charge
+    heads at near-init values and silently produces nonsense; going down
+    (MOLECULE-trained → POINTCLOUD RL) rots the pretrained heads we'd be
+    discarding. Checkpoints with no ``representation`` field error out — no
+    silent fallback.
+    """
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    hp = ckpt.get("hyper_parameters", {}) or {}
+    ckpt_rep_raw = hp.get("representation")
+    if ckpt_rep_raw is None:
+        raise ValueError(
+            f"Checkpoint {ckpt_path!r} has no 'representation' in "
+            "hyper_parameters. Re-save the checkpoint with the field set "
+            "before using it for RL."
+        )
+    ckpt_rep = Representation(ckpt_rep_raw)
+
+    if ckpt_rep != representation:
+        raise ValueError(
+            f"Checkpoint was trained with representation={ckpt_rep.value!r} "
+            f"but RL is running with representation={representation.value!r}. "
+            "Representations must match exactly — re-pretrain or change the RL config."
+        )
     state_dict = ckpt["state_dict"]
     state_dict = {k.replace("._orig_mod", ""): v for k, v in state_dict.items()}
     module.load_state_dict(state_dict, strict=True)
+
+    # GRPO trains the *live* model. Lightning's `_get_model()` returns
+    # `model_ema` whenever `use_ema_for_eval=True` (the default), which puts
+    # every gradient step on `model_ema` while `self.model` stays at init.
+    # On pretrained ckpts the good weights live in `model_ema`; copy them into
+    # `model`. Then sync `model_ema <- model` so any future reload finds them
+    # consistent.
+    ema_was_source = getattr(module, "use_ema_for_eval", False)
+    module.use_ema_for_eval = False
+
+    if getattr(module, "model_ema", None) is not None:
+        if ema_was_source:
+            module.model.load_state_dict(module.model_ema.state_dict())
+            print("[grpo] RL: copied model_ema -> model (pretrained init).", flush=True)
+        module.model_ema.load_state_dict(module.model.state_dict())
+        module.model_ema.eval()
+        for p in module.model_ema.parameters():
+            p.requires_grad_(False)
     return module
 
 
@@ -180,37 +247,40 @@ def build_grpo_config(grpo_cfg: DictConfig) -> GRPOConfig:
     return GRPOConfig(**kwargs)
 
 
-def build_reward(reward_cfg: DictConfig):
+def build_reward(reward_cfg: DictConfig, *, representation: Representation):
     name = str(reward_cfg.name)
-    if name not in REWARDS:
-        raise ValueError(
-            f"Unknown RL reward {name!r}. Available rewards: {sorted(REWARDS)}"
-        )
+    wrappers: list[tuple[str, dict]] = []
 
-    reward_fn = REWARDS[name]
-    if not bool(reward_cfg.scaffold_diversity):
-        return reward_fn
+    # Order matters: validity gates the raw reward first, then diversity
+    # bucketing penalizes over-represented scaffolds among the survivors.
+    if bool(reward_cfg.get("apply_validity_gate", False)):
+        wrappers.append(("validity_gate", {}))
 
-    bucket_size = int(reward_cfg.scaffold_bucket_size)
-    if bucket_size < 1:
-        raise ValueError(f"scaffold_bucket_size must be >= 1, got {bucket_size}")
+    if bool(reward_cfg.scaffold_diversity):
+        bucket_size = int(reward_cfg.scaffold_bucket_size)
+        if bucket_size < 1:
+            raise ValueError(f"scaffold_bucket_size must be >= 1, got {bucket_size}")
 
-    window_batches_raw = int(reward_cfg.scaffold_window_batches)
-    scaffold_window = None if window_batches_raw < 0 else window_batches_raw
-    if scaffold_window is not None and scaffold_window < 1:
-        raise ValueError(
-            "scaffold_window_batches must be >= 1 or -1 (full run), "
-            f"got {window_batches_raw}"
-        )
+        window_batches_raw = int(reward_cfg.scaffold_window_batches)
+        scaffold_window = None if window_batches_raw < 0 else window_batches_raw
+        if scaffold_window is not None and scaffold_window < 1:
+            raise ValueError(
+                "scaffold_window_batches must be >= 1 or -1 (full run), "
+                f"got {window_batches_raw}"
+            )
 
-    return scaffold_diversity_wrapper(
-        reward_fn,
-        bucket_size=bucket_size,
-        penalty=float(reward_cfg.scaffold_penalty),
-        generic_scaffold=not bool(reward_cfg.scaffold_labeled),
-        diversity_bucket=str(reward_cfg.scaffold_diversity_key),
-        window_batches=scaffold_window,
-    )
+        wrappers.append((
+            "scaffold_diversity",
+            dict(
+                bucket_size=bucket_size,
+                penalty=float(reward_cfg.scaffold_penalty),
+                generic_scaffold=not bool(reward_cfg.scaffold_labeled),
+                diversity_bucket=str(reward_cfg.scaffold_diversity_key),
+                window_batches=scaffold_window,
+            ),
+        ))
+
+    return build_reward_from_spec(name, representation=representation, wrappers=wrappers)
 
 
 def _init_wandb(cfg: DictConfig, config_payload: dict):
@@ -254,8 +324,9 @@ def run_from_cfg(cfg: DictConfig):
         flush=True,
     )
     module, datamodule = build_module_and_datamodule(cfg)
+    representation = Representation(cfg.representation)
     print(f"[grpo] loading checkpoint: {ckpt_path}", flush=True)
-    module = load_ckpt_into_module(module, ckpt_path)
+    module = load_ckpt_into_module(module, ckpt_path, representation=representation)
     module.integrator.max_atoms = int(cfg.rl.max_atoms)
 
     if int(cfg.rl.grpo.group_size) < 1:
@@ -268,7 +339,7 @@ def run_from_cfg(cfg: DictConfig):
     grpo_cfg = build_grpo_config(cfg.rl.grpo)
 
     dataloader = first_test_dataloader(datamodule)
-    reward_fn = build_reward(cfg.rl.reward)
+    reward_fn = build_reward(cfg.rl.reward, representation=representation)
     device = _resolve_device(str(cfg.rl.device))
 
     if bool(cfg.rl.wandb.enabled):
@@ -295,7 +366,18 @@ def run_from_cfg(cfg: DictConfig):
 
     if save_path is not None:
         os.makedirs(os.path.dirname(os.path.abspath(save_path)) or ".", exist_ok=True)
-        torch.save({"state_dict": module.state_dict()}, save_path)
+        _sync_model_ema_to_live(module)
+        torch.save(
+            {
+                "state_dict": module.state_dict(),
+                "hyper_parameters": {
+                    "representation": representation.value,
+                    "rl_checkpoint": True,
+                    "use_ema_for_eval": False,
+                },
+            },
+            save_path,
+        )
         print(f"saved: {save_path}")
 
 

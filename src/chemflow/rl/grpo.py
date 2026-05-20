@@ -74,9 +74,9 @@ class GRPOConfig:
     # `kl_coef` when you rely on the ref anchor (often an order of magnitude
     # or more — tune on validation).
     per_element_logp_mean: bool = False
-    # CFG inputs to feed guided_predict.  Built at rollout time from a batch's
-    # (mol_t, mol_1) pair and stashed here so every step + log-prob call shares
-    # the exact same conditioning.
+    # CFG signal overrides to feed guided_predict. Built at rollout time from a
+    # batch's (mol_t, mol_1) pair and stashed here so every step + log-prob call
+    # shares the exact same conditioning.
     cfg_inputs: dict | None = None
 
 
@@ -155,6 +155,17 @@ def _scatter_sum(src: torch.Tensor, index: torch.Tensor, dim_size: int) -> torch
 def _to_per_element_mean(per_graph_sum: torch.Tensor, denom: torch.Tensor) -> torch.Tensor:
     """`per_graph_sum / max(denom,1)` — safe when denom==0 (numerator is zero there)."""
     return per_graph_sum / denom.clamp(min=1.0)
+
+
+def _sync_model_ema_to_live(module) -> None:
+    """Copy live `model` weights into `model_ema` before checkpointing.
+
+    Prevents a stale EMA copy from overwriting the trained policy on reload
+    (see ``load_ckpt_into_module`` — it copies EMA -> model when the loaded
+    module has ``use_ema_for_eval=True``).
+    """
+    if getattr(module, "model_ema", None) is not None:
+        module.model_ema.load_state_dict(module.model.state_dict())
 
 
 def _gather_logp(probs: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
@@ -344,7 +355,7 @@ def _forward_preds(module, mol_t, t: torch.Tensor, cfg: GRPOConfig):
     """Single forward pass that returns the full preds dict (with h_latent)."""
     model = module._get_model()
     model.set_inference()
-    return module.cfg_adapter.guided_predict(model, mol_t, t, None, cfg.cfg_inputs)
+    return module.cfg_guidance.guided_predict(model, mol_t, t, None, cfg.cfg_inputs)
 
 
 def _compute_p_ins(
@@ -953,7 +964,8 @@ def rollout_trajectory(module, batch, cfg: GRPOConfig) -> Trajectory:
     n_steps = cfg.num_integration_steps or module.integrator.num_integration_steps
     step_sizes = module.integrator.get_time_steps(num_steps=n_steps)
 
-    cfg.cfg_inputs = module._build_inference_cfg_inputs(mol_t, mol_1, batch_size)
+    ctx = module.cfg_guidance.build_ctx()
+    cfg.cfg_inputs = module.cfg_guidance.build_overrides(mol_1, ctx)
 
     steps: List[StepData] = []
     for dt in step_sizes:
@@ -1217,6 +1229,12 @@ def train(
     module = module.to(device)
     for p in module.parameters():
         p.requires_grad_(True)
+    # GRPO trains the live `model`. Keep `model_ema` frozen so it doesn't enter
+    # the optimizer's param list (no Adam state allocated) and stays inert if
+    # something later puts it back in the forward graph.
+    if getattr(module, "model_ema", None) is not None:
+        for p in module.model_ema.parameters():
+            p.requires_grad_(False)
 
     ref_module: torch.nn.Module | None = None
     if cfg.kl_coef > 0.0:
@@ -1264,9 +1282,15 @@ def train(
 
         if best_save_path is not None and step >= best_warmup_steps and reward_ema > best_ema:
             best_ema = reward_ema
+            rep = getattr(module, "representation", None)
+            hp: dict = {"rl_checkpoint": True, "use_ema_for_eval": False}
+            if rep is not None:
+                hp["representation"] = rep.value
+            _sync_model_ema_to_live(module)
             torch.save(
                 {
                     "state_dict": module.state_dict(),
+                    "hyper_parameters": hp,
                     "step": step,
                     "reward_ema": reward_ema,
                     "reward_mean": r_mean,

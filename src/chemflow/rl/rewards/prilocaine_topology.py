@@ -7,7 +7,10 @@ import math
 import torch
 from rdkit import Chem
 
+from chemflow.dataset.representation import Representation
+
 from .common import _as_tensor, _iter_valid_mols
+from .spec import RewardSpec
 
 _PRILOCAINE_REF_SMILES = "CCCNC(C)C(=O)Nc1ccccc1C"
 _SHAPE_REF_SMILES = _PRILOCAINE_REF_SMILES  # Back-compat for analysis notebooks.
@@ -399,3 +402,13 @@ def topology_motif_reward(module, trajectory) -> tuple[torch.Tensor, dict[str, f
         ) if motif_vals else 0.0,
         "topology_motif_ref_count": float(motif_ref["motif_count"]),
     }
+
+
+# All three rewards build RDKit molecules from the final batch and score
+# against a reference scaffold, so they require full chemistry.
+_MOLECULE_ONLY = frozenset({Representation.MOLECULE})
+TANIMOTO_SPEC = RewardSpec(fn=tanimoto_reward, supported_representations=_MOLECULE_ONLY)
+TOPOLOGY_SPEC = RewardSpec(fn=topology_reward, supported_representations=_MOLECULE_ONLY)
+TOPOLOGY_MOTIF_SPEC = RewardSpec(
+    fn=topology_motif_reward, supported_representations=_MOLECULE_ONLY
+)

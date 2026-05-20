@@ -9,15 +9,25 @@ hydra:
     # GRPO historically ran from the repository root. Keep that runtime shape
     # even when using @hydra.main; durable artifacts are anchored by PROJECT_ROOT.
     chdir: false
+  run:
+    # Mirror pretraining's layout but slot RL under its own `grpo/` group so
+    # pretraining and RL outputs stay separated.
+    dir: ${hydra:runtime.cwd}/outputs/${hydra:runtime.choices.data}/grpo/${now:%Y-%m-%d}/${oc.env:CHEMFLOW_RUN_ID}
+
+# Match the old GRPO Slurm launcher, which used test batches of 128 prompts.
+data:
+  datamodule:
+    batch_size:
+      test: 128
 
 # GRPO fine-tuning config.
 rl:
-  # Checkpoints and run control
-  # Keep this pointed at the pretrained model by default. The Slurm continuation
-  # script overrides `rl.ckpt` when continuing from an RL checkpoint.
-  ckpt: ${oc.env:PROJECT_ROOT}/.pretrained_model/epoch=499-step=48500.ckpt
-  save: null
-  save_best: null
+  # Pretrained checkpoint to start from. Must carry `hyper_parameters.representation`.
+  ckpt: ${oc.env:PROJECT_ROOT}/.pretrained_model/epoch=167-step=4009.ckpt
+  # Saved under the per-run hydra dir so `.hydra/config.yaml`, the ckpts, and
+  # the run log all live together.
+  save:      ${hydra:runtime.output_dir}/grpo.pt
+  save_best: ${hydra:runtime.output_dir}/grpo_best.pt
   n_updates: 200
   lr: 1e-4
   device: auto  # auto | cuda | cpu
@@ -48,6 +58,9 @@ rl:
   # Reward registry key and optional REINVENT-style diversity wrapper.
   reward:
     name: n_atoms
+    # Multiply reward by RDKit validity (0/1) per graph. MOLECULE only;
+    # raises if true under any other representation.
+    apply_validity_gate: true
     scaffold_diversity: true
     scaffold_bucket_size: 10
     scaffold_penalty: 0.5
@@ -55,9 +68,10 @@ rl:
     scaffold_labeled: false
     scaffold_diversity_key: canonical_smiles  # murcko | canonical_smiles
 
-  # Weights & Biases logging for RL metrics.
+  # Weights & Biases logging for RL metrics. `group` is the right knob for sweep
+  # aggregation; set it from the sweep wrapper.
   wandb:
     enabled: true
-    project: chemflow-grpo-sweep-20260424_111439
-    name: null
+    project: chemflow-grpo-n_atoms
+    name: ${oc.env:CHEMFLOW_RUN_ID,base}
     group: null
