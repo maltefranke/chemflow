@@ -1,0 +1,43 @@
+# ── Joint classifier-free guidance on logP + QED ──
+# Both signals are cached on the dataset element (see chemflow.dataset.qm9).
+do_cfg: true
+
+cfg:
+  embed_dim: 128
+
+  # LogP
+  logp_dropout_prob: 0.0
+  logp_guidance_scale: 1.0
+  logp_sinusoidal_dim: 64
+  logp_max_period: 20.0
+  logp_encoder: null
+
+  # QED (bounded in [0, 1] — no extrapolation hook needed)
+  qed_dropout_prob: 0.0
+  qed_guidance_scale: 1.0
+  qed_sinusoidal_dim: 64
+  qed_max_period: 4.0
+
+  embedding:
+    _target_: chemflow.model.cfg.CFGEmbedding
+    out_dim: ${cfg.cfg.embed_dim}
+    signals:
+      - _target_: chemflow.model.cfg.LogPSignal
+        sinusoidal_dim: ${cfg.cfg.logp_sinusoidal_dim}
+        max_period: ${cfg.cfg.logp_max_period}
+        encoder_args: ${cfg.cfg.logp_encoder}
+        dropout_prob: ${cfg.cfg.logp_dropout_prob}
+        guidance_scale: ${cfg.cfg.logp_guidance_scale}
+        cfg_mode: linear
+      - _target_: chemflow.model.cfg.QEDSignal
+        sinusoidal_dim: ${cfg.cfg.qed_sinusoidal_dim}
+        max_period: ${cfg.cfg.qed_max_period}
+        dropout_prob: ${cfg.cfg.qed_dropout_prob}
+        guidance_scale: ${cfg.cfg.qed_guidance_scale}
+        cfg_mode: linear
+
+cfg_guidance:
+    _target_: chemflow.model.cfg.CFGGuidance
+
+cfg_embedding: ${cfg.cfg.embedding}
+cfg_embed_dim: ${cfg.cfg.embed_dim}

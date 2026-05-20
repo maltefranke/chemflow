@@ -1,49 +1,33 @@
-cfg_adapter:
-    _target_: chemflow.model.cfg.CFGAdapter
-    cfg_dropout_prob: ${if:${cfg.do_cfg}, ${cfg.cfg.property_dropout_prob}, 0.0}
-    cfg_guidance_scale: ${if:${cfg.do_cfg}, ${cfg.cfg.property_guidance_scale}, 0.0}
-    natoms_cfg_dropout_prob: ${if:${cfg.do_cfg}, ${cfg.cfg.natoms_dropout_prob}, 0.0}
-    natoms_cfg_guidance_scale: ${if:${cfg.do_cfg}, ${cfg.cfg.natoms_guidance_scale}, 0.0}
-    mw_cfg_dropout_prob: ${if:${cfg.do_cfg}, ${cfg.cfg.mw_dropout_prob}, 0.0}
-    mw_cfg_guidance_scale: ${if:${cfg.do_cfg}, ${cfg.cfg.mw_guidance_scale}, 0.0}
-
-# ── Unified classifier-free guidance ──
+# ── Classifier-free guidance on target atom count ──
 do_cfg: true
 
 cfg:
   embed_dim: 128
-  # Property conditioning (num_properties=0 disables)
-  num_properties: 0
-  property_hidden_dim: 128
-  property_dropout_prob: 0.0
-  property_guidance_scale: 1.0
-  # N-atoms conditioning (always on)
-  use_natoms: true
+
   natoms_dropout_prob: 0.0
   natoms_guidance_scale: 1.0
-  # Encoder used by UnifiedCFGEmbedding to embed the target n_atoms scalar
-  # before CFG null-mixing.  Must expose an `out_dim` attribute.
-  # Swap `_target_` to `chemflow.model.embedding.ExtrapolatableCountEmbedding`
-  # (and provide its args) for a representation that extrapolates to counts
-  # just outside the training support.
+
+  # Encoder used to embed the n_atoms scalar.  Swap _target_ to
+  # chemflow.model.embedding.ExtrapolatableCountEmbedding to extrapolate
+  # to counts just outside the training support.
   natoms_encoder:
     _target_: chemflow.model.embedding.CountEmbedding
     embedding_dim: 64
     out_dim: 64
     max_period: 100.0
-  # MW conditioning
-  use_mw: false
-  mw_dropout_prob: 0.0
-  mw_guidance_scale: 1.0
-  # Unified embedding
-  embedding:
-    _target_: chemflow.model.cfg.UnifiedCFGEmbedding
-    out_dim: ${cfg.cfg.embed_dim}
-    num_properties: ${cfg.cfg.num_properties}
-    property_hidden_dim: ${cfg.cfg.property_hidden_dim}
-    use_natoms: ${cfg.cfg.use_natoms}
-    natoms_encoder: ${cfg.cfg.natoms_encoder}
-    use_mw: ${cfg.cfg.use_mw}
 
-cfg_embedding: ${if:${cfg.do_cfg}, ${cfg.cfg.embedding}, null}
-cfg_embed_dim: ${if:${cfg.do_cfg}, ${cfg.cfg.embed_dim}, 0}
+  embedding:
+    _target_: chemflow.model.cfg.CFGEmbedding
+    out_dim: ${cfg.cfg.embed_dim}
+    signals:
+      - _target_: chemflow.model.cfg.NAtomsSignal
+        encoder_args: ${cfg.cfg.natoms_encoder}
+        dropout_prob: ${cfg.cfg.natoms_dropout_prob}
+        guidance_scale: ${cfg.cfg.natoms_guidance_scale}
+        cfg_mode: linear
+
+cfg_guidance:
+    _target_: chemflow.model.cfg.CFGGuidance
+
+cfg_embedding: ${cfg.cfg.embedding}
+cfg_embed_dim: ${cfg.cfg.embed_dim}

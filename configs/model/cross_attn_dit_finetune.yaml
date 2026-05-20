@@ -1,0 +1,104 @@
+# DiT backbone augmented with Flamingo-style gated cross-attention for
+# scaffold-decoration / molecule-optimization fine-tuning.
+#
+# Inherits everything from configs/model/dit.yaml and overrides:
+#   - module._target_ → LightningModuleRatesScaffoldFinetune (subclass that
+#       loads a pretrained unconditional DiT checkpoint and adds scaffold
+#       loss/inference masking)
+#   - model._target_  → ScaffoldCrossAttnDiTBackboneWithHeads (auto-builds
+#       scaffold cross-attn + edge-conditioning inputs from mol_t.scaffold_mask)
+#   - backbone._target_ → CrossAttnDiTBackbone (DiT + gated cross-attn blocks)
+#
+# Provides a ``pretrained_ckpt`` field for the lightning module to load.
+defaults:
+  - dit
+  - _self_
+
+module:
+  _target_: chemflow.model.lightning_module_finetune.LightningModuleRatesScaffoldFinetune
+  # Path to the unconditional DiT checkpoint to load weights from.
+  # CrossAttnDiT keys are auto-retargeted (backbone.* → backbone.dit.*).
+  pretrained_ckpt: /cluster/project/krause/frankem/chemflow/outputs/qm9/uncond/2026-05-16/tvjvno68/morph-qm9/tvjvno68/checkpoints/epoch=999-step=48000.ckpt
+  pretrained_prefer_ema: true
+  # If true, only the cross-attention blocks, edge-conditioning projection,
+  # embedding backbone, and heads train; the pretrained DiT blocks are frozen.
+  freeze_pretrained_backbone: false
+  # Whether to exclude scaffold atoms from sub / x losses. These atoms are
+  # frozen at inference, so training them adds no useful signal.
+  exclude_scaffold_from_sub_loss: true
+  exclude_scaffold_from_x_loss: true
+
+  # Override the model target to the scaffold-aware cross-attn wrapper.
+  model:
+    _target_: chemflow.model.scaffold_context.ScaffoldCrossAttnDiTBackboneWithHeads
+    _recursive_: false
+
+    atom_type_embedding_args: ${embeddings.atom_type_embedding}
+    edge_type_embedding_args: ${embeddings.edge_type_embedding}
+    time_embedding_args: ${embeddings.time_embedding}
+    node_count_embedding_args: ${embeddings.node_count_embedding}
+
+    backbone_model_args: ${model.backbone}
+
+    heads_args: ${heads.heads}
+    ins_gmm_head_args: ${heads.gmm_head}
+    ins_edge_head_args: ${heads.ins_edge_head}
+    cfg_embedding_args: ${cfg.cfg_embedding}
+
+    scaffold_encoder_args: ${model.scaffold_encoder}
+
+# Lower LR for fine-tuning. The base dit.yaml uses Muon @ 0.01 for backbone
+# weights — too high when starting from a fully trained unconditional model.
+# AdamW lr is also lowered for embeddings / heads / cross-attn blocks.
+# Override the optimizer config block.
+optimizer_lr_overrides:
+  optimizer:
+    lr: 1e-3
+  aux_optimizer:
+    lr: 1e-4
+  emb_optimizer:
+    lr: 1e-4
+
+# Scaffold context encoder configuration. Builds per-token cross-attention
+# inputs from the scaffold atoms of mol_t. ctx_dim and edge_ctx_dim must
+# match the corresponding fields on the backbone.
+scaffold_encoder:
+  _target_: chemflow.model.scaffold_context.ScaffoldContextEncoder
+  num_atom_types: ${len:${data.vocab.atom_tokens}}
+  num_charges: ${len:${data.vocab.charge_tokens}}
+  atom_embed_dim: 64
+  charge_embed_dim: 16
+  pos_embed_dim: 32
+  ctx_dim: ${model.backbone.ctx_dim}
+  edge_ctx_dim: ${model.backbone.edge_ctx_dim}
+  pair_bias_init: 2.0   # mild prior on (token_k → atom_k) attention
+
+# Override the backbone to use CrossAttnDiTBackbone.
+backbone:
+  _target_: chemflow.model.backbones.cross_attn_dit.CrossAttnDiTBackbone
+  _recursive_: false
+  d_input: ${embeddings.atom_type_embedding.out_dim}
+  d_cond: ${oc.eval:"${embeddings.time_embedding.out_dim} + ${embeddings.node_count_embedding.out_dim} + ${cfg.cfg_embed_dim}"}
+  d_model: 512
+  out_node_nf: 256
+  num_layers: 8
+  nhead: 16
+  mlp_ratio: 4.0
+  in_edge_nf: ${embeddings.edge_type_embedding.out_dim}
+  ctx_dim: 128
+  edge_ctx_dim: 32
+  # Graph-wise (property) conditioning. Set ``prop_dim`` to the dimension of
+  # the per-graph ``target_props`` tensor (e.g. 1 for a single QED-delta
+  # scalar). When the data path does not provide ``target_props`` (e.g. plain
+  # unconditional pretraining), leave ``prop_dim: null`` to disable this path
+  # entirely. The dataset side must match — see
+  # ``ScaffoldLightningDataModule.compute_qed_delta``.
+  prop_dim: 1
+  prop_hidden_dim: 256
+  rbf_embedding_args:
+    _target_: chemflow.model.embedding.RBFEmbedding
+    num_rbf: 128
+    rbf_dmax: 3.5
+    out_dim: 64
+    dropout: 0.0
+    trainable: false

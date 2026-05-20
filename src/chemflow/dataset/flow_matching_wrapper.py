@@ -1,10 +1,17 @@
 import math
 import torch
 import numpy as np
+from scipy.spatial.transform import Rotation
 from torch.utils.data import Dataset
 
 from chemflow.flow_matching.sampling import sample_prior_graph
 from chemflow.dataset.molecule_data import MoleculeBatch
+from chemflow.dataset.representation import (
+    Representation,
+    project_molecule_to_representation,
+    validate_representation,
+)
+from chemflow.dataset.vocab import Vocab
 
 
 class FlowMatchingDatasetWrapper(Dataset):
@@ -12,7 +19,13 @@ class FlowMatchingDatasetWrapper(Dataset):
     ``__getitem__``, enabling parallel processing across DataLoader workers.
 
     For **training**, each call to ``__getitem__`` returns a fully-processed
-    ``(mol_t, mol_1, ins_targets, t)`` tuple ready for batching.
+    ``(mol_t, mol_1, ins_targets, t)`` tuple ready for batching. When
+    ``n_augmentations > 1`` (training only), ``__getitem__`` instead returns a
+    list of ``n_augmentations`` such tuples — same molecule / prior / time /
+    interpolation noise, but each with an independent random rotation applied
+    to the coordinates. The DataLoader's ``batch_size`` should therefore be
+    divided by ``n_augmentations`` so that the effective collated batch size
+    stays constant.
 
     For **validation / test**, it returns ``(sample, target)`` with the prior
     sample already drawn.
@@ -23,16 +36,32 @@ class FlowMatchingDatasetWrapper(Dataset):
         base_dataset,
         distributions,
         interpolator,
+        vocab: Vocab,
+        representation: str | Representation = Representation.MOLECULE,
         n_atoms_strategy="flexible",
         time_dist=None,
         stage="train",
+        rotate: bool = False,
+        n_augmentations: int = 1,
     ):
+        self.representation = Representation(representation)
+        caps = getattr(type(base_dataset), "CAPABILITIES", None)
+        if caps is None:
+            raise ValueError(
+                f"Dataset {type(base_dataset).__name__} must declare a "
+                f"CAPABILITIES attribute to be used with a representation."
+            )
+        validate_representation(caps, self.representation)
+
         self.base_dataset = base_dataset
         self.distributions = distributions
         self.interpolator = interpolator
+        self.vocab = vocab
         self.n_atoms_strategy = n_atoms_strategy
         self.time_dist = time_dist
         self.stage = stage
+        self.rotate = rotate
+        self.n_augmentations = max(1, int(n_augmentations))
 
         if self.n_atoms_strategy == "median":
             n_atoms_dist = self.distributions.n_atoms_distribution
@@ -62,8 +91,34 @@ class FlowMatchingDatasetWrapper(Dataset):
         else:
             return None
 
+    @staticmethod
+    def _apply_rotation_inplace(mol, R):
+        """Rotate ``mol.x`` in place. ``R`` is a (3, 3) tensor matching ``mol.x.dtype``."""
+        if mol.x is not None and mol.x.numel() > 0:
+            mol.x = mol.x @ R
+
+    def _augment(self, mol_t, mol_1, ins_targets, t):
+        """Produce one augmented copy with a fresh random 3D rotation applied
+        consistently to ``mol_t.x``, ``mol_1.x`` and ``ins_targets.x``."""
+        aug_mol_t = mol_t.clone()
+        aug_mol_1 = mol_1.clone()
+        aug_ins_targets = ins_targets.clone()
+
+        if self.rotate:
+            R = torch.from_numpy(Rotation.random(1).as_matrix()[0]).to(
+                dtype=aug_mol_t.x.dtype
+            )
+            self._apply_rotation_inplace(aug_mol_t, R)
+            self._apply_rotation_inplace(aug_mol_1, R)
+            self._apply_rotation_inplace(aug_ins_targets, R)
+
+        return aug_mol_t, aug_mol_1, aug_ins_targets, t.clone()
+
     def __getitem__(self, index):
         target = self.base_dataset[index]
+        target = project_molecule_to_representation(
+            target, self.vocab, self.representation
+        )
 
         n_atoms = self._get_n_atoms(target)
         sample = sample_prior_graph(self.distributions, n_atoms=n_atoms)
@@ -79,7 +134,23 @@ class FlowMatchingDatasetWrapper(Dataset):
             if hasattr(target, "y") and target.y is not None:
                 mol_t.y = target.y
 
-            return mol_t, mol_1, ins_targets, t
+            # The interpolator builds mol_1 from filter_nodes(target) and drops
+            # non-tensor attributes; re-attach the SMILES so downstream CFG
+            # signals (e.g. logP) can be computed from mol_1.
+            if hasattr(target, "smiles"):
+                mol_1.smiles = target.smiles
+                mol_t.smiles = target.smiles
+
+            if self.n_augmentations <= 1:
+                if self.rotate:
+                    return self._augment(mol_t, mol_1, ins_targets, t)
+                return mol_t, mol_1, ins_targets, t
+
+            # Same processed sample, N independent rotations.
+            return [
+                self._augment(mol_t, mol_1, ins_targets, t)
+                for _ in range(self.n_augmentations)
+            ]
 
         return sample, target
 
@@ -100,6 +171,17 @@ def train_collate_fn(batch):
     - ``ins_edge_ins_local_idx`` indexes batched ``ins_targets`` (inserted node).
     - ``ins_edge_types`` stores edge class targets.
     """
+    # When ``n_augmentations > 1`` the wrapper returns a list of tuples per
+    # __getitem__ call (same molecule, different rotations). Flatten so the
+    # rest of this function can iterate uniformly.
+    flat_batch = []
+    for item in batch:
+        if isinstance(item, list):
+            flat_batch.extend(item)
+        else:
+            flat_batch.append(item)
+    batch = flat_batch
+
     mol_t_list = []
     mol_1_list = []
     ins_targets_list = []

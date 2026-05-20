@@ -30,7 +30,7 @@ import pytorch_lightning as pl
 import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
-from rdkit import RDLogger
+from rdkit import Chem, RDLogger
 
 from chemflow.dataset.vocab import setup_token_weights
 from chemflow.utils.diagnostics import (
@@ -90,7 +90,7 @@ def _setup_eval_components(cfg, predict_batch_size: int):
     allow_charged = bool(cfg.data.get("allow_charged", False))
 
     train_smiles = datamodule.train_dataset.base_dataset.get_all_smiles()
-    metrics, stability_metrics, distribution_metrics = init_metrics(
+    metrics, stability_metrics, distribution_metrics, _batch_metrics = init_metrics(
         train_smiles=train_smiles,
         target_n_atoms_distribution=loss_weight_distributions.n_atoms_distribution,
         atom_type_distribution=loss_weight_distributions.atom_type_distribution,
@@ -156,7 +156,7 @@ class EmpiricalNAtomsSampler(pl.Callback):
 
     Before each predict batch, samples a ``(batch_size,)`` tensor from
     ``n_atoms_distribution`` and writes it to
-    ``module.predict_target_n_atoms_override`` (the signal read by
+    ``module.predict_overrides["n_atoms"]`` (read by
     ``LightningModuleRates.predict_step``).
     """
 
@@ -197,8 +197,7 @@ class EmpiricalNAtomsSampler(pl.Callback):
             generator=self.generator,
         )
         targets = idx.to(dtype=torch.long, device=pl_module.device)
-        pl_module.predict_target_n_atoms_override = targets
-        pl_module.predict_target_mw_override = None
+        pl_module.predict_overrides = {"n_atoms": targets}
         self.sampled_targets.extend(int(x) for x in idx.tolist())
 
 
@@ -239,14 +238,11 @@ def _install_ordered_predict_step(module) -> None:
 
     def predict_step(self, batch, batch_idx):
         return_traj = bool(getattr(self, "predict_return_traj", True))
-        target_override = getattr(self, "predict_target_n_atoms_override", None)
-        target_mw_override = getattr(self, "predict_target_mw_override", None)
         gen_mols = self.sample(
             batch,
             batch_idx,
             return_traj=return_traj,
-            target_n_atoms_override=target_override,
-            target_mw_override=target_mw_override,
+            overrides=getattr(self, "predict_overrides", None),
         )
 
         last_rdkit = [
@@ -318,6 +314,102 @@ def _collect_from_predict_output(pred) -> tuple[list, list, list, list]:
     return valid_trajs, invalid_trajs, all_trajs, is_valid_mask
 
 
+_KEKULIZE_EXCEPTIONS = tuple(
+    exc
+    for exc in (
+        getattr(Chem, "AtomKekulizeException", None),
+        getattr(Chem, "KekulizeException", None),
+    )
+    if exc is not None
+)
+
+
+def _kekulize_safe_writer(path: Path) -> Chem.SDWriter:
+    writer = Chem.SDWriter(str(path))
+    writer.SetKekulize(False)
+    return writer
+
+
+def _write_sdf_mol(
+    writer: Chem.SDWriter,
+    mol: Chem.Mol | None,
+    name: str,
+    is_valid: bool,
+    target_n_atoms: int | None,
+) -> bool:
+    if mol is None:
+        return False
+    mol.SetProp("_Name", name)
+    mol.SetProp("valid", "1" if is_valid else "0")
+    if target_n_atoms is not None:
+        mol.SetProp("target_n_atoms", str(int(target_n_atoms)))
+    try:
+        writer.write(mol)
+        return True
+    except _KEKULIZE_EXCEPTIONS:
+        fallback = Chem.RWMol(mol)
+        for atom in fallback.GetAtoms():
+            atom.SetIsAromatic(False)
+        for bond in fallback.GetBonds():
+            if bond.GetBondType() == Chem.BondType.AROMATIC or bond.GetIsAromatic():
+                bond.SetBondType(Chem.BondType.SINGLE)
+            bond.SetIsAromatic(False)
+        fallback.SetProp("_Name", name)
+        fallback.SetProp("valid", "1" if is_valid else "0")
+        if target_n_atoms is not None:
+            fallback.SetProp("target_n_atoms", str(int(target_n_atoms)))
+        try:
+            writer.write(fallback)
+            return True
+        except Exception as e:
+            print(f"  skipping {name}: {e}")
+            return False
+    except Exception as e:
+        print(f"  skipping {name}: {e}")
+        return False
+
+
+def _save_final_frames_sdf(
+    all_trajs: list,
+    is_valid_mask: list[bool],
+    sampled_targets: list[int],
+    vocab,
+    output_dir: Path,
+) -> tuple[Path, Path, int, int]:
+    valid_path = output_dir / "valid.sdf"
+    invalid_path = output_dir / "invalid.sdf"
+    valid_writer = _kekulize_safe_writer(valid_path)
+    invalid_writer = _kekulize_safe_writer(invalid_path)
+
+    n_valid_written = 0
+    n_invalid_written = 0
+    try:
+        for idx, (traj, is_valid) in enumerate(zip(all_trajs, is_valid_mask)):
+            final_mol = _final_mol(traj)
+            rdmol = None
+            if final_mol is not None:
+                try:
+                    rdmol = final_mol.to_rdkit_mol(
+                        vocab.atom_tokens,
+                        vocab.edge_tokens,
+                        vocab.charge_tokens,
+                    )
+                except Exception:
+                    rdmol = None
+            target = sampled_targets[idx] if idx < len(sampled_targets) else None
+            writer = valid_writer if is_valid else invalid_writer
+            if _write_sdf_mol(writer, rdmol, f"mol_{idx:04d}", is_valid, target):
+                if is_valid:
+                    n_valid_written += 1
+                else:
+                    n_invalid_written += 1
+    finally:
+        valid_writer.close()
+        invalid_writer.close()
+
+    return valid_path, invalid_path, n_valid_written, n_invalid_written
+
+
 def _trajectories_to_rdkit(trajectories, vocab) -> list:
     rdkit_mols: list = []
     for traj in trajectories:
@@ -365,7 +457,7 @@ def _compute_all_metrics(
         for k, v in stability_metrics.compute().items():
             results[k] = v.item() if isinstance(v, torch.Tensor) else v
     else:
-        for key in ("atom-stability", "molecule-stability"):
+        for key in ("rdkit-atom-stability", "rdkit-molecule-stability"):
             results[key] = float("nan")
 
     if distribution_metrics is not None:
@@ -703,6 +795,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Disable saving generated molecule trajectories.",
     )
     parser.add_argument(
+        "--no-save-sdf",
+        action="store_true",
+        help="Disable writing valid.sdf / invalid.sdf with the final frames.",
+    )
+    parser.add_argument(
         "--diagnostics-min-invalid-duration",
         type=int,
         default=1,
@@ -741,18 +838,18 @@ def main() -> None:
     _load_checkpoint(module, args.checkpoint)
     _install_ordered_predict_step(module)
 
-    adapter = module.cfg_adapter
-    if not adapter._has_natoms_cfg:
+    guidance = module.cfg_guidance
+    natoms_signal = next((s for s in guidance.signals if s.name == "n_atoms"), None)
+    if natoms_signal is None:
         raise RuntimeError("Loaded model does not expose n-atoms CFG conditioning.")
 
-    # Force property / MW CFG off; only the n_atoms branch is exercised here.
-    original_property_scale = adapter.cfg_guidance_scale
-    original_mw_scale = adapter.mw_cfg_guidance_scale
-    original_natoms_scale = adapter.natoms_cfg_guidance_scale
-    adapter.cfg_guidance_scale = 0.0
-    adapter.mw_cfg_guidance_scale = 0.0
+    # Force every other signal off; only the n_atoms branch is exercised here.
+    original_scales = {s.name: s.guidance_scale for s in guidance.signals}
+    for s in guidance.signals:
+        if s.name != "n_atoms":
+            s.guidance_scale = 0.0
     if args.natoms_guidance_scale is not None:
-        adapter.natoms_cfg_guidance_scale = float(args.natoms_guidance_scale)
+        natoms_signal.guidance_scale = float(args.natoms_guidance_scale)
 
     # Save tokens so the diagnostics CLI can be re-run on the saved trajectories.
     _dump_tokens(vocab, args.output_dir)
@@ -789,11 +886,9 @@ def main() -> None:
     try:
         predictions = trainer.predict(module, dataloaders=test_dl)
     finally:
-        adapter.cfg_guidance_scale = original_property_scale
-        adapter.mw_cfg_guidance_scale = original_mw_scale
-        adapter.natoms_cfg_guidance_scale = original_natoms_scale
-        module.predict_target_n_atoms_override = None
-        module.predict_target_mw_override = None
+        for s in guidance.signals:
+            s.guidance_scale = original_scales[s.name]
+        module.predict_overrides = None
 
     for pred in predictions or []:
         _, _, trajs_in_order, mask_in_order = _collect_from_predict_output(pred)
@@ -914,6 +1009,23 @@ def main() -> None:
         )
         print(f"Saved trajectories to:           {trajectories_path}")
 
+    if not args.no_save_sdf:
+        valid_sdf_path, invalid_sdf_path, n_valid_sdf, n_invalid_sdf = (
+            _save_final_frames_sdf(
+                all_trajs=all_trajs,
+                is_valid_mask=is_valid_mask,
+                sampled_targets=sampled_targets,
+                vocab=vocab,
+                output_dir=args.output_dir,
+            )
+        )
+        print(
+            f"Saved {n_valid_sdf} valid molecules to:    {valid_sdf_path}"
+        )
+        print(
+            f"Saved {n_invalid_sdf} invalid molecules to:  {invalid_sdf_path}"
+        )
+
     print(f"Saved JSON summary to:           {json_path}")
     print(f"Saved tensor results to:         {pt_path}")
     print(f"Saved n_atoms plot to:           {plot_path}")
@@ -931,9 +1043,9 @@ def main() -> None:
     )
     print(f"  novelty                  : {tm.get('novelty', float('nan')):.1%}")
     print(f"  uniqueness               : {tm.get('uniqueness', float('nan')):.1%}")
-    print(f"  atom-stability           : {tm.get('atom-stability', float('nan')):.1%}")
+    print(f"  atom-stability           : {tm.get('rdkit-atom-stability', float('nan')):.1%}")
     print(
-        f"  molecule-stability       : {tm.get('molecule-stability', float('nan')):.1%}"
+        f"  molecule-stability       : {tm.get('rdkit-molecule-stability', float('nan')):.1%}"
     )
     print(f"  energy-validity          : {tm.get('energy-validity', float('nan')):.1%}")
     print(

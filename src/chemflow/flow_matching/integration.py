@@ -51,6 +51,7 @@ class RateIntegrator:
         num_integration_steps=100,
         time_strategy="log",
         ins_noise_scale=0.01,
+        renoise_insertions: bool = False,
         del_schedule: KappaSchedule | None = None,
         ins_schedule: KappaSchedule | None = None,
         sub_schedule: KappaSchedule | None = None,
@@ -61,6 +62,11 @@ class RateIntegrator:
         self.distributions = distributions
         self.gmm_params = gmm_params
         self.ins_noise_scale = ins_noise_scale
+        # When True, renoise newly inserted node positions / atom types / charges
+        # back to the t+dt marginal so they match training (mirrors the renoising
+        # already done for inserted edges). When False, inserted nodes go in at
+        # the model's clean predictions.
+        self.renoise_insertions = renoise_insertions
         self.n_atoms_strategy = n_atoms_strategy
         self.time_strategy = time_strategy
         self.num_integration_steps = num_integration_steps
@@ -181,6 +187,54 @@ class RateIntegrator:
 
         return new_atoms
 
+    def _renoise_insertions(
+        self,
+        new_atoms: PointCloud,
+        t_ins: torch.Tensor,
+    ) -> PointCloud:
+        """Push freshly-inserted nodes to the t+dt marginal.
+
+        Training places inserted nodes at noise level matching `t` (linear
+        interpolation + ins_noise on positions, Bernoulli kappa-mix on a/c).
+        Sampling from the GMM head gives the *clean* prediction (x_1, a_1, c_1).
+        This helper re-introduces the matching noise so the next forward pass
+        sees inputs drawn from the same distribution as during training.
+        """
+        if t_ins.numel() == 0:
+            return new_atoms
+
+        t_ins = t_ins.to(new_atoms.x.device).clamp(0.0, 1.0)
+
+        # ── Positions: add (1 - t) * ins_noise_scale * randn ──────────────────
+        # Mirrors training's `target + (1 - t) * ins_noise_scale * randn` after
+        # linear interpolation. (move_noise_scale isn't applied here; it's the
+        # ongoing position noise channel, not the insertion-specific term.)
+        noise_x = torch.randn_like(new_atoms.x)
+        scale_x = ((1.0 - t_ins) * self.ins_noise_scale).unsqueeze(-1)
+        new_atoms.x = new_atoms.x + scale_x * noise_x
+
+        # ── Atom types: Bernoulli kappa-mix between clean a_1 and prior ───────
+        A = self._cat_atom.probs.shape[-1]
+        kappa_a = self.sub_schedule.kappa_t(t_ins).clamp(0.0, 1.0).unsqueeze(-1)
+        prior_a = self._cat_atom.probs.unsqueeze(0).expand(new_atoms.a.shape[0], -1)
+        a_oh = F.one_hot(new_atoms.a, num_classes=A).to(prior_a.dtype)
+        a_mix = prior_a * (1.0 - kappa_a) + a_oh * kappa_a
+        a_mix = a_mix.float()
+        a_mix = a_mix / a_mix.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        new_atoms.a = torch.distributions.Categorical(probs=a_mix).sample()
+
+        # ── Charges: same scheme, sub_schedule is reused for c at training ───
+        C = self._cat_charge.probs.shape[-1]
+        kappa_c = kappa_a  # training shares sub_schedule for a and c
+        prior_c = self._cat_charge.probs.unsqueeze(0).expand(new_atoms.c.shape[0], -1)
+        c_oh = F.one_hot(new_atoms.c, num_classes=C).to(prior_c.dtype)
+        c_mix = prior_c * (1.0 - kappa_c) + c_oh * kappa_c
+        c_mix = c_mix.float()
+        c_mix = c_mix / c_mix.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        new_atoms.c = torch.distributions.Categorical(probs=c_mix).sample()
+
+        return new_atoms
+
     def integrate_step_gnn(
         self,
         mol_t: MoleculeData,
@@ -195,6 +249,7 @@ class RateIntegrator:
         eps: float = 1e-6,
         h_latent: torch.Tensor = None,
         ins_edge_head=None,
+        force_charge_idx: int | None = None,
     ) -> MoleculeBatch:
         """
         Integrate one step of the stochastic process for GNN models.
@@ -257,6 +312,16 @@ class RateIntegrator:
         x_t_original = x_t
 
         velocity = (x_1 - x_t) * move_rate_node.view(-1, 1)
+        # Scaffold preservation: when mol_t carries a scaffold_mask, freeze the
+        # positions of scaffold atoms by zeroing their velocity. Edit-channel
+        # masking (do_del / do_sub_a / scaffold-scaffold do_sub_e) is done by
+        # the caller in lightning_module.sample(), so insertions seeded *from*
+        # scaffold atoms (decoration growth) remain unaffected.
+        scaffold_mask = getattr(mol_t, "scaffold_mask", None)
+        if scaffold_mask is not None:
+            # this seemed to work better
+            # velocity[scaffold_mask.bool()] = 0.0
+            pass
         x_t = x_t + velocity * dt
 
         """INSERTION"""
@@ -361,6 +426,12 @@ class RateIntegrator:
             batch=batch_id,
         )
 
+        # Carry scaffold_mask through so the deletion/insertion stages below
+        # (and any downstream filter_nodes / join / sort_nodes_by_batch) can
+        # keep it aligned with the evolving node set.
+        if scaffold_mask is not None:
+            mol.scaffold_mask = scaffold_mask
+
         if self.n_atoms_strategy != "fixed":
             # Build index mapping: original_idx -> post_deletion_idx (or -1 if deleted)
             N_original = mol.num_nodes
@@ -407,6 +478,18 @@ class RateIntegrator:
                 t_ins = t[batch_id[do_ins_valid]] + dt
                 new_atoms = self.sample_insertions(ins_gmm_dict, t_ins)
 
+                # Optionally renoise inserted x/a/c to the t+dt marginal so the
+                # next forward pass sees a distribution matching training.
+                # Mirrors the e_t_ins renoising done a few blocks below.
+                if self.renoise_insertions:
+                    new_atoms = self._renoise_insertions(new_atoms, t_ins)
+
+                # In non-charge modes the c_probs sub-head is untrained at this
+                # call site; clamp inserted charges to the neutral index so they
+                # match what training saw (all targets were neutral_idx).
+                if force_charge_idx is not None:
+                    new_atoms.c = torch.full_like(new_atoms.c, force_charge_idx)
+
                 new_atoms.batch = batch_id[do_ins_valid]
 
                 # Determine fallback edge distribution
@@ -450,28 +533,36 @@ class RateIntegrator:
                         )
                     )
 
-                    # sample e1_ins_types
+                    # sample e1_ins_types (clean t=1 edge type prediction)
                     ins_edge_probs = F.softmax(ins_edge_logits, dim=-1)
-                    e1_ins_types = torch.distributions.Categorical(
+                    e1_ins_idx = torch.distributions.Categorical(
                         probs=ins_edge_probs
                     ).sample()
-                    e1_ins_types = F.one_hot(
-                        e1_ins_types, num_classes=len(self.vocab.edge_tokens)
-                    )
 
-                    # Adjust to noise level of next time step t+dt
-                    t_ins_orig = t[batch_id[orig_spawn_idx]] + dt
-                    kappa_t_e = self.sub_e_schedule.kappa_t(t_ins_orig).unsqueeze(1)
+                    if self.renoise_insertions:
+                        # Adjust to noise level of next time step t+dt.
+                        e1_ins_types = F.one_hot(
+                            e1_ins_idx, num_classes=len(self.vocab.edge_tokens)
+                        )
+                        t_ins_orig = t[batch_id[orig_spawn_idx]] + dt
+                        kappa_t_e = self.sub_e_schedule.kappa_t(t_ins_orig).unsqueeze(1)
 
-                    prior_edge_probs = self._cat_edge.probs.unsqueeze(0).expand(
-                        e1_ins_types.shape[0], -1
-                    )
-                    e_t_ins = (
-                        prior_edge_probs * (1 - kappa_t_e)
-                        + e1_ins_types.to(dtype=prior_edge_probs.dtype) * kappa_t_e
-                    )
-                    # e_t_ins = F.softmax(e_t_ins, dim=-1)
-                    e_t_ins = torch.distributions.Categorical(probs=e_t_ins).sample()
+                        prior_edge_probs = self._cat_edge.probs.unsqueeze(0).expand(
+                            e1_ins_types.shape[0], -1
+                        )
+                        e_t_ins = (
+                            prior_edge_probs * (1 - kappa_t_e)
+                            + e1_ins_types.to(dtype=prior_edge_probs.dtype) * kappa_t_e
+                        )
+                        # Cast to fp32 + explicit row-normalize: convex combos of bf16
+                        # probability tensors can drift outside the [1 - 1e-6, 1 + 1e-6]
+                        # simplex tolerance enforced by ``Categorical(validate_args=True)``.
+                        e_t_ins = e_t_ins.float()
+                        e_t_ins = e_t_ins / e_t_ins.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                        e_t_ins = torch.distributions.Categorical(probs=e_t_ins).sample()
+                    else:
+                        # No renoising: drop in at the clean prediction.
+                        e_t_ins = e1_ins_idx
 
                     if ins_edge_logits is not None and ins_edge_logits.numel() > 0:
                         # Map spawn indices to new atom indices (0, 1, 2, ...)
@@ -528,26 +619,35 @@ class RateIntegrator:
                             ins_x_dst=new_atoms.x[ii_dst],
                         )
 
-                        ii_probs = F.softmax(ii_logits, dim=-1)
-                        e1_ii = torch.distributions.Categorical(probs=ii_probs).sample()
-                        e1_ii = F.one_hot(
-                            e1_ii, num_classes=len(self.vocab.edge_tokens)
-                        )
-
-                        # Adjust to noise level t+dt using spawn_src's graph time
-                        t_ii = t[batch_id[ii_spawn_src]] + dt
-                        kappa_t_ii = self.sub_e_schedule.kappa_t(t_ii).unsqueeze(1)
-                        prior_ii = self._cat_edge.probs.unsqueeze(0).expand(
-                            e1_ii.shape[0], -1
-                        )
-                        e_t_ins_ii = (
-                            prior_ii * (1 - kappa_t_ii)
-                            + e1_ii.to(dtype=prior_ii.dtype) * kappa_t_ii
-                        )
-                        # e_t_ins_ii = F.softmax(e_t_ins_ii, dim=-1)
-                        e_t_ins_ii = torch.distributions.Categorical(
-                            probs=e_t_ins_ii
+                        # Pass logits directly: skips the bf16 softmax precision
+                        # loss that violates the simplex tolerance.
+                        e1_ii_idx = torch.distributions.Categorical(
+                            logits=ii_logits.float()
                         ).sample()
+
+                        if self.renoise_insertions:
+                            e1_ii = F.one_hot(
+                                e1_ii_idx, num_classes=len(self.vocab.edge_tokens)
+                            )
+                            # Adjust to noise level t+dt using spawn_src's graph time
+                            t_ii = t[batch_id[ii_spawn_src]] + dt
+                            kappa_t_ii = self.sub_e_schedule.kappa_t(t_ii).unsqueeze(1)
+                            prior_ii = self._cat_edge.probs.unsqueeze(0).expand(
+                                e1_ii.shape[0], -1
+                            )
+                            e_t_ins_ii = (
+                                prior_ii * (1 - kappa_t_ii)
+                                + e1_ii.to(dtype=prior_ii.dtype) * kappa_t_ii
+                            )
+                            e_t_ins_ii = e_t_ins_ii.float()
+                            e_t_ins_ii = e_t_ins_ii / e_t_ins_ii.sum(
+                                dim=-1, keepdim=True
+                            ).clamp_min(1e-12)
+                            e_t_ins_ii = torch.distributions.Categorical(
+                                probs=e_t_ins_ii
+                            ).sample()
+                        else:
+                            e_t_ins_ii = e1_ii_idx
 
                         ins_ii_src_local = ii_src
                         ins_ii_dst_local = ii_dst
@@ -560,39 +660,6 @@ class RateIntegrator:
                     and e_t_ins is not None
                     and e_t_ins.numel() > 0
                 )
-
-                """# Finally, we turn the new atoms to the current noise level
-                kappa_t = self.sub_schedule.kappa_t(t_ins).unsqueeze(1)
-                a_1_one_hot = F.one_hot(
-                    new_atoms.a, num_classes=len(self.vocab.atom_tokens)
-                )
-                c_1_one_hot = F.one_hot(
-                    new_atoms.c, num_classes=len(self.vocab.charge_tokens)
-                )
-
-                a = (
-                    self._cat_atom.probs.repeat(c_1_one_hot.shape[0], 1) * (1 - kappa_t)
-                    + a_1_one_hot * kappa_t
-                )
-                # a = F.softmax(a, dim=-1)
-                a = torch.distributions.Categorical(probs=a).sample()
-
-                c = (
-                    self._cat_charge.probs.repeat(c_1_one_hot.shape[0], 1)
-                    * (1 - kappa_t)
-                    + c_1_one_hot * kappa_t
-                )
-                # c = F.softmax(c, dim=-1)
-                c = torch.distributions.Categorical(probs=c).sample()
-
-                t_ins = t_ins.view(-1, 1)
-                x = new_atoms.x + self.ins_noise_scale * torch.randn_like(
-                    new_atoms.x, device=self.device
-                ) * (1 - t_ins)
-
-                new_atoms.x = x
-                new_atoms.a = a
-                new_atoms.c = c"""
 
                 if use_predicted_edges:
                     # Use predicted edges from InsertionEdgeHead
@@ -613,4 +680,7 @@ class RateIntegrator:
                     # Fall back to random edge sampling
                     mol = join_molecules_with_atoms(mol, new_atoms, edge_dist)
 
+        # max_seqlen may have shifted from inserts/deletes; recompute once for
+        # the next backbone forward (flash-attn varlen needs a Python int).
+        mol.max_seqlen = int(torch.bincount(mol.batch).max().item())
         return mol

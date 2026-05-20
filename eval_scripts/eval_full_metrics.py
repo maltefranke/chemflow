@@ -108,7 +108,7 @@ def _setup_eval_components(cfg, predict_batch_size: int):
     allow_charged = bool(cfg.data.get("allow_charged", False))
 
     train_smiles = datamodule.train_dataset.base_dataset.get_all_smiles()
-    metrics, stability_metrics, distribution_metrics = init_metrics(
+    metrics, stability_metrics, distribution_metrics, _batch_metrics = init_metrics(
         train_smiles=train_smiles,
         target_n_atoms_distribution=loss_weight_distributions.n_atoms_distribution,
         atom_type_distribution=loss_weight_distributions.atom_type_distribution,
@@ -202,10 +202,9 @@ class EmpiricalNAtomsSampler(pl.Callback):
         idx = torch.multinomial(
             self.probs, num_samples=bs, replacement=True, generator=self.generator
         )
-        pl_module.predict_target_n_atoms_override = idx.to(
-            dtype=torch.long, device=pl_module.device
-        )
-        pl_module.predict_target_mw_override = None
+        pl_module.predict_overrides = {
+            "n_atoms": idx.to(dtype=torch.long, device=pl_module.device),
+        }
         self.sampled_targets.extend(int(x) for x in idx.tolist())
 
 
@@ -329,7 +328,7 @@ def _compute_all_metrics(
         for k, v in stability_metrics.compute().items():
             results[k] = v.item() if isinstance(v, torch.Tensor) else v
     else:
-        for key in ("atom-stability", "molecule-stability"):
+        for key in ("rdkit-atom-stability", "rdkit-molecule-stability"):
             results[key] = float("nan")
 
     if distribution_metrics is not None:
@@ -385,8 +384,7 @@ def _run_one_seed(
     trainer_kwargs["limit_predict_batches"] = n_predict_batches
 
     callbacks: list = []
-    adapter = module.cfg_adapter
-    if adapter._has_natoms_cfg:
+    if module.cfg_guidance.has_signal("n_atoms"):
         callbacks.append(
             EmpiricalNAtomsSampler(
                 n_atoms_distribution=distributions.n_atoms_distribution, seed=seed
@@ -401,8 +399,7 @@ def _run_one_seed(
     )
 
     module.predict_return_traj = True
-    module.predict_target_n_atoms_override = None
-    module.predict_target_mw_override = None
+    module.predict_overrides = None
 
     print(
         f"\n[seed={seed}] generating ~{n_mols} molecules "

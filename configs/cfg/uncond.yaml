@@ -1,38 +1,11 @@
-cfg_adapter:
-    _target_: chemflow.model.cfg.CFGAdapter
-    cfg_dropout_prob: ${if:${cfg.do_cfg}, ${cfg.cfg.property_dropout_prob}, 0.0}
-    cfg_guidance_scale: ${if:${cfg.do_cfg}, ${cfg.cfg.property_guidance_scale}, 0.0}
-    natoms_cfg_dropout_prob: ${if:${cfg.do_cfg}, ${cfg.cfg.natoms_dropout_prob}, 0.0}
-    natoms_cfg_guidance_scale: ${if:${cfg.do_cfg}, ${cfg.cfg.natoms_guidance_scale}, 0.0}
-    mw_cfg_dropout_prob: ${if:${cfg.do_cfg}, ${cfg.cfg.mw_dropout_prob}, 0.0}
-    mw_cfg_guidance_scale: ${if:${cfg.do_cfg}, ${cfg.cfg.mw_guidance_scale}, 0.0}
-
-# ── Unified classifier-free guidance ──
+# ── Unconditional model: no CFG signals ──
 do_cfg: false
 
 cfg:
-  embed_dim: 128
-  # Property conditioning (num_properties=0 disables)
-  num_properties: 0
-  property_hidden_dim: 128
-  property_dropout_prob: 0.15
-  property_guidance_scale: 1.5
-  # N-atoms conditioning
-  use_natoms: false
-  natoms_dropout_prob: 0.15
-  natoms_guidance_scale: 0.0
-  # MW conditioning
-  use_mw: false
-  mw_dropout_prob: 0.15
-  mw_guidance_scale: 0.0
-  # Unified embedding
-  embedding:
-    _target_: chemflow.model.cfg.UnifiedCFGEmbedding
-    out_dim: ${cfg.cfg.embed_dim}
-    num_properties: ${cfg.cfg.num_properties}
-    property_hidden_dim: ${cfg.cfg.property_hidden_dim}
-    use_natoms: ${cfg.cfg.use_natoms}
-    use_mw: ${cfg.cfg.use_mw}
+  embed_dim: 0
 
-cfg_embedding: ${if:${cfg.do_cfg}, ${cfg.cfg.embedding}, null}
-cfg_embed_dim: ${if:${cfg.do_cfg}, ${cfg.cfg.embed_dim}, 0}
+cfg_guidance:
+    _target_: chemflow.model.cfg.CFGGuidance
+
+cfg_embedding: null
+cfg_embed_dim: 0

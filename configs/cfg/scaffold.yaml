@@ -1,0 +1,12 @@
+# ── Scaffold fine-tune: no CFG property signal, scaffold conditioning is
+# applied separately by the ScaffoldCrossAttnDiTBackboneWithHeads model ──
+do_cfg: false
+
+cfg:
+  embed_dim: 0
+
+cfg_guidance:
+    _target_: chemflow.model.cfg.CFGGuidance
+
+cfg_embedding: null
+cfg_embed_dim: 0

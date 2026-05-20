@@ -1,0 +1,30 @@
+# @package _global_
+# QM9 **scaffold decoration** fine-tune preset.
+#
+# Bare-scaffold source → full-molecule target. The model learns to grow
+# a molecule by inserting decoration atoms around the fixed scaffold.
+# For the full-molecule → full-molecule "molecule optimization" task use
+# ``defaults=qm9_scaffold`` instead.
+#
+# Differences from qm9_scaffold:
+#   - data → qm9_scaffold_decoration (wrapper_kind=scaffold_decoration,
+#       compute_qed_delta=false)
+#   - model.backbone.prop_dim → null (no per-graph target_props since the
+#       source is a bare scaffold with no QED)
+#
+# Reuses the same cross_attn_dit_finetune model config (which loads the
+# pretrained unconditional DiT) and the same scaffold cfg group.
+defaults:
+  - core
+  - /data: qm9_scaffold_decoration
+  - /embeddings: qm9
+  - override /model: cross_attn_dit_finetune
+  - override /cfg: scaffold
+  - _self_
+
+# Disable per-graph property conditioning for the scaffold-decoration task.
+# The cross-attention path (cond_tokens + edge_cond derived from scaffold_mask)
+# remains active; only the QED-delta scalar input is turned off.
+model:
+  backbone:
+    prop_dim: null

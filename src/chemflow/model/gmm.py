@@ -52,8 +52,12 @@ def get_typed_gmm_components(gmm_output):
 
     # --- Mixture Weights ---
     # Shape: [B, K] -> [B, 1, K]
-    # We use 'probs' because compute_equivariant_gmm already applied softmax
-    mixture_weights = Categorical(probs=pi.unsqueeze(1))
+    # We use 'probs' because compute_equivariant_gmm already applied softmax.
+    # Cast to fp32 + renormalize so bf16 softmax rounding doesn't trip the
+    # simplex tolerance enforced by ``Categorical(validate_args=True)``.
+    pi32 = pi.float()
+    pi32 = pi32 / pi32.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    mixture_weights = Categorical(probs=pi32.unsqueeze(1))
 
     # --- Spatial Distribution ---
     # Means: [B, K, D] -> [B, 1, K, D]
@@ -69,8 +73,13 @@ def get_typed_gmm_components(gmm_output):
 
     # --- Type Distribution ---
     # Shape: [B, K, T] -> [B, 1, K, T]
-    a_dist = Categorical(probs=a_probs.unsqueeze(1))
-    c_dist = Categorical(probs=c_probs.unsqueeze(1))
+    # Same fp32 + renormalize trick as the mixture weights above.
+    a32 = a_probs.float()
+    a32 = a32 / a32.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    c32 = c_probs.float()
+    c32 = c32 / c32.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    a_dist = Categorical(probs=a32.unsqueeze(1))
+    c_dist = Categorical(probs=c32.unsqueeze(1))
 
     return mixture_weights, x_dist, a_dist, c_dist
 

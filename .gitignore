@@ -151,7 +151,9 @@ dmypy.json
 *.h5
 *.tar
 *.tar.gz
-
+*.tex
+*.csv
+*.json
 # Lightning-Hydra-Template
 configs/local/default.yaml
 #/data/
@@ -167,8 +169,12 @@ outputs/
 logs/
 
 data/
+/data/
 
 slurm-*.out
+
+submission_scripts/
+notebooks/
 
 #RL
 .pretrained_model/

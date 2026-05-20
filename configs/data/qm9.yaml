@@ -18,12 +18,12 @@ preprocessing:
   _recursive_: false
   root: ${data.root_path}/qm9
   train_dataset: ${data.datamodule.datasets.train}
+  # Canonical (representation-agnostic) cache. One preprocessing per dataset;
+  # representation-specific projection happens at runtime in the wrapper.
   atom_tokens_path: ${data.preprocessing.root}/processed/atom_tokens.txt
   edge_tokens_path: ${data.preprocessing.root}/processed/edge_tokens.txt
   charge_tokens_path: ${data.preprocessing.root}/processed/charge_tokens.txt
   distributions_path: ${data.preprocessing.root}/processed/distributions.pt
-  # Tokens and distributions will be discovered from data and saved to files
-  # On subsequent runs, they will be loaded from the files
 
 vocab: None
 
@@ -50,6 +50,7 @@ datamodule:
 
   vocab: ${data.vocab}
   distributions: None
+  representation: ${representation}
 
   datasets:
     train:
@@ -57,32 +58,32 @@ datamodule:
       root: ${data.root_path}/qm9
       vocab: ${data.vocab}
       distributions: None
-      rotate: ${model.rotate}
-      
+
     val:
       - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
         root: ${data.root_path}/qm9
         vocab: ${data.vocab}
         distributions: None
-        rotate: ${model.rotate}
 
     test:
       - _target_: chemflow.dataset.qm9.FlowMatchingQM9Dataset
         root: ${data.root_path}/qm9
         vocab: ${data.vocab}
         distributions: None
-        rotate: ${model.rotate}
-  
+
   interpolator: ${data.interpolator}
 
+  rotate: ${model.rotate}
+  n_augmentations: ${model.n_augmentations}
+
   num_workers:
-    train: 4
+    train: 10
     val: 0
     test: 0
     predict: 0
 
   batch_size:
-    train: 256
+    train: 1024
     val: 128
     test: 32
 

@@ -2,7 +2,10 @@ import torch
 
 from torch_geometric.utils import to_dense_adj
 
-from chemflow.flow_matching.assignment import partial_optimal_transport_single
+from chemflow.flow_matching.assignment import (
+    partial_optimal_transport_single,
+    scaffold_based_assignment_single,
+)
 
 from chemflow.utils.utils import EDGE_ALIGNER
 
@@ -216,6 +219,8 @@ class Interpolator:
         sample_mol: MoleculeData,
         target_mol: MoleculeData,
         t_scalar: float,
+        scaffold_pairs: list[tuple[int, int]] | None = None,
+        scaffold_substituents: tuple | None = None,
     ):
         """Per-sample interpolation (OT alignment + interpolation + rates).
 
@@ -228,6 +233,14 @@ class Interpolator:
             sample_mol: Prior sample graph.
             target_mol: Target graph from the dataset.
             t_scalar: Interpolation time in [0, 1).
+            scaffold_pairs: Optional list of ``(src_atom_idx, tgt_atom_idx)``
+                pairs to lock as a fixed scaffold during OT. The first
+                ``len(scaffold_pairs)`` rows of the returned objects are the
+                scaffold-matched atoms, so a ``scaffold_mask`` with ones at
+                the first ``n_scaffold`` indices marks scaffold atoms.
+            scaffold_substituents: Optional ``(src_subs, tgt_subs)`` tuple
+                of per-scaffold-atom substituent branch dicts. Enables
+                substituent-aware OT.
 
         Returns:
             interp_state: Interpolated molecule at time t (with rate attributes).
@@ -238,15 +251,32 @@ class Interpolator:
         t_i = torch.tensor(t_scalar, device=device)
 
         # ===== 1. OT Alignment =====
-        sample, target = partial_optimal_transport_single(
-            sample_mol,
-            target_mol,
-            c_move=self.c_move,
-            c_sub=self.c_sub,
-            c_ins=self.c_ins,
-            c_del=self.c_del,
-            optimal_transport=self.optimal_transport,
-        )
+        if scaffold_pairs:
+            src_subs = tgt_subs = None
+            if scaffold_substituents is not None:
+                src_subs, tgt_subs = scaffold_substituents
+            sample, target = scaffold_based_assignment_single(
+                sample_mol,
+                target_mol,
+                scaffold_pairs=scaffold_pairs,
+                src_subs=src_subs,
+                tgt_subs=tgt_subs,
+                c_move=self.c_move,
+                c_sub=self.c_sub,
+                c_ins=self.c_ins,
+                c_del=self.c_del,
+                optimal_transport=self.optimal_transport,
+            )
+        else:
+            sample, target = partial_optimal_transport_single(
+                sample_mol,
+                target_mol,
+                c_move=self.c_move,
+                c_sub=self.c_sub,
+                c_ins=self.c_ins,
+                c_del=self.c_del,
+                optimal_transport=self.optimal_transport,
+            )
 
         # ===== 2. Per-pair interpolation =====
         N = sample.x.shape[0]

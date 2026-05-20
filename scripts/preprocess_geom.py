@@ -37,9 +37,11 @@ from tqdm import tqdm
 from chemflow.dataset.geom import (
     LEN_KEY,
     LMDB_MAP_SIZE,
+    RAW_FILENAMES,
     open_read_env,
     process_conformers_to_lmdb,
 )
+from external_code.geom_drugs_preprocessing import process_geom_drugs
 
 RAW_SPLITS = {
     "train": "train_data.pickle",
@@ -119,11 +121,34 @@ def process_split(
 def main(args: argparse.Namespace) -> None:
     data_path = Path(args.data_path)
     raw_path = data_path / "raw"
+    filtered_path = data_path / "raw_filtered"
     save_path = data_path / "processed"
     save_path.mkdir(parents=True, exist_ok=True)
 
+    # Apply GEOM-Drugs Revisited pre-filter once for all splits. Skipped if the
+    # filtered pickles already exist.
+    all_filtered_present = all(
+        (filtered_path / fname).exists() for fname in RAW_FILENAMES.values()
+    )
+    if not all_filtered_present:
+        print(f"\n{'=' * 60}")
+        print("Pre-filter (GEOM-Drugs Revisited)")
+        print(f"{'=' * 60}")
+        process_geom_drugs(str(raw_path), str(filtered_path))
+
+        # Reclaim ~8 GB by truncating each raw pickle whose filtered copy now
+        # exists. A zero-byte sentinel is left so future runs of GEOM.download
+        # still short-circuit.
+        for fname in RAW_FILENAMES.values():
+            raw_file = raw_path / fname
+            filtered_file = filtered_path / fname
+            if filtered_file.exists() and raw_file.exists() and raw_file.stat().st_size > 0:
+                with open(raw_file, "wb"):
+                    pass
+                print(f"  Truncated raw {fname}")
+
     for split, raw_filename in RAW_SPLITS.items():
-        raw_file = raw_path / raw_filename
+        raw_file = filtered_path / raw_filename
         if not raw_file.exists():
             print(f"Skipping {split}: {raw_file} not found")
             continue

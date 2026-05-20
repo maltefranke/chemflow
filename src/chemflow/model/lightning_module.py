@@ -18,7 +18,9 @@ from external_code.egnn import unsorted_segment_mean
 
 from chemflow.dataset.molecule_data import MoleculeBatch
 from chemflow.dataset.vocab import Vocab, Distributions
+from chemflow.dataset.representation import Representation, neutral_charge_index
 from chemflow.utils.metrics import (
+    calc_atom_stabilities,
     calc_metrics_,
     MetricCollection,
     calc_posebusters_metrics,
@@ -83,11 +85,12 @@ class LightningModuleRates(pl.LightningModule):
         atom_type_weights: torch.Tensor,
         edge_token_weights: torch.Tensor,
         charge_token_weights: torch.Tensor,
-        cfg_adapter: DictConfig,
+        cfg_guidance: DictConfig,
         time_dist: DictConfig,
         metrics: MetricCollection,
         stability_metrics: MetricCollection,
         distribution_metrics: MetricCollection | None = None,
+        batch_metrics: MetricCollection | None = None,
         n_atoms_strategy: str = "fixed",
         ins_noise_scale: float = 0.5,
         use_learnable_loss_weights: bool = False,
@@ -96,6 +99,9 @@ class LightningModuleRates(pl.LightningModule):
         use_ema_for_eval: bool = True,
         use_time_weights: bool = False,
         allow_charged: bool = False,
+        log_grad_norms_every_n_steps: int = 100,
+        grad_norms_granularity: str = "component",
+        representation: str | Representation = Representation.MOLECULE,
     ):
         super().__init__()
 
@@ -111,6 +117,9 @@ class LightningModuleRates(pl.LightningModule):
         # Whether charged species are considered chemically valid for the dataset
         # (e.g. QM9 contains only neutral molecules; GEOM contains charged ones).
         self.allow_charged = allow_charged
+
+        # Controls mode-aware losses, validation metrics, and prediction cleanup.
+        self.representation = Representation(representation)
 
         # setup ema scheduler
         self.ema_decay = float(ema_decay)
@@ -138,9 +147,12 @@ class LightningModuleRates(pl.LightningModule):
         # Distribution metrics accumulate over the entire validation epoch so we
         # can log a single pooled KL and render marginal plots at epoch end.
         self.distribution_metrics = distribution_metrics
+        # Tensor-based metrics for non-topology modes. Updated in validation_step
+        # and computed/logged in on_validation_epoch_end.
+        self.batch_metrics = batch_metrics
 
-        self.cfg_adapter = hydra.utils.instantiate(
-            cfg_adapter,
+        self.cfg_guidance = hydra.utils.instantiate(
+            cfg_guidance,
             model=self.model,
             atom_tokens=list(self.vocab.atom_tokens),
         )
@@ -166,13 +178,14 @@ class LightningModuleRates(pl.LightningModule):
         if use_time_weights:
             time_weights = {
                 "x": InverseSquaredTimeLossWeighting(clamp_max=100.0),
-                "c": InverseSquaredTimeLossWeighting(clamp_max=100.0),
+                "c": lambda t: self.integrator.sub_schedule.rate(t).clamp(max=100.0),
                 "ins": lambda t: self.integrator.ins_schedule.rate(t).clamp(max=100.0),
                 "del": lambda t: self.integrator.del_schedule.rate(t).clamp(max=100.0),
                 "sub": lambda t: self.integrator.sub_schedule.rate(t).clamp(max=100.0),
             }
         else:
-            time_weights = {}
+            # always use time-weighting for x and c
+            time_weights = {"x": InverseSquaredTimeLossWeighting(clamp_max=100.0), "c": lambda t: self.integrator.sub_schedule.rate(t).clamp(max=100.0)}
 
         # object to tie loss computation, weighting, and logging together
         self.loss_accumulator = LossAccumulator(
@@ -181,19 +194,30 @@ class LightningModuleRates(pl.LightningModule):
 
         self.optimizer_config = optimizer_config
 
+        # Per-loss gradient-norm logging. Each invocation runs one extra
+        # backward per reported term, so this is rate-limited via a step
+        # interval and is off by default.
+        self.log_grad_norms_every_n_steps = int(log_grad_norms_every_n_steps)
+        if grad_norms_granularity not in {"component", "group", "both"}:
+            raise ValueError(
+                "grad_norms_granularity must be one of component/group/both, "
+                f"got {grad_norms_granularity!r}"
+            )
+        self.grad_norms_granularity = grad_norms_granularity
+
         self.is_compiled = False
 
         # lastly, save hyperparameters
-        # ``cfg_adapter`` wraps ``self.model``; excluding it avoids capturing a
-        # duplicate (cyclic) reference to the backbone in the hparams snapshot
-        # and keeps checkpoint size down.
+        # ``cfg_guidance`` wraps ``self.model``; excluding it avoids capturing
+        # a duplicate (cyclic) reference to the backbone in the hparams
+        # snapshot and keeps checkpoint size down.
         self.save_hyperparameters(
             ignore=[
                 "ema_decay_scheduler",
                 "metrics",
                 "stability_metrics",
                 "distribution_metrics",
-                "cfg_adapter",
+                "cfg_guidance",
             ]
         )
 
@@ -202,6 +226,14 @@ class LightningModuleRates(pl.LightningModule):
         if self.is_compiled:
             return
         print("Compiling model...")
+        # Per-loss grad-norm logging calls torch.autograd.grad(..., retain_graph=True)
+        # before the main backward. torch.compile's donated-buffer optimization frees
+        # activations after the first backward and rejects any subsequent one, so
+        # disable it when grad-norm tracking is active.
+        if self.log_grad_norms_every_n_steps > 0:
+            import torch._functorch.config as _functorch_config
+
+            _functorch_config.donated_buffer = False
         self.model = torch.compile(self.model, dynamic=True)
         self.is_compiled = True
 
@@ -237,6 +269,38 @@ class LightningModuleRates(pl.LightningModule):
     def forward(self, x):
         pass
 
+    # ------------------------------------------------------------------
+    # Hooks for fine-tuning subclasses (e.g. scaffold-decoration).
+    # Default implementations are no-ops so the base behaviour is unchanged.
+    # ------------------------------------------------------------------
+
+    def _node_loss_exclusion_mask(self, mols_t) -> torch.Tensor | None:
+        """Optional per-node bool mask: True = drop this node from
+        non-deletion / substitution / position losses.
+
+        Used by scaffold fine-tuning to exclude scaffold atoms from losses
+        that they can't meaningfully contribute to (since they are frozen
+        during inference). Default ``None`` keeps all nodes.
+        """
+        return None
+
+    def _apply_inference_edit_masks(
+        self,
+        mol_t,
+        do_sub_a_probs: torch.Tensor,
+        do_sub_e_probs: torch.Tensor,
+        do_del_probs: torch.Tensor,
+        num_ins_pred: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Optional hook to zero out edit probabilities at certain positions
+        before they reach the integrator. Default returns inputs unchanged.
+
+        Subclasses override to hard-zero del / sub-a / sub-e (scaffold-scaffold)
+        probabilities at scaffold positions while leaving insertions intact so
+        decorations can still grow.
+        """
+        return do_sub_a_probs, do_sub_e_probs, do_del_probs, num_ins_pred
+
     def shared_step(self, batch, batch_idx):
         self.model.set_training()
         # Define the training step logic here
@@ -250,19 +314,20 @@ class LightningModuleRates(pl.LightningModule):
         # randomized self-conditioning with p = 0.5 during training
         is_random_self_conditioning = (torch.rand(1) > 0.5).item()
 
-        cfg_inputs = self.cfg_adapter.get_training_inputs(
-            mols_t,
-            mols_1,
-            self.device,
-            self.training,
-            ins_targets=ins_targets,
+        ctx = self.cfg_guidance.build_ctx(ins_targets=ins_targets)
+        overrides = self.cfg_guidance.build_overrides(mols_1, ctx)
+        drop_masks = self.cfg_guidance.sample_drop_masks(
+            batch_size=mols_t.num_graphs,
+            device=self.device,
+            training=self.training,
         )
 
         preds = self.model(
             mols_t,
             t.view(-1, 1),
             is_random_self_conditioning=is_random_self_conditioning,
-            cfg_inputs=cfg_inputs,
+            overrides=overrides,
+            drop_masks=drop_masks,
         )
         # NOTE: we separate this from the forward pass because CFG acts on the logits before activations.
         self.model.apply_activations(preds)
@@ -285,16 +350,35 @@ class LightningModuleRates(pl.LightningModule):
         to_delete_mask = mols_t.lambda_del > 0.0
         non_del_mask = ~to_delete_mask
 
+        # Optional per-node exclusion (e.g. scaffold atoms in fine-tuning).
+        # ``_excl_mask`` is True at nodes that should NOT contribute to non-del /
+        # substitution / position losses; defaults to ``None`` (no exclusion).
+        _excl_mask = self._node_loss_exclusion_mask(mols_t)
+        if _excl_mask is not None:
+            _excl_mask = _excl_mask.bool()
+            non_del_mask = non_del_mask & ~_excl_mask
+
         # NOTE take loss on all non-deletion nodes
-        c_loss, c_batch_mask = class_loss(
-            c_pred,
-            mols_1.c,
-            self.charge_token_weights,
-            non_del_mask,
-            mols_t.batch,
-            mols_t.num_graphs,
-            reduction="none",
-        )
+        if self.representation.requires_charges:
+            c_loss, c_batch_mask = class_loss(
+                c_pred,
+                mols_1.c,
+                self.charge_token_weights,
+                non_del_mask,
+                mols_t.batch,
+                mols_t.num_graphs,
+                reduction="none",
+            )
+        else:
+            # Pointcloud mode: c is the neutral dummy charge. Skip the loss
+            # entirely (no information content) but keep charge_head in the graph.
+            c_loss = (
+                torch.zeros(mols_t.num_graphs, 1, device=self.device)
+                + 0.0 * c_pred.sum()
+            )
+            c_batch_mask = torch.zeros(
+                mols_t.num_graphs, dtype=torch.bool, device=self.device
+            )
 
         # 1. Handle substitutions
 
@@ -319,42 +403,64 @@ class LightningModuleRates(pl.LightningModule):
             reduction="none",
         )
         #### Handle edge type substitutions
-        edge_infos = self.edge_aligner.align_edges(
-            source_group=(mols_t.edge_index, [e_pred, do_sub_e_head]),
-            target_group=(mols_1.edge_index, [mols_1.e, mols_t.lambda_e_sub]),
-        )
-        e_batch_triu = mols_t.batch[edge_infos["edge_index"][0][0]]
-        e_pred_triu, do_sub_e_head_triu = edge_infos["edge_attr"][:2]
-        e_target_triu, do_sub_e_target_triu = edge_infos["edge_attr"][2:]
+        if self.representation.requires_topology:
+            edge_infos = self.edge_aligner.align_edges(
+                source_group=(mols_t.edge_index, [e_pred, do_sub_e_head]),
+                target_group=(mols_1.edge_index, [mols_1.e, mols_t.lambda_e_sub]),
+            )
+            e_batch_triu = mols_t.batch[edge_infos["edge_index"][0][0]]
+            e_pred_triu, do_sub_e_head_triu = edge_infos["edge_attr"][:2]
+            e_target_triu, do_sub_e_target_triu = edge_infos["edge_attr"][2:]
 
-        # Supervise e_pred on all non-deletion edges (same fix as sub_a_class_loss).
-        # Edges where either endpoint is scheduled for deletion are excluded:
-        # their targets are frozen to the source value, so supervising e_pred on them
-        # would train it to predict prior edge types — the wrong signal.
-        _src_idx = edge_infos["edge_index"][0][0]
-        _dst_idx = edge_infos["edge_index"][0][1]
-        non_del_edge_mask = ~to_delete_mask[_src_idx] & ~to_delete_mask[_dst_idx]
+            # Supervise e_pred on all non-deletion edges (same fix as sub_a_class_loss).
+            # Edges where either endpoint is scheduled for deletion are excluded:
+            # their targets are frozen to the source value, so supervising e_pred on them
+            # would train it to predict prior edge types — the wrong signal.
+            _src_idx = edge_infos["edge_index"][0][0]
+            _dst_idx = edge_infos["edge_index"][0][1]
+            non_del_edge_mask = ~to_delete_mask[_src_idx] & ~to_delete_mask[_dst_idx]
+            if _excl_mask is not None:
+                # Exclude edges where BOTH endpoints are excluded (matches inference
+                # masking: scaffold-scaffold edges can never change).
+                non_del_edge_mask = non_del_edge_mask & ~(
+                    _excl_mask[_src_idx] & _excl_mask[_dst_idx]
+                )
 
-        # NOTE As per EditFlow, only count class loss for edges that need modification
-        do_sub_e_loss = do_action_loss(
-            do_sub_e_head_triu,
-            do_sub_e_target_triu,
-            e_batch_triu,
-            mols_t.num_graphs,
-            reduction="none",
-        )
+            do_sub_e_loss = do_action_loss(
+                do_sub_e_head_triu,
+                do_sub_e_target_triu,
+                e_batch_triu,
+                mols_t.num_graphs,
+                reduction="none",
+            )
 
-        # NOTE take loss on all non-deletion & to-be-substituted edges
-        to_sub_edge_mask = (non_del_edge_mask) & (do_sub_e_target_triu > 0.0)
-        sub_e_class_loss, sub_e_batch_mask = class_loss(
-            e_pred_triu,
-            e_target_triu,
-            self.edge_token_weights,
-            to_sub_edge_mask,
-            e_batch_triu,
-            mols_t.num_graphs,
-            reduction="none",
-        )
+            to_sub_edge_mask = (non_del_edge_mask) & (do_sub_e_target_triu > 0.0)
+            sub_e_class_loss, sub_e_batch_mask = class_loss(
+                e_pred_triu,
+                e_target_triu,
+                self.edge_token_weights,
+                to_sub_edge_mask,
+                e_batch_triu,
+                mols_t.num_graphs,
+                reduction="none",
+            )
+        else:
+            # Non-topology modes: runtime edges carry the inert <NO_BOND> token
+            # and lambda_e_sub is identically zero, so the supervised edge-loss
+            # path is both informationless and a DDP risk (the class_loss
+            # short-circuit would drop edge_type_head from the autograd graph).
+            # Use explicit graph-preserving dummies on the head outputs instead.
+            do_sub_e_loss = (
+                torch.zeros(mols_t.num_graphs, 1, device=self.device)
+                + 0.0 * do_sub_e_head.sum()
+            )
+            sub_e_class_loss = (
+                torch.zeros(mols_t.num_graphs, 1, device=self.device)
+                + 0.0 * e_pred.sum()
+            )
+            sub_e_batch_mask = torch.zeros(
+                mols_t.num_graphs, dtype=torch.bool, device=self.device
+            )
 
         do_del_loss = torch.tensor(0.0, device=self.device)
 
@@ -381,7 +487,17 @@ class LightningModuleRates(pl.LightningModule):
 
             # 3. Handle insertions
             # Poisson NLL over all nodes (including those with zero insertions).
-            ins_loss_gmm = torch.tensor(0.0, device=self.device)
+            # DDP keep-alive: if this rank's batch has zero spawn nodes the GMM
+            # branch below is skipped. A bare `torch.tensor(0.0)` leaves
+            # ins_gmm_head with no gradient on that rank, so under
+            # find_unused_parameters_false the gradient all-reduce desyncs
+            # across ranks (hang on 4090 / NaN on A100). Initialise with the
+            # same 0-weighted head reference the requires_topology=False branch
+            # already uses, so the head is always in the autograd graph
+            # regardless of data. Overwritten by the real loss when spawns > 0.
+            ins_loss_gmm = 0.0 * sum(
+                p.sum() for p in self.model.ins_gmm_head.parameters()
+            )
             ins_loss_rate, ins_batch_mask = rate_loss(
                 ins_rate_pred,
                 mols_t.n_ins,
@@ -419,9 +535,13 @@ class LightningModuleRates(pl.LightningModule):
                     self.atom_type_weights,
                     self.charge_token_weights,
                     reduction="none",
+                    include_c=self.representation.requires_charges,
                 )
 
                 ins_loss_gmm = gmm_loss.view(-1)
+                # Keep c_probs in the autograd graph for DDP when its term is dropped.
+                if not self.representation.requires_charges:
+                    ins_loss_gmm = ins_loss_gmm + 0.0 * gmm_dict_pred["c_probs"].sum()
 
                 # reduce the loss to per-graph level
                 ins_loss_gmm = unsorted_segment_mean(
@@ -438,7 +558,15 @@ class LightningModuleRates(pl.LightningModule):
                 spawn_idx = ins_targets.ins_edge_spawn_idx
                 existing_idx = ins_targets.ins_edge_existing_idx
 
-                if spawn_idx.numel() > 0 and existing_idx.numel() > 0:
+                # Insertion-edge prediction is only meaningful when chemical bonds
+                # are part of the representation. In non-topology modes, skip the
+                # head call entirely and emit a parameter-sum dummy so DDP still
+                # sees ins_edge_head as participating.
+                if (
+                    self.representation.requires_topology
+                    and spawn_idx.numel() > 0
+                    and existing_idx.numel() > 0
+                ):
                     ins_edge_non_del = (
                         non_del_mask[spawn_idx] & non_del_mask[existing_idx]
                     )
@@ -468,11 +596,10 @@ class LightningModuleRates(pl.LightningModule):
                                 mols_t.num_graphs,
                                 reduction="none",
                             )
-
-                # Compute ins -> ins edge loss
+                # Compute ins -> ins edge loss (gated on topology for the same reason).
                 spawn_src_ii = ins_targets.ins_to_ins_edge_spawn_src_idx
                 spawn_dst_ii = ins_targets.ins_to_ins_edge_spawn_dst_idx
-                if spawn_src_ii.numel() > 0:
+                if self.representation.requires_topology and spawn_src_ii.numel() > 0:
                     ii_non_del = non_del_mask[spawn_src_ii] & non_del_mask[spawn_dst_ii]
                     if ii_non_del.any():
                         edges_ii_src = ins_targets.ins_to_ins_edge_src_local_idx
@@ -505,6 +632,16 @@ class LightningModuleRates(pl.LightningModule):
                 # loss accumulator's mask path stays consistent with ndim-0 dummy losses.
                 ins_loss_e = torch.tensor(0.0, device=self.device)
                 ins_loss_e_ii = torch.tensor(0.0, device=self.device)
+
+            # In non-topology modes ins_edge_head is never invoked through the real
+            # supervised path, so attach a parameter-sum dummy to keep every one of
+            # its parameters in the autograd graph for DDP.
+            if not self.representation.requires_topology:
+                ins_edge_head_dummy = 0.0 * sum(
+                    p.sum() for p in self.model.ins_edge_head.parameters()
+                )
+                ins_loss_e = ins_loss_e + ins_edge_head_dummy
+                ins_loss_e_ii = ins_loss_e_ii + ins_edge_head_dummy
 
         else:
             # NOTE ins_rate_head, edge_head, gmm_head unused, throws an error (unused_params)
@@ -585,23 +722,86 @@ class LightningModuleRates(pl.LightningModule):
         loss = self.loss_accumulator.total_loss()
         self.log_dict(self.loss_accumulator.log_dict(), prog_bar=False, logger=True)
 
+        # ins_edge_head.unseen_node_embedding is exclusive to forward_ins_to_ins
+        # (InsertionEdgeHead.forward never references it). On batches without a
+        # single ins-to-ins edge — more likely with smaller effective batches
+        # such as n_augmentations > 1 — the param ends up with .grad = None and
+        # DDP rejects the step. Add a 0-weighted reference so it always lands
+        # in the autograd graph.
+        loss = loss + 0.0 * self.model.ins_edge_head.unseen_node_embedding.sum()
+
         return loss
 
     def training_step(self, batch, batch_idx):
         self.model_ema.eval()
         loss = self.shared_step(batch, batch_idx)
+        self._maybe_log_per_loss_grad_norms()
         self.log("loss/train", loss.detach(), prog_bar=True, logger=True)
         return loss
 
+    def _maybe_log_per_loss_grad_norms(self) -> None:
+        """Log per-loss-term gradient norms at the configured cadence.
+
+        Runs *before* Lightning calls ``loss.backward()``, leveraging
+        ``retain_graph=True`` inside ``LossAccumulator.compute_grad_norms`` so
+        the autograd graph survives for the actual backward pass. The
+        ``.grad`` attributes on parameters are not touched, so this is safe to
+        interleave with DDP's reducer (which only fires on
+        ``loss.backward()``).
+        """
+        every = self.log_grad_norms_every_n_steps
+        if every <= 0 or (self.global_step % every) != 0:
+            return
+
+        norms = self.loss_accumulator.compute_grad_norms(
+            self.model.parameters(),
+            granularity=self.grad_norms_granularity,
+            use_weighted=False,
+            apply_component_weights=False,
+        )
+        if not norms:
+            return
+
+        component_keys = {k for keys in self.LOSS_GROUPS.values() for k in keys}
+        entries: dict[str, torch.Tensor] = {}
+        for key, val in norms.items():
+            prefix = "grad_norm" if key in component_keys else "grad_norm_group"
+            entries[f"{prefix}/{key}"] = val.detach()
+
+        self.log_dict(
+            entries,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            logger=True,
+        )
+
     def on_validation_epoch_start(self):
-        # Distribution metrics accumulate histograms across the epoch; reset them
-        # here so each validation cycle starts from a clean state.
+        # Tensor-style collections accumulate raw counts/histograms across the
+        # epoch so the reported metric is computed from the full epoch's atoms
+        # (not a per-batch rate averaged with the wrong weighting).
         if self.distribution_metrics is not None:
             self.distribution_metrics.reset()
+        if self.batch_metrics is not None:
+            self.batch_metrics.reset()
+        if self.stability_metrics is not None:
+            self.stability_metrics.reset()
 
     def validation_step(self, batch, batch_idx):
         self.model_ema.eval()
         batched_mols = self.sample(batch, batch_idx, return_traj=False)
+
+        # Tensor / distribution metrics consume the batch directly and work in
+        # every representation, so they always run — no early return. Only the
+        # RDKit-mol chemistry metrics below require real topology.
+        if self.batch_metrics is not None and len(self.batch_metrics) > 0:
+            self.batch_metrics.update(batched_mols)
+        if self.distribution_metrics is not None and len(self.distribution_metrics) > 0:
+            self.distribution_metrics.update(batched_mols)
+
+        if not self.representation.requires_topology:
+            del batched_mols
+            return
 
         # List of MoleculeData objects
         mols = batched_mols.to_data_list()
@@ -638,9 +838,21 @@ class LightningModuleRates(pl.LightningModule):
             batch_size=n_mols,
         )
 
-        # Accumulate marginal histograms across the epoch without resetting.
-        if self.distribution_metrics is not None:
-            self.distribution_metrics.update(rdkit_mols)
+        # RDKit per-atom stability — fed precomputed bools (not RDKit mols).
+        # Accumulate only here; compute/log/reset happens in
+        # on_validation_epoch_end so the rate is weighted by atom count across
+        # the full epoch, not molecule count per batch.
+        if self.stability_metrics is not None and len(self.stability_metrics) > 0:
+            stabilities = []
+            for mol in rdkit_mols:
+                if mol is None:
+                    continue
+                try:
+                    stabilities.append(calc_atom_stabilities(mol))
+                except Exception:
+                    continue
+            if stabilities:
+                self.stability_metrics.update(stabilities)
 
         try:
             # pb_metrics = calc_posebusters_metrics(rdkit_mols)
@@ -661,7 +873,84 @@ class LightningModuleRates(pl.LightningModule):
             )
 
     def on_validation_epoch_end(self):
-        if self.distribution_metrics is None:
+        # RDKit per-atom stability — accumulated across the full epoch in
+        # validation_step; compute the atom-weighted rate once here.
+        if self.stability_metrics is not None and len(self.stability_metrics) > 0:
+            try:
+                stab_results = self.stability_metrics.compute()
+                self.log_dict(
+                    {
+                        f"val/{k}": (v.detach() if isinstance(v, torch.Tensor) else v)
+                        for k, v in stab_results.items()
+                    },
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    logger=True,
+                    sync_dist=False,
+                )
+            except Exception as e:
+                print(f"Error in stability-metric epoch-end logging: {e}")
+            finally:
+                self.stability_metrics.reset()
+
+        # Tensor-based metrics run in every representation; logged here so the
+        # values land in the same wandb step as everything else.
+        if (
+            self.batch_metrics is not None
+            and len(self.batch_metrics) > 0
+        ):
+            try:
+                batch_results = self.batch_metrics.compute()
+                self.log_dict(
+                    {
+                        f"val/batch/{key}": (
+                            v.detach() if isinstance(v, torch.Tensor) else v
+                        )
+                        for key, v in batch_results.items()
+                    },
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    logger=True,
+                    sync_dist=False,
+                )
+
+                # GT-vs-generated marginal plots. `sync_context()` is DDP-collective:
+                # *all* ranks must enter the block so each metric's local state is
+                # gathered across processes; only rank 0 then reads the synced
+                # histograms and logs (mirrors the RDKit-marginal pattern above).
+                with ExitStack() as stack:
+                    for m in self.batch_metrics.values():
+                        stack.enter_context(m.sync_context())
+
+                    if self.trainer.is_global_zero and hasattr(self.logger, "log_image"):
+                        from chemflow.utils.metrics.plotting import (
+                            build_batch_marginal_plots,
+                        )
+                        figs = build_batch_marginal_plots(
+                            self.batch_metrics,
+                            atom_tokens=list(self.vocab.atom_tokens),
+                        )
+                        for name, fig in figs.items():
+                            try:
+                                self.logger.log_image(key=name, images=[fig])
+                            except Exception as e:
+                                print(f"Error logging {name}: {e}")
+                        if figs:
+                            import matplotlib.pyplot as plt
+
+                            for fig in figs.values():
+                                plt.close(fig)
+            except Exception as e:
+                print(f"Error in batch-metric epoch-end logging: {e}")
+            finally:
+                self.batch_metrics.reset()
+
+        # Distribution KLs are tensor-native and accumulate in every
+        # representation; edge/charge KLs are only registered when meaningful
+        # (see init_metrics), so an empty/absent collection just no-ops.
+        if self.distribution_metrics is None or len(self.distribution_metrics) == 0:
             return
 
         try:
@@ -704,15 +993,41 @@ class LightningModuleRates(pl.LightningModule):
 
     def predict_step(self, batch, batch_idx):
         return_traj = bool(getattr(self, "predict_return_traj", True))
-        target_override = getattr(self, "predict_target_n_atoms_override", None)
-        target_mw_override = getattr(self, "predict_target_mw_override", None)
+
+        # Optional graph-wise property override (e.g. QED delta for the
+        # molecule-optimization fine-tune). When set, replaces the
+        # dataset-supplied ``target_props`` on the input batch with a
+        # user-chosen value broadcast across the batch.
+        prop_override = getattr(self, "predict_target_props_override", None)
+        if prop_override is not None:
+            mol_t, mol_1 = batch
+            if isinstance(prop_override, (int, float)):
+                prop_override = torch.tensor(
+                    [[float(prop_override)]], dtype=torch.float
+                )
+            elif not torch.is_tensor(prop_override):
+                prop_override = torch.tensor(prop_override, dtype=torch.float)
+            if prop_override.dim() == 1:
+                prop_override = prop_override.unsqueeze(0)
+            B = int(mol_t.num_graphs)
+            if prop_override.shape[0] == 1 and B > 1:
+                prop_override = prop_override.expand(B, -1).contiguous()
+            mol_t.target_props = prop_override.to(
+                device=mol_t.x.device, dtype=mol_t.x.dtype
+            )
+            batch = (mol_t, mol_1)
+
         gen_mols = self.sample(
             batch,
             batch_idx,
             return_traj=return_traj,
-            target_n_atoms_override=target_override,
-            target_mw_override=target_mw_override,
+            overrides=getattr(self, "predict_overrides", None),
         )
+
+        # In non-topology modes, runtime edges labeled <NO_BOND> are not chemical
+        # bonds. Skip the validity pipeline and return the raw samples.
+        if not self.representation.requires_topology:
+            return {"valid_mols": [], "invalid_mols": list(gen_mols), "invalid_mols_rdkit": []}
 
         # do quick validity check of the generated molecules
         # take the last state of the trajectory and check validity
@@ -748,79 +1063,41 @@ class LightningModuleRates(pl.LightningModule):
             "invalid_mols_rdkit": invalid_mols_rdkit,
         }
 
-    def _build_inference_cfg_inputs(
+    def _broadcast_override(
         self,
-        mol_t,
-        mol_1,
-        batch_size,
-        target_n_atoms_override=None,
-        target_mw_override=None,
-    ) -> dict:
-        """Build the cfg_inputs dict for inference."""
-        properties = self.cfg_adapter.extract_properties(mol_t)
-
-        if target_n_atoms_override is not None:
-            if isinstance(target_n_atoms_override, int):
-                target_n_atoms = torch.full(
-                    (batch_size,),
-                    target_n_atoms_override,
-                    dtype=torch.long,
-                    device=self.device,
-                )
-            else:
-                target_n_atoms = target_n_atoms_override.to(
-                    self.device,
-                )
-        else:
-            target_n_atoms = self.cfg_adapter.extract_target_n_atoms(
-                mol_1,
-            )
-
-        if target_mw_override is not None:
-            if isinstance(target_mw_override, (int, float)):
-                target_mw = torch.full(
-                    (batch_size,),
-                    float(target_mw_override),
-                    dtype=torch.float,
-                    device=self.device,
-                )
-            else:
-                target_mw = target_mw_override.to(self.device)
-        else:
-            target_mw = self.cfg_adapter.extract_target_mw(mol_1)
-
-        return {
-            "properties": properties,
-            "property_drop_mask": None,
-            "target_n_atoms": target_n_atoms,
-            "natoms_drop_mask": None,
-            "target_mw": target_mw,
-            "mw_drop_mask": None,
-        }
+        value: torch.Tensor | float | int | None,
+        batch_size: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        """Coerce a scalar / tensor user-supplied override to ``[B, ...]``."""
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return torch.full((batch_size,), float(value), dtype=dtype, device=self.device)
+        return value.to(self.device)
 
     def sample(
         self,
         batch,
         batch_idx,
         return_traj: bool = False,
-        target_n_atoms_override: torch.Tensor | int | None = None,
-        target_mw_override: torch.Tensor | float | None = None,
+        overrides: dict[str, torch.Tensor | float | int] | None = None,
     ):
-        """
-        Inference step for flow matching.
+        """Inference step for flow matching.
 
         Args:
-            batch: Batch of data (for now, we'll use batch size to determine number of graphs)
-            batch_idx: Batch index
-            return_traj: If True, return trajectory for each molecule. If False, return final state only.
-            target_n_atoms_override: If provided, overrides the target n_atoms extracted from data.
-                Shape (batch_size,) with integer atom counts.
-            target_mw_override: If provided, overrides the target molecular weight.
-                Shape (batch_size,) with MW in Daltons, or a scalar float.
+            batch: Tuple ``(mol_t, mol_1)`` from the dataloader.
+            batch_idx: Batch index.
+            return_traj: Return per-molecule trajectories instead of the final state.
+            overrides: Optional ``{signal_name: tensor | scalar}`` to inject a
+                target value into a CFG signal.  Recognised names are the
+                signal names registered on the model's ``cfg_embedding``
+                (e.g. ``"n_atoms"``, ``"mw"``, ``"logp"``, ``"qed"``).
+                Scalars are broadcast to ``[batch_size]``.
 
         Returns:
-            If return_traj is False: MoleculeBatch - final sampled molecules
-            If return_traj is True: List[List[MoleculeData]] - trajectory for each molecule
+            If ``return_traj`` is False: a ``MoleculeBatch`` with the final state.
+            If ``return_traj`` is True: a ``List[List[MoleculeData]]`` (one per molecule).
         """
         model = self._get_model()
         model.set_inference()
@@ -854,12 +1131,25 @@ class LightningModuleRates(pl.LightningModule):
         # previous outputs for self-conditioning. none at the beginning
         preds = None
 
-        cfg_inputs = self._build_inference_cfg_inputs(
-            mol_t,
-            mol_1,
-            batch_size,
-            target_n_atoms_override,
-            target_mw_override,
+        # Build the per-signal override dict once: signal.extract(mols_1)
+        # for each signal not already supplied by the user, broadcasted to
+        # tensors on the right device.
+        ctx = self.cfg_guidance.build_ctx()
+        user_overrides: dict[str, torch.Tensor | None] = {}
+        if overrides:
+            dtype_by_signal = {
+                "n_atoms": torch.long,
+                "mw": torch.float,
+                "logp": torch.float,
+                "qed": torch.float,
+                "properties": torch.float,
+            }
+            for name, v in overrides.items():
+                user_overrides[name] = self._broadcast_override(
+                    v, batch_size, dtype_by_signal.get(name, torch.float)
+                )
+        signal_overrides = self.cfg_guidance.build_overrides(
+            mol_1, ctx, user_overrides=user_overrides
         )
 
         # Integration loop: integrate from t=0 to t=1
@@ -873,12 +1163,12 @@ class LightningModuleRates(pl.LightningModule):
 
             prev_preds = preds
 
-            preds = self.cfg_adapter.guided_predict(
+            preds = self.cfg_guidance.guided_predict(
                 model,
                 mol_t,
                 t,
                 prev_preds,
-                cfg_inputs,
+                signal_overrides,
             )
             # Release previous step's preds as soon as self-conditioning no longer needs them.
             del prev_preds
@@ -886,22 +1176,26 @@ class LightningModuleRates(pl.LightningModule):
             # Extract predictions
             x1_pred = preds["pos_head"]  # (N_total, D)
 
-            a_pred = preds["atom_type_head"]  # (N_total, num_classes)
+            # Pass logits directly to Categorical instead of softmax(...) -> probs.
+            # The softmax-then-Categorical(probs=) path produces rows that miss the
+            # simplex by ~1e-3 under fp16/bf16 (validate_args raises), and is also
+            # numerically lossy compared to the internal log-sum-exp path.
             T_a = 1.0
-            a_pred = F.softmax(a_pred / T_a, dim=-1)
-            a_pred = torch.distributions.Categorical(probs=a_pred).sample()
+            a_pred = torch.distributions.Categorical(
+                logits=(preds["atom_type_head"] / T_a).float()
+            ).sample()
 
-            c_pred = preds["charge_head"]  # (N_total, num_classes)
             T_c = 1.0
-            c_pred = F.softmax(c_pred / T_c, dim=-1)
-            c_pred = torch.distributions.Categorical(probs=c_pred).sample()
+            c_pred = torch.distributions.Categorical(
+                logits=(preds["charge_head"] / T_c).float()
+            ).sample()
 
             # NOTE: predictions are for full adj matrix.
             # NOTE: Will take triu and resymmetrize in integration step
             T_e = 1.0
-            e_pred = preds["edge_type_head"]
-            e_pred = F.softmax(e_pred / T_e, dim=-1)
-            e_pred = torch.distributions.Categorical(probs=e_pred).sample()
+            e_pred = torch.distributions.Categorical(
+                logits=(preds["edge_type_head"] / T_e).float()
+            ).sample()
 
             mol_1_pred = MoleculeBatch(
                 x=x1_pred,
@@ -919,6 +1213,17 @@ class LightningModuleRates(pl.LightningModule):
             do_sub_e_probs = torch.sigmoid(preds["do_sub_e_head"].view(-1))
             do_del_probs = torch.sigmoid(preds["do_del_head"].view(-1))
 
+            # Inference-side clamping for heads that were gated at training. Those
+            # heads stayed at near-init weights and would otherwise produce random
+            # samples over the full canonical vocab. See refactor doc §4.8(e).
+            if not self.representation.requires_topology:
+                e_pred.fill_(0)            # all <NO_BOND>
+                do_sub_e_probs.zero_()     # never substitute an edge
+                mol_1_pred.e = e_pred
+            if not self.representation.requires_charges:
+                c_pred.fill_(neutral_charge_index(self.vocab))
+                mol_1_pred.c = c_pred
+
             # Extract insertion rate prediction (number of insertions per node)
             num_ins_pred = preds["ins_rate_head"].view(-1)
 
@@ -927,8 +1232,31 @@ class LightningModuleRates(pl.LightningModule):
                 num_ins_pred = torch.zeros_like(num_ins_pred)
                 do_del_probs = torch.zeros_like(do_del_probs)
 
-            # Get insertion edge head if available
-            ins_edge_head = getattr(model, "ins_edge_head", None)
+            # Subclass hook: scaffold fine-tuning hard-zeros del / sub-a / sub-e
+            # (scaffold-scaffold) probs at scaffold positions, leaving insertions
+            # alone so decorations can still grow.
+            do_sub_a_probs, do_sub_e_probs, do_del_probs, num_ins_pred = (
+                self._apply_inference_edit_masks(
+                    mol_t, do_sub_a_probs, do_sub_e_probs, do_del_probs, num_ins_pred
+                )
+            )
+
+            # Get insertion edge head if available. In non-topology modes all
+            # inserted/runtime edges use the inert <NO_BOND> prior; pass None to
+            # take the integrator's fallback path instead of spending a head on
+            # outputs with no chemical meaning.
+            ins_edge_head = (
+                getattr(model, "ins_edge_head", None)
+                if self.representation.requires_topology
+                else None
+            )
+            # In non-charge modes c_probs is untrained — force inserted charges
+            # to the neutral index so they match training-time targets (§4.8(e)).
+            force_charge_idx = (
+                None
+                if self.representation.requires_charges
+                else neutral_charge_index(self.vocab)
+            )
             h_latent = preds["h_latent"]
 
             # Integrate one step (edge prediction happens inside if head is provided)
@@ -944,6 +1272,7 @@ class LightningModuleRates(pl.LightningModule):
                 dt=step_size,
                 h_latent=h_latent,
                 ins_edge_head=ins_edge_head,
+                force_charge_idx=force_charge_idx,
             )
 
             # Drop per-step intermediates before the next forward pass so the peak

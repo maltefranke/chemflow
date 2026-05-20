@@ -8,10 +8,12 @@ import torch
 from rdkit import Chem
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
+from torch_geometric.data import download_url
 from tqdm import tqdm
 
 from chemflow.dataset.molecule_data import MoleculeData
 from chemflow.dataset.vocab import Distributions, Vocab
+from chemflow.dataset.representation import Capabilities
 from chemflow.utils.rdkit_utils import (
     BOND_IDX_MAP,
     mol_is_valid,
@@ -23,6 +25,18 @@ from chemflow.utils.utils import (
     token_to_index,
     z_to_atom_types,
 )
+from external_code.geom_drugs_preprocessing import process_geom_drugs
+
+# Source of the raw GEOM-Drugs pickle files used by the GEOM-Drugs Revisited
+# paper (Nikitin et al., 2025, arXiv:2505.00169). Three files live here:
+# train_data.pickle, val_data.pickle, test_data.pickle.
+GEOM_RAW_URL = "https://bits.csb.pitt.edu/files/geom_raw"
+
+RAW_FILENAMES = {
+    "train": "train_data.pickle",
+    "val": "val_data.pickle",
+    "test": "test_data.pickle",
+}
 
 PICKLE_PROTOCOL = 4
 
@@ -50,6 +64,17 @@ def process_one_conformer(mol: Chem.Mol):
 
     mol = sanitize_mol_correctly(mol)
     if mol is None:
+        return None
+
+    # Force Kekulé form so aromatic ring bonds become SINGLE/DOUBLE rather than
+    # BondType.AROMATIC. Sanitization above re-perceives aromaticity, undoing
+    # the kekulization applied by the GEOM-Drugs Revisited pre-filter; this
+    # call restores it so AROMATIC never reaches the bond-type tensor (Nikitin
+    # et al., 2025 — kekulization is the paper's recommended fix for the
+    # valency ambiguity of aromatic bonds).
+    try:
+        Chem.Kekulize(mol, clearAromaticFlags=True)
+    except Exception:
         return None
 
     try:
@@ -283,6 +308,10 @@ class GEOM(Dataset):
         self.distributions = distributions
 
         self.raw_dir = os.path.join(root, "raw")
+        # Output dir of the GEOM-Drugs Revisited pre-filter (Nikitin et al.,
+        # 2025). Sits between ``raw/`` and ``processed/`` and holds the
+        # sanitized pickle files plus the empirical ``valency_dict.json``.
+        self.filtered_dir = os.path.join(root, "raw_filtered")
         self.processed_dir = os.path.join(root, "processed")
 
         os.makedirs(self.processed_dir, exist_ok=True)
@@ -290,6 +319,8 @@ class GEOM(Dataset):
         self.lmdb_path = os.path.join(self.processed_dir, f"{split}_data.lmdb")
 
         if not os.path.exists(self.lmdb_path):
+            self.download()
+            self.prefilter()
             self.process()
 
         self._length = read_lmdb_length(self.lmdb_path)
@@ -307,14 +338,66 @@ class GEOM(Dataset):
         state["_env"] = None
         return state
 
+    def download(self) -> None:
+        """Fetch raw GEOM-Drugs pickle files from bits.csb.pitt.edu.
+
+        Mirrors the PyG ``InMemoryDataset.download`` pattern: each of the three
+        split pickles is downloaded into ``raw/`` if it is not already present.
+        Files that already exist on disk are left untouched so re-running
+        training does not re-fetch ~8 GB.
+        """
+        os.makedirs(self.raw_dir, exist_ok=True)
+        for fname in RAW_FILENAMES.values():
+            target = os.path.join(self.raw_dir, fname)
+            if os.path.exists(target):
+                continue
+            print(f"Downloading {fname} from {GEOM_RAW_URL} ...")
+            download_url(f"{GEOM_RAW_URL}/{fname}", self.raw_dir)
+
+    def prefilter(self) -> None:
+        """Apply the GEOM-Drugs Revisited pre-filter to all available splits.
+
+        Defers to ``external_code.geom_drugs_preprocessing.process_geom_drugs``,
+        which sanitizes/kekulizes molecules, drops disconnected fragments, runs
+        a covalent-radius topology check on every conformer, and writes the
+        cleaned pickle files plus a ``valency_dict.json`` into ``raw_filtered/``.
+
+        Runs once per dataset root: if every filtered pickle is already on disk
+        the step is skipped.
+        """
+        all_present = all(
+            os.path.exists(os.path.join(self.filtered_dir, fname))
+            for fname in RAW_FILENAMES.values()
+        )
+        if all_present:
+            return
+
+        print("Applying GEOM-Drugs Revisited pre-filter to all splits ...")
+        process_geom_drugs(self.raw_dir, self.filtered_dir)
+
+        # Reclaim ~8 GB by truncating each raw pickle whose filtered copy now
+        # exists. A zero-byte sentinel is left in place so ``download()`` still
+        # short-circuits on subsequent runs.
+        for fname in RAW_FILENAMES.values():
+            raw_path = os.path.join(self.raw_dir, fname)
+            filtered_path = os.path.join(self.filtered_dir, fname)
+            if (
+                os.path.exists(filtered_path)
+                and os.path.exists(raw_path)
+                and os.path.getsize(raw_path) > 0
+            ):
+                with open(raw_path, "wb"):
+                    pass
+                print(f"  Truncated raw {fname} (filtered copy in {self.filtered_dir})")
+
     def process(self):
-        """Process raw pickle files and write them into LMDB."""
-        raw_file = os.path.join(self.raw_dir, f"{self.split}_data.pickle")
+        """Process pre-filtered pickle files and write them into LMDB."""
+        raw_file = os.path.join(self.filtered_dir, f"{self.split}_data.pickle")
 
         if not os.path.exists(raw_file):
-            raise FileNotFoundError(f"Raw data file not found: {raw_file}")
+            raise FileNotFoundError(f"Filtered data file not found: {raw_file}")
 
-        print(f"Loading raw data from {raw_file}...")
+        print(f"Loading filtered data from {raw_file}...")
         with open(raw_file, "rb") as f:
             raw_data = pickle.load(f)
 
@@ -381,6 +464,8 @@ class GEOM(Dataset):
 
 
 class FlowMatchingGEOMDataset(GEOM):
+    CAPABILITIES = Capabilities(provides_charges=True, provides_topology=True)
+
     def __init__(
         self,
         root,
@@ -388,7 +473,6 @@ class FlowMatchingGEOMDataset(GEOM):
         distributions: Distributions,
         transform=None,
         pre_transform=None,
-        rotate=False,
         split="train",
     ):
         super().__init__(root, split, transform, pre_transform)
@@ -396,43 +480,38 @@ class FlowMatchingGEOMDataset(GEOM):
         self.vocab = vocab
         self.distributions = distributions
 
-        self.rotate = rotate
-
     def __getitem__(self, index):
         data = super().__getitem__(index)
 
-        # remove center of mass
         coord = data.pos - data.pos.mean(dim=0)
         if self.distributions.coordinate_std is not None:
             coord = coord / self.distributions.coordinate_std
 
-        atom_types = data.z
-        atom_types = z_to_atom_types(atom_types.tolist())
-        atom_types = [
-            token_to_index(self.vocab.atom_tokens, token) for token in atom_types
-        ]
-        atom_types = torch.tensor(atom_types, dtype=torch.long)
+        atom_types = z_to_atom_types(data.z.tolist())
+        atom_types = torch.tensor(
+            [token_to_index(self.vocab.atom_tokens, t) for t in atom_types],
+            dtype=torch.long,
+        )
 
-        # add 1 to the edge types to make them 1-indexed
-        # 0 is no bond, 1 is single, 2 is double, 3 is triple, 4 is aromatic
         edge_types = data.edge_attr
         edge_types = edge_types_to_symmetric(
             data.edge_index, edge_types, data.num_nodes
         )
+        edge_types = edge_types[data.edge_index[0], data.edge_index[1]].to(torch.long)
 
-        edge_types = edge_types[data.edge_index[0], data.edge_index[1]]
-        edge_types = edge_types.to(torch.long)
-
-        charges = data.charges.tolist()
         charges = [
-            token_to_index(self.vocab.charge_tokens, str(charge)) for charge in charges
+            token_to_index(self.vocab.charge_tokens, str(c))
+            for c in data.charges.tolist()
         ]
         charges = torch.tensor(charges, dtype=torch.long)
 
-        data = MoleculeData(
-            x=coord, a=atom_types, e=edge_types, c=charges, edge_index=data.edge_index
+        return MoleculeData(
+            x=coord, a=atom_types, e=edge_types, c=charges,
+            edge_index=data.edge_index,
         )
-        return data
 
     def get(self, index):
-        return self.__getitem__(index)
+        # Contract: .get() returns raw source data (PyG fields like z, pos,
+        # edge_attr, charges) so preprocessing can iterate before any vocab
+        # exists. __getitem__ is the canonical-MoleculeData builder.
+        return super().get(index)

@@ -1,7 +1,7 @@
 ## Put your data args here
 
 root_path: ${oc.env:PROJECT_ROOT}/data
-preprocess_workers: 0
+preprocess_workers: 10
 
 n_atoms_strategy: "uniform" # "fixed", "approx"
 optimal_transport: "equivariant"
@@ -50,40 +50,41 @@ datamodule:
 
   vocab: ${data.vocab}
   distributions: None
+  representation: ${representation}
 
   datasets:
     train:
       _target_: chemflow.dataset.geom.FlowMatchingGEOMDataset
-      root: ${data.root_path}/geom
+      root: ${data.preprocessing.root}
       vocab: ${data.vocab}
       distributions: None
-      rotate: ${model.rotate}
-      
+
     val:
       - _target_: chemflow.dataset.geom.FlowMatchingGEOMDataset
-        root: ${data.root_path}/geom
+        root: ${data.preprocessing.root}
         vocab: ${data.vocab}
         distributions: None
-        rotate: ${model.rotate}
 
     test:
       - _target_: chemflow.dataset.geom.FlowMatchingGEOMDataset
-        root: ${data.root_path}/geom
+        root: ${data.preprocessing.root}
         vocab: ${data.vocab}
         distributions: None
-        rotate: ${model.rotate}
-  
+
   interpolator: ${data.interpolator}
 
+  rotate: ${model.rotate}
+  n_augmentations: ${model.n_augmentations}
+
   num_workers:
-    train: 2
+    train: 10
     val: 0
     test: 0
     predict: 0
 
   batch_size:
-    train: 64
-    val: 48
+    train: 384
+    val: 80
     test: 32
 
   n_atoms_strategy: ${data.n_atoms_strategy}

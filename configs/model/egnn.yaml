@@ -1,9 +1,10 @@
 ## Put your model args here
 gmm_params:
-    K: 5
+    K: 10
     D: 3
   
 rotate: false
+n_augmentations: 1
 
 
 integrator:
@@ -49,7 +50,7 @@ module:
   use_time_weights: false
   time_dist: ${if:${eq:${model.sample_time_strategy}, log}, ${model.beta_sched}, ${model.linear_sched}}
 
-  cfg_adapter: ${cfg.cfg_adapter}
+  cfg_guidance: ${cfg.cfg_guidance}
 
   integrator: ${model.integrator}
 
@@ -101,45 +102,14 @@ module:
 
     backbone_model_args: ${model.backbone}
 
-    heads_args: ${model.heads}
-    ins_gmm_head_args: ${model.gmm_head_args}
+    heads_args: ${heads.heads}
+    ins_gmm_head_args: ${heads.gmm_head}
+    ins_edge_head_args: ${heads.ins_edge_head}
 
-    ins_edge_head_args:
-      _target_: chemflow.model.heads.InsertionEdgeHead
-      _recursive_: false
-      hidden_dim: ${model.backbone.out_node_nf}  # Match your EGNN hidden dim
-      n_edge_types: ${len:${data.vocab.edge_tokens}} # Your number of edge types
-      n_atom_types: ${len:${data.vocab.atom_tokens}}  # Your number of atom types
-      n_charge_types: ${len:${data.vocab.charge_tokens}}  # Your number of charge types
-      rbf_embedding_args:
-        _target_: chemflow.model.embedding.RBFEmbedding
-        num_rbf: 128
-        rbf_dmax: 3.5
-        out_dim: 64
-        dropout: 0.05
-        trainable: false
-
-atom_type_embedding:
-  _target_: chemflow.model.embedding.Embedding
-  num_embeddings: ${len:${data.vocab.atom_tokens}}
-  embedding_dim: 64
-  out_dim: 128
-
-edge_type_embedding:
-  _target_: chemflow.model.embedding.Embedding
-  num_embeddings: ${len:${data.vocab.edge_tokens}}
-  embedding_dim: 64
-  out_dim: 128
-
-time_embedding:
-  _target_: chemflow.model.embedding.TimeEmbedding
-  embedding_dim: 64
-  out_dim: 128
-
-node_count_embedding:
-  _target_: chemflow.model.embedding.CountEmbedding
-  embedding_dim: 64
-  out_dim: 128
+# Backbone dim references consumed by the shared heads config.
+# EGNN does not have a separate edge feature dim, so node and edge heads share out_node_nf.
+head_node_dim: ${model.backbone.out_node_nf}
+head_edge_dim: ${model.backbone.out_node_nf}
 
 token_weighting:
   type_loss_token_weights: uniform
@@ -149,15 +119,15 @@ token_weighting:
 embedding_backbone:
   _target_: chemflow.model.model.EmbeddingBackbone
   _recursive_: false
-  atom_type_embedding_args: ${model.atom_type_embedding}
-  edge_type_embedding_args: ${model.edge_type_embedding}
-  time_embedding_args: ${model.time_embedding}
-  node_count_embedding_args: ${model.node_count_embedding}
+  atom_type_embedding_args: ${embeddings.atom_type_embedding}
+  edge_type_embedding_args: ${embeddings.edge_type_embedding}
+  time_embedding_args: ${embeddings.time_embedding}
+  node_count_embedding_args: ${embeddings.node_count_embedding}
   cfg_embedding_args: ${cfg.cfg_embedding}
-  h0_input_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${cfg.cfg_embed_dim}"}
-  h0_projection_dim: ${oc.eval:"${model.atom_type_embedding.out_dim} + ${model.time_embedding.out_dim} + ${model.node_count_embedding.out_dim} + ${cfg.cfg_embed_dim}"}
-  e_input_dim: ${model.edge_type_embedding.out_dim}
-  e_projection_dim: ${model.edge_type_embedding.out_dim}
+  h0_input_dim: ${oc.eval:"${embeddings.atom_type_embedding.out_dim} + ${embeddings.time_embedding.out_dim} + ${embeddings.node_count_embedding.out_dim} + ${cfg.cfg_embed_dim}"}
+  h0_projection_dim: ${oc.eval:"${embeddings.atom_type_embedding.out_dim} + ${embeddings.time_embedding.out_dim} + ${embeddings.node_count_embedding.out_dim} + ${cfg.cfg_embed_dim}"}
+  e_input_dim: ${embeddings.edge_type_embedding.out_dim}
+  e_projection_dim: ${embeddings.edge_type_embedding.out_dim}
 
 backbone:
   _target_: chemflow.model.backbones.egnn.EGNNWithEdgeType
@@ -176,71 +146,6 @@ backbone:
     num_rbf: 128
     rbf_dmax: 3.5
     out_dim: 64
-    dropout: 0.05
+    dropout: 0.0
     trainable: false
 
-heads:
-  _target_: chemflow.model.heads.MultiHeadModule
-
-  heads_configs:
-    # Aggregation method for all graph heads
-    graph_aggregation: mean  # Options: mean, sum, max
-    
-    node_heads:
-      atom_type_head:
-        input_dim: ${model.backbone.out_node_nf}
-        output_dim: ${len:${data.vocab.atom_tokens}}
-        hidden_dim: 128
-
-      charge_head:
-        input_dim: ${model.backbone.out_node_nf}
-        output_dim: ${len:${data.vocab.charge_tokens}}
-        hidden_dim: 128
-
-      # Insertion rate head: output_dim depends on strategy
-      ins_rate_head:
-        input_dim: ${model.backbone.out_node_nf}
-        output_dim: 1
-        hidden_dim: 128
-
-      do_ins_head:
-        input_dim: ${model.backbone.out_node_nf}
-        output_dim: 1
-        hidden_dim: 128
-
-      do_del_head:
-        input_dim: ${model.backbone.out_node_nf}
-        output_dim: 1
-        hidden_dim: 128
-
-      do_sub_a_head:
-        input_dim: ${model.backbone.out_node_nf}
-        output_dim: 1
-        hidden_dim: 128
-      
-    edge_heads:
-
-      edge_type_head:
-        input_dim: ${model.backbone.out_node_nf}
-        output_dim: ${len:${data.vocab.edge_tokens}}
-        hidden_dim: 128
-
-      do_sub_e_head:
-        input_dim: ${model.backbone.out_node_nf}
-        output_dim: 1
-        hidden_dim: 128
-
-gmm_head_args:
-  _target_: chemflow.model.heads.EquivariantGMMHead
-  _recursive_: false
-  hidden_dim: ${model.backbone.out_node_nf}
-  K: ${model.gmm_params.K}
-  N_a: ${len:${data.vocab.atom_tokens}}
-  N_c: ${len:${data.vocab.charge_tokens}}
-  rbf_embedding_args:
-    _target_: chemflow.model.embedding.RBFEmbedding
-    num_rbf: 128
-    rbf_dmax: 3.5
-    out_dim: 64
-    dropout: 0.05
-    trainable: false

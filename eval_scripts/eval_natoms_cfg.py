@@ -22,7 +22,7 @@ import torch
 from hydra import compose, initialize_config_dir
 from matplotlib.animation import FuncAnimation, PillowWriter
 from omegaconf import OmegaConf
-from rdkit import RDLogger
+from rdkit import Chem, RDLogger
 
 from chemflow.dataset.vocab import setup_token_weights
 from chemflow.utils.metrics import calc_atom_stabilities, init_metrics
@@ -95,6 +95,122 @@ def _natoms_trajectories(trajectories) -> list[list[int]]:
             per_step.append(n if n is not None else -1)
         out.append(per_step)
     return out
+
+
+_KEKULIZE_EXCEPTIONS = tuple(
+    exc
+    for exc in (
+        getattr(Chem, "AtomKekulizeException", None),
+        getattr(Chem, "KekulizeException", None),
+    )
+    if exc is not None
+)
+
+
+def _kekulize_safe_writer(path: Path) -> Chem.SDWriter:
+    writer = Chem.SDWriter(str(path))
+    writer.SetKekulize(False)
+    return writer
+
+
+def _write_sdf_mol(
+    writer: Chem.SDWriter,
+    mol: Chem.Mol | None,
+    name: str,
+    is_valid: bool,
+    target_n_atoms: int | None,
+    guidance_scale: float | None,
+) -> bool:
+    if mol is None:
+        return False
+    mol.SetProp("_Name", name)
+    mol.SetProp("valid", "1" if is_valid else "0")
+    if target_n_atoms is not None:
+        mol.SetProp("target_n_atoms", str(int(target_n_atoms)))
+    if guidance_scale is not None:
+        mol.SetProp("guidance_scale", f"{float(guidance_scale)}")
+    try:
+        writer.write(mol)
+        return True
+    except _KEKULIZE_EXCEPTIONS:
+        fallback = Chem.RWMol(mol)
+        for atom in fallback.GetAtoms():
+            atom.SetIsAromatic(False)
+        for bond in fallback.GetBonds():
+            if bond.GetBondType() == Chem.BondType.AROMATIC or bond.GetIsAromatic():
+                bond.SetBondType(Chem.BondType.SINGLE)
+            bond.SetIsAromatic(False)
+        fallback.SetProp("_Name", name)
+        fallback.SetProp("valid", "1" if is_valid else "0")
+        if target_n_atoms is not None:
+            fallback.SetProp("target_n_atoms", str(int(target_n_atoms)))
+        if guidance_scale is not None:
+            fallback.SetProp("guidance_scale", f"{float(guidance_scale)}")
+        try:
+            writer.write(fallback)
+            return True
+        except Exception as e:
+            print(f"  skipping {name}: {e}")
+            return False
+    except Exception as e:
+        print(f"  skipping {name}: {e}")
+        return False
+
+
+def _save_cell_sdf(
+    valid_trajs: list,
+    invalid_trajs: list,
+    target: int,
+    scale: float,
+    vocab,
+    output_dir: Path,
+) -> tuple[Path, Path, int, int]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    valid_path = output_dir / f"scale={scale}_target={target}_valid.sdf"
+    invalid_path = output_dir / f"scale={scale}_target={target}_invalid.sdf"
+    valid_writer = _kekulize_safe_writer(valid_path)
+    invalid_writer = _kekulize_safe_writer(invalid_path)
+
+    n_valid_written = 0
+    n_invalid_written = 0
+    try:
+        for idx, traj in enumerate(valid_trajs):
+            final_mol = _final_mol(traj)
+            rdmol = None
+            if final_mol is not None:
+                try:
+                    rdmol = final_mol.to_rdkit_mol(
+                        vocab.atom_tokens,
+                        vocab.edge_tokens,
+                        vocab.charge_tokens,
+                    )
+                except Exception:
+                    rdmol = None
+            if _write_sdf_mol(
+                valid_writer, rdmol, f"mol_{idx:04d}", True, target, scale
+            ):
+                n_valid_written += 1
+        for idx, traj in enumerate(invalid_trajs):
+            final_mol = _final_mol(traj)
+            rdmol = None
+            if final_mol is not None:
+                try:
+                    rdmol = final_mol.to_rdkit_mol(
+                        vocab.atom_tokens,
+                        vocab.edge_tokens,
+                        vocab.charge_tokens,
+                    )
+                except Exception:
+                    rdmol = None
+            if _write_sdf_mol(
+                invalid_writer, rdmol, f"mol_{idx:04d}", False, target, scale
+            ):
+                n_invalid_written += 1
+    finally:
+        valid_writer.close()
+        invalid_writer.close()
+
+    return valid_path, invalid_path, n_valid_written, n_invalid_written
 
 
 def _save_natoms_trajectories(
@@ -518,7 +634,7 @@ def _setup_eval_components(cfg, predict_batch_size: int):
     allow_charged = bool(cfg.data.get("allow_charged", False))
 
     train_smiles = datamodule.train_dataset.base_dataset.get_all_smiles()
-    metrics, stability_metrics, distribution_metrics = init_metrics(
+    metrics, stability_metrics, distribution_metrics, _batch_metrics = init_metrics(
         train_smiles=train_smiles,
         target_n_atoms_distribution=loss_weight_distributions.n_atoms_distribution,
         atom_type_distribution=loss_weight_distributions.atom_type_distribution,
@@ -619,7 +735,7 @@ def _compute_all_metrics(
         for k, v in stability_metrics.compute().items():
             results[k] = v.item() if isinstance(v, torch.Tensor) else v
     else:
-        for key in ("atom-stability", "molecule-stability"):
+        for key in ("rdkit-atom-stability", "rdkit-molecule-stability"):
             results[key] = float("nan")
 
     if distribution_metrics is not None:
@@ -728,6 +844,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Disable saving per-cell GIFs of the n_atoms marginal over time.",
     )
     parser.add_argument(
+        "--no-save-sdf",
+        action="store_true",
+        help=(
+            "Disable writing per-cell valid/invalid SDFs of the final frames "
+            "(one pair per (scale, target) cell, written to <output-dir>/sdf/)."
+        ),
+    )
+    parser.add_argument(
         "--gif-fps",
         type=int,
         default=10,
@@ -748,6 +872,9 @@ def main() -> None:
     gifs_dir = args.output_dir / "natoms_gifs"
     if not args.no_save_gifs:
         gifs_dir.mkdir(parents=True, exist_ok=True)
+    sdf_dir = args.output_dir / "sdf"
+    if not args.no_save_sdf:
+        sdf_dir.mkdir(parents=True, exist_ok=True)
 
     _register_resolvers()
     torch.set_float32_matmul_precision("medium")
@@ -768,8 +895,9 @@ def main() -> None:
     ) = _setup_eval_components(cfg, args.predict_batch_size)
     _load_checkpoint(module, args.checkpoint)
 
-    adapter = module.cfg_adapter
-    if not adapter._has_natoms_cfg:
+    guidance = module.cfg_guidance
+    natoms_signal = guidance.get_signal("n_atoms")
+    if natoms_signal is None:
         raise RuntimeError("Loaded model does not expose n-atoms CFG conditioning.")
 
     n_predict_batches = max(1, math.ceil(args.n_mols / max(1, args.predict_batch_size)))
@@ -787,21 +915,21 @@ def main() -> None:
     guidance_scales = _parse_float_list(args.guidance_scales)
     module.predict_return_traj = True
 
-    original_property_scale = adapter.cfg_guidance_scale
-    original_mw_scale = adapter.mw_cfg_guidance_scale
+    original_scales = {s.name: s.guidance_scale for s in guidance.signals}
     all_results: dict[tuple[float, int], dict] = {}
 
     try:
-        adapter.cfg_guidance_scale = 0.0
-        adapter.mw_cfg_guidance_scale = 0.0
+        # Disable every signal except n_atoms while sweeping.
+        for s in guidance.signals:
+            if s.name != "n_atoms":
+                s.guidance_scale = 0.0
 
         for scale in guidance_scales:
-            adapter.natoms_cfg_guidance_scale = float(scale)
+            natoms_signal.guidance_scale = float(scale)
             print(f"\n{'=' * 60}\nn_atoms guidance scale={scale}\n{'=' * 60}")
 
             for target in target_n_atoms:
-                module.predict_target_n_atoms_override = int(target)
-                module.predict_target_mw_override = None
+                module.predict_overrides = {"n_atoms": int(target)}
 
                 per_seed: list[dict] = []
                 valid_trajs: list = []
@@ -877,8 +1005,8 @@ def main() -> None:
                         f"({summary['n_valid']}/{summary['n_total']}), "
                         f"novelty={tm.get('novelty', float('nan')):.1%}, "
                         f"uniqueness={tm.get('uniqueness', float('nan')):.1%}, "
-                        f"atom-stab={tm.get('atom-stability', float('nan')):.1%}, "
-                        f"mol-stab={tm.get('molecule-stability', float('nan')):.1%}, "
+                        f"atom-stab={tm.get('rdkit-atom-stability', float('nan')):.1%}, "
+                        f"mol-stab={tm.get('rdkit-molecule-stability', float('nan')):.1%}, "
                         f"exact(all)={stats['exact_match_rate']:.1%}, "
                         f"exact(valid)={valid_stats['exact_match_rate']:.1%}, "
                         f"within±1(valid)={valid_stats['within_1_rate']:.1%}, "
@@ -920,11 +1048,24 @@ def main() -> None:
                         scale=float(scale),
                         fps=args.gif_fps,
                     )
+
+                if not args.no_save_sdf:
+                    valid_sdf_path, invalid_sdf_path, n_v_sdf, n_i_sdf = _save_cell_sdf(
+                        valid_trajs=valid_trajs,
+                        invalid_trajs=invalid_trajs,
+                        target=int(target),
+                        scale=float(scale),
+                        vocab=module.vocab,
+                        output_dir=sdf_dir,
+                    )
+                    print(
+                        f"  wrote {n_v_sdf} valid -> {valid_sdf_path.name}, "
+                        f"{n_i_sdf} invalid -> {invalid_sdf_path.name}"
+                    )
     finally:
-        adapter.cfg_guidance_scale = original_property_scale
-        adapter.mw_cfg_guidance_scale = original_mw_scale
-        module.predict_target_n_atoms_override = None
-        module.predict_target_mw_override = None
+        for s in guidance.signals:
+            s.guidance_scale = original_scales[s.name]
+        module.predict_overrides = None
 
     pt_path = args.output_dir / "natoms_cfg_results.pt"
     json_path = args.output_dir / "natoms_cfg_results.json"
@@ -981,6 +1122,8 @@ def main() -> None:
         print(f"Saved n_atoms trajectories under: {natoms_traj_dir}")
     if not args.no_save_gifs:
         print(f"Saved n_atoms GIFs under:       {gifs_dir}")
+    if not args.no_save_sdf:
+        print(f"Saved per-cell SDFs under:      {sdf_dir}")
 
 
 if __name__ == "__main__":
