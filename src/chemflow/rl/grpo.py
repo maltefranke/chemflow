@@ -385,8 +385,14 @@ def ins_edge_marginal_logprob(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _ensure_max_seqlen(mol: MoleculeBatch) -> MoleculeBatch:
+    mol.max_seqlen = int(torch.bincount(mol.batch).max().item())
+    return mol
+
+
 def _forward_preds(module, mol_t, t: torch.Tensor, cfg: GRPOConfig):
     """Single forward pass that returns the full preds dict (with h_latent)."""
+    mol_t = _ensure_max_seqlen(mol_t)
     model = module._get_model()
     model.set_inference()
     return module.cfg_guidance.guided_predict(model, mol_t, t, None, cfg.cfg_inputs)

@@ -58,18 +58,18 @@ module:
   #  c: 1.0
 
   loss_weights:
-    do_sub_a: 0.2
-    sub_a_class: 0.03
-    do_sub_e: 0.25
-    sub_e_class: 0.5
-    do_del: 0.4
+    do_sub_a: 1.0
+    sub_a_class: 1.0
+    do_sub_e: 1.0
+    sub_e_class: 1.0
+    do_del: 1.0
     do_ins: 1.0
-    ins_rate: 0.15
-    ins_gmm: 0.01
-    ins_e: 0.4
+    ins_rate: 1.0
+    ins_gmm: 1.0
+    ins_e: 1.0
     x: 1.0
-    c: 0.5
-    ins_e_ii: 0.03
+    c: 1.0
+    ins_e_ii: 1.0
 
   # Optimizer configuration
   # MuonWithAuxAdam: Muon for 2D backbone weights, AdamW for the rest.

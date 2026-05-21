@@ -26,6 +26,12 @@ source .venv/bin/activate
 echo "host=$(hostname)  gpus=${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi -L || true
 
-# All knobs live in configs/rl/grpo.yaml. Per-job overrides come in as trailing
-# hydra args, e.g. `sbatch run_grpo_slurm.sh rl.grpo.kl_coef=0.02 rl.seed=1`.
-uv run --active --no-sync --env-file .env python -m chemflow.rl.run_grpo "$@"
+uv run --active --no-sync --env-file .env python -m chemflow.rl.run_grpo \
+    data=qm9 \
+    model=dit \
+    cfg=uncond \
+    representation=pointcloud \
+    'rl.ckpt="${oc.env:PROJECT_ROOT}/.pretrained_model/epoch=206-step=4968.ckpt"' \
+    rl.reward.apply_validity_gate=false \
+    rl.reward.scaffold_diversity=false \
+    "$@"
