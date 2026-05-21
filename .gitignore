@@ -185,15 +185,7 @@ slurm_logs/
 diagnostics/
 src/chemflow/rl/notes/
 
-# RL experiment runs: one folder per checkpoint (plots + tensors); reproducible via scripts/notebooks.
-src/chemflow/rl/experiments/natoms/grpo_*/
-src/chemflow/rl/experiments/shape/grpo_*/
-src/chemflow/rl/experiments/tanimoto/grpo_*/
-src/chemflow/rl/experiments/topology/grpo_*/
-# Loose PNGs beside notebooks (preferred: write under grpo_* only)
-src/chemflow/rl/experiments/natoms/*.png
-src/chemflow/rl/experiments/shape/*.png
-src/chemflow/rl/experiments/tanimoto/*.png
-src/chemflow/rl/experiments/topology/*.png
+# All RL experiment scratch (scripts, notebooks, run artifacts) stays local-only.
+src/chemflow/rl/experiments/
 
 .codex
