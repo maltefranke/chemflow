@@ -22,7 +22,7 @@ class LightningDataModule(pl.LightningDataModule):
         interpolator: DictConfig,
         num_workers: DictConfig,
         batch_size: DictConfig,
-        representation: str | Representation = Representation.GEOMETRIC_GRAPH,
+        representation: str | Representation = Representation.MOLECULE,
         n_atoms_strategy: str = "flexible",
         optimal_transport: str = "equivariant",
         time_dist: DictConfig = None,

@@ -1,21 +1,14 @@
-"""Tensor-based generative metrics, consumed directly from ``MoleculeBatch``.
+"""Geometric tensor metrics consumed directly from ``MoleculeBatch``.
 
-These mirror the KL / distribution-distance ideas in ``metrics.py`` but operate
-on the batch tensors (``x``, ``a``, ``batch``) rather than on RDKit molecules,
-so they work in every representation — including pointcloud modes where runtime
-edges are ``<NO_BOND>`` placeholders rather than real bonds.
-
-All metrics here run in every representation. The 1D atom-count / atom-type
-KLs intentionally coexist with their RDKit-mol counterparts in ``metrics.py``:
-the RDKit versions are *conditional* on samples being RDKit-convertible (they
-silently drop ``None`` mols), while the ones here are *marginal* over every
-generated sample. The gap between them is itself diagnostic.
-
-Target stats (per-element-pair distance histogram, RoG histogram) are computed
-once at preprocessing time on training-set coords in Angstroms and stored in
+These run in every representation (no RDKit, no validity conditioning). Target
+stats (per-element-pair distance histogram, RoG histogram) are computed once at
+preprocessing time on training-set coords in Angstroms and stored in
 ``Distributions``. Generated coords are expected to arrive in Angstroms too —
 ``sample()`` in the LightningModule already multiplies by ``coordinate_std``
 before returning the final ``MoleculeBatch``.
+
+Also hosts the shared bin edges + histogram accumulators because both this
+module and ``preprocessing.py`` must agree on them exactly.
 """
 
 import torch
@@ -41,12 +34,6 @@ def dist_edges() -> torch.Tensor:
 
 def rg_edges() -> torch.Tensor:
     return torch.linspace(RG_RANGE[0], RG_RANGE[1], RG_N_BINS + 1)
-
-
-def _kl(p: torch.Tensor, q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    p = p / p.sum().clamp(min=eps)
-    q = q / q.sum().clamp(min=eps)
-    return (p * (p.clamp(min=eps).log() - q.clamp(min=eps).log())).sum()
 
 
 def accumulate_pairwise_distance_hist(
@@ -111,62 +98,6 @@ class BatchMetric(Metric):
 
     def compute(self) -> torch.Tensor:
         raise NotImplementedError
-
-
-class AtomCountMarginalKL(BatchMetric):
-    """KL(gen || target) over atom counts per molecule, marginal over all generated
-    samples (no RDKit-validity conditioning, unlike ``AtomCountDistributionMetric``).
-    """
-
-    def __init__(self, target_distribution: torch.Tensor, eps: float = 1e-8, **kwargs):
-        super().__init__(**kwargs)
-        target = target_distribution.detach().to(torch.float32)
-        self.eps = eps
-        self.K = int(target.numel())
-        self.register_buffer("target", target / target.sum().clamp(min=eps))
-        self.add_state(
-            "gen_hist",
-            default=torch.zeros(self.K, dtype=torch.float32),
-            dist_reduce_fx="sum",
-        )
-
-    def update(self, batch: MoleculeBatch) -> None:
-        counts = torch.bincount(batch.batch, minlength=batch.num_graphs).clamp(
-            0, self.K - 1
-        )
-        self.gen_hist += torch.bincount(counts, minlength=self.K).to(torch.float32)
-
-    def compute(self) -> torch.Tensor:
-        if self.gen_hist.sum() <= 0:
-            return torch.tensor(0.0, device=self.gen_hist.device)
-        return _kl(self.gen_hist, self.target, self.eps)
-
-
-class AtomTypeMarginalKL(BatchMetric):
-    """KL(gen || target) over atom-type histogram, marginal over all generated
-    samples (no RDKit-validity conditioning, unlike ``AtomTypeDistributionMetric``).
-    """
-
-    def __init__(self, target_distribution: torch.Tensor, eps: float = 1e-8, **kwargs):
-        super().__init__(**kwargs)
-        target = target_distribution.detach().to(torch.float32)
-        self.eps = eps
-        self.K = int(target.numel())
-        self.register_buffer("target", target / target.sum().clamp(min=eps))
-        self.add_state(
-            "gen_hist",
-            default=torch.zeros(self.K, dtype=torch.float32),
-            dist_reduce_fx="sum",
-        )
-
-    def update(self, batch: MoleculeBatch) -> None:
-        a = batch.a.clamp(0, self.K - 1)
-        self.gen_hist += torch.bincount(a, minlength=self.K).to(torch.float32)
-
-    def compute(self) -> torch.Tensor:
-        if self.gen_hist.sum() <= 0:
-            return torch.tensor(0.0, device=self.gen_hist.device)
-        return _kl(self.gen_hist, self.target, self.eps)
 
 
 class PairwiseDistanceL1(BatchMetric):
@@ -315,59 +246,11 @@ class RoGL1(BatchMetric):
         return (gen_n - tgt_n).abs().sum()
 
 
-def build_batch_marginal_plots(metrics, atom_tokens: list[str] | None = None):
-    """Produce a small set of GT-vs-generated marginal plots from a populated
-    ``BatchMetric`` collection. Returns ``{wandb_key: matplotlib.Figure}``.
+def build_batch_metrics(distributions) -> dict[str, BatchMetric]:
+    """Construct the geometric batch-side metric set from training target stats.
 
-    v1 covers the three 1D marginals — atom count, atom type, radius of gyration.
-    Per-pair distance plots are deferred; with ``A`` atom types you'd get up to
-    ``A*(A+1)/2`` figures and it's better to pick the few that matter once we
-    know which pairs we care about.
-    """
-    from chemflow.utils.metrics import plot_marginal_comparison
-
-    figs: dict = {}
-    by_name = {k: m for k, m in metrics.items()} if hasattr(metrics, "items") else {}
-
-    def _maybe_plot(name, gen_attr, target_attr, labels, title, xlabel, key):
-        m = by_name.get(name)
-        if m is None:
-            return
-        gen = getattr(m, gen_attr, None)
-        tgt = getattr(m, target_attr, None)
-        if gen is None or tgt is None:
-            return
-        figs[key] = plot_marginal_comparison(gen, tgt, labels, title, xlabel)
-
-    _maybe_plot(
-        "atom_count_marginal_kl", "gen_hist", "target",
-        labels=None, title="Atom count (all samples)", xlabel="num atoms",
-        key="val/batch/plots/atom_count_marginal",
-    )
-    _maybe_plot(
-        "atom_type_marginal_kl", "gen_hist", "target",
-        labels=list(atom_tokens) if atom_tokens is not None else None,
-        title="Atom type (all samples)", xlabel="token",
-        key="val/batch/plots/atom_type_marginal",
-    )
-    _maybe_plot(
-        "rog_l1", "gen_hist", "target_hist",
-        labels=None, title="Radius of gyration",
-        xlabel=f"RoG bin (Å in [{RG_RANGE[0]}, {RG_RANGE[1]}])",
-        key="val/batch/plots/rog",
-    )
-    return figs
-
-
-def build_batch_metrics(
-    distributions,
-    num_atom_types: int,
-) -> dict[str, BatchMetric]:
-    """Construct the batch-side metric set from training-side target stats.
-
-    All metrics run in every representation. The 1D atom-count / atom-type KLs
-    coexist with the RDKit-mol equivalents in ``metrics.py`` on purpose — see
-    module docstring.
+    Atom-count / atom-type / edge / charge KLs live in the distribution
+    collection (see ``init_metrics``), not here — this set is purely geometric.
 
     Returns an empty dict if Distributions lacks either geometric target stat
     (e.g. an older cache built before these were added). Both are checked
@@ -383,6 +266,4 @@ def build_batch_metrics(
         "range_overflow": RangeOverflow(),
         "pair_dist_l1": PairwiseDistanceL1(distributions.pairwise_distance_histogram),
         "rog_l1": RoGL1(distributions.radius_of_gyration_histogram),
-        "atom_count_marginal_kl": AtomCountMarginalKL(distributions.n_atoms_distribution),
-        "atom_type_marginal_kl": AtomTypeMarginalKL(distributions.atom_type_distribution),
     }

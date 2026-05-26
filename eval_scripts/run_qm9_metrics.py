@@ -59,7 +59,7 @@ def main():
         stability_metrics = None
         print("Computing validity metrics only")
     else:
-        metrics, stability_metrics = init_metrics()
+        metrics, stability_metrics, _, _ = init_metrics()
 
     # Process molecules in batches
     print(f"Processing molecules in batches of {args.batch_size}...")

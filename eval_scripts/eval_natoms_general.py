@@ -90,7 +90,7 @@ def _setup_eval_components(cfg, predict_batch_size: int):
     allow_charged = bool(cfg.data.get("allow_charged", False))
 
     train_smiles = datamodule.train_dataset.base_dataset.get_all_smiles()
-    metrics, stability_metrics, distribution_metrics = init_metrics(
+    metrics, stability_metrics, distribution_metrics, _batch_metrics = init_metrics(
         train_smiles=train_smiles,
         target_n_atoms_distribution=loss_weight_distributions.n_atoms_distribution,
         atom_type_distribution=loss_weight_distributions.atom_type_distribution,
@@ -457,7 +457,7 @@ def _compute_all_metrics(
         for k, v in stability_metrics.compute().items():
             results[k] = v.item() if isinstance(v, torch.Tensor) else v
     else:
-        for key in ("atom-stability", "molecule-stability"):
+        for key in ("rdkit-atom-stability", "rdkit-molecule-stability"):
             results[key] = float("nan")
 
     if distribution_metrics is not None:
@@ -1043,9 +1043,9 @@ def main() -> None:
     )
     print(f"  novelty                  : {tm.get('novelty', float('nan')):.1%}")
     print(f"  uniqueness               : {tm.get('uniqueness', float('nan')):.1%}")
-    print(f"  atom-stability           : {tm.get('atom-stability', float('nan')):.1%}")
+    print(f"  atom-stability           : {tm.get('rdkit-atom-stability', float('nan')):.1%}")
     print(
-        f"  molecule-stability       : {tm.get('molecule-stability', float('nan')):.1%}"
+        f"  molecule-stability       : {tm.get('rdkit-molecule-stability', float('nan')):.1%}"
     )
     print(f"  energy-validity          : {tm.get('energy-validity', float('nan')):.1%}")
     print(

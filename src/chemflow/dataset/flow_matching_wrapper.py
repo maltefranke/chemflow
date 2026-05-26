@@ -9,6 +9,7 @@ from chemflow.dataset.molecule_data import MoleculeBatch
 from chemflow.dataset.representation import (
     Representation,
     project_molecule_to_representation,
+    validate_representation,
 )
 from chemflow.dataset.vocab import Vocab
 
@@ -36,18 +37,26 @@ class FlowMatchingDatasetWrapper(Dataset):
         distributions,
         interpolator,
         vocab: Vocab,
-        representation: str | Representation = Representation.GEOMETRIC_GRAPH,
+        representation: str | Representation = Representation.MOLECULE,
         n_atoms_strategy="flexible",
         time_dist=None,
         stage="train",
         rotate: bool = False,
         n_augmentations: int = 1,
     ):
+        self.representation = Representation(representation)
+        caps = getattr(type(base_dataset), "CAPABILITIES", None)
+        if caps is None:
+            raise ValueError(
+                f"Dataset {type(base_dataset).__name__} must declare a "
+                f"CAPABILITIES attribute to be used with a representation."
+            )
+        validate_representation(caps, self.representation)
+
         self.base_dataset = base_dataset
         self.distributions = distributions
         self.interpolator = interpolator
         self.vocab = vocab
-        self.representation = Representation(representation)
         self.n_atoms_strategy = n_atoms_strategy
         self.time_dist = time_dist
         self.stage = stage

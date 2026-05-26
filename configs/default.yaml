@@ -10,8 +10,9 @@ defaults:
 # the requested mode against them before preprocessing.
 #   pointcloud         — x, a only (charges and edges are dummy singletons)
 #   charged_pointcloud — x, a, c   (edges are dummy singletons)
-#   geometric_graph    — full chemistry (current behavior)
-representation: geometric_graph
+#   geometric_graph    — x, a, edge_index, e (charges are dummy neutral)
+#   molecule           — full chemistry (current behavior)
+representation: molecule
 
 # Run directory: outputs/<dataset>/<cfg_method>/<date>/<wandb_id>.
 # wandb id is CHEMFLOW_RUN_ID (same as WANDB_RUN_ID). Set in the shell before

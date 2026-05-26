@@ -1,8 +1,7 @@
-from rdkit import Chem
-from rdkit.Chem.rdDetermineBonds import DetermineBonds
-from chemflow.utils.utils  import index_to_token
-import torch
 import numpy as np
+from rdkit import Chem, RDLogger
+
+RDLogger.DisableLog("rdApp.*")
 
 
 def tensors_to_rdkit_mol(
@@ -42,20 +41,19 @@ def tensors_to_rdkit_mol(
         # DetermineBonds(mol)
         for atom in mol.GetAtoms():
             atom.UpdatePropertyCache(strict=False)
-    except Exception as e:
-        print(e)
+    except Exception:
         return None
 
     if sanitize:
-        try:
-            Chem.SanitizeMol(mol)
+        err = Chem.SanitizeMol(mol, catchErrors=True)
+        if err:
+            return None
 
+        try:
             for atom in mol.GetAtoms():
                 atom.SetNoImplicit(True) # Ensure no "ghost" Hs are expected
                 atom.UpdatePropertyCache()
-
-        except Exception as e:
-            print(e)
+        except Exception:
             return None
 
     return mol

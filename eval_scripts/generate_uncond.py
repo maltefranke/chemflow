@@ -72,7 +72,7 @@ def _setup(cfg, predict_batch_size: int):
 
     allow_charged = bool(cfg.data.get("allow_charged", False))
     train_smiles = datamodule.train_dataset.base_dataset.get_all_smiles()
-    metrics, stab_metrics, dist_metrics = init_metrics(
+    metrics, stab_metrics, dist_metrics, batch_metrics = init_metrics(
         train_smiles=train_smiles,
         target_n_atoms_distribution=loss_weight_distributions.n_atoms_distribution,
         atom_type_distribution=loss_weight_distributions.atom_type_distribution,
@@ -103,6 +103,7 @@ def _setup(cfg, predict_batch_size: int):
         metrics=metrics,
         stability_metrics=stab_metrics,
         distribution_metrics=dist_metrics,
+        batch_metrics=batch_metrics,
         allow_charged=allow_charged,
     )
 
