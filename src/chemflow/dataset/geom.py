@@ -49,6 +49,13 @@ LMDB_MAP_SIZE = 128 * (1024**3)
 # big-endian, so this textual key cannot collide with them.
 LEN_KEY = b"__len__"
 
+# FlowMol3 atom vocabulary. Conformers containing any element outside this set
+# are dropped during processing. The outlier elements observed in the raw GEOM
+# train SMILES are vanishingly rare compared to the kept set (counts from
+# notebooks/atom_type_counts.ipynb): B=14, Si=8, Bi=3 — i.e. ≤2e-6 of all
+# atoms, vs. ≥200 for the rarest kept element (I).
+ALLOWED_ATOM_SYMBOLS = frozenset({"H", "C", "N", "O", "S", "F", "Cl", "Br", "P", "I"})
+
 
 def _int_key(i: int) -> bytes:
     return i.to_bytes(8, "big")
@@ -80,6 +87,8 @@ def process_one_conformer(mol: Chem.Mol):
     try:
         N = mol.GetNumAtoms()
         if N >= 72:
+            return None
+        if any(a.GetSymbol() not in ALLOWED_ATOM_SYMBOLS for a in mol.GetAtoms()):
             return None
         conf = mol.GetConformer()
         pos = conf.GetPositions()
