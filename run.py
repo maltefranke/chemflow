@@ -145,15 +145,16 @@ def setup(cfg: DictConfig):
 
     module.compile()
 
-    # Setup logging and callbacks
-    wandb_logger = WandbLogger(**cfg.logging)
+    # Setup logging and callbacks. Skip wandb when we are not training so
+    # validate/predict-only runs don't spawn a run.
+    logger = WandbLogger(**cfg.logging) if cfg.trainer.do_train else False
     callbacks = build_callbacks(cfg)
     lr_monitor = LearningRateMonitor(logging_interval="step")
     callbacks.append(lr_monitor)
 
     # Instantiate trainer
     trainer = pl.Trainer(
-        logger=wandb_logger,
+        logger=logger,
         callbacks=callbacks,
         **cfg.trainer.trainer,
     )
