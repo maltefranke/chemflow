@@ -32,6 +32,12 @@ from .diversity import (
     ScaffoldBucketMemory,
     scaffold_diversity_wrapper,
 )
+from .organic_xyz_validity import (
+    ORGANIC_XYZ_VALIDITY_GATE_SPEC,
+    ORGANIC_XYZ_VALIDITY_SPEC,
+    organic_xyz_validity_gate_wrapper,
+    organic_xyz_validity_reward,
+)
 from .prilocaine_topology import (
     _SHAPE_REF_SMILES,
     TANIMOTO_SPEC,
@@ -49,6 +55,7 @@ from .spec import RewardSpec, WrapperSpec
 
 REWARDS: dict[str, RewardSpec] = {
     "validity": VALIDITY_SPEC,
+    "organic_xyz_validity": ORGANIC_XYZ_VALIDITY_SPEC,
     "n_atoms": N_ATOMS_SPEC,
     "tanimoto": TANIMOTO_SPEC,
     "topology": TOPOLOGY_SPEC,
@@ -58,6 +65,7 @@ REWARDS: dict[str, RewardSpec] = {
 WRAPPERS: dict[str, WrapperSpec] = {
     "scaffold_diversity": SCAFFOLD_DIVERSITY_SPEC,
     "validity_gate": VALIDITY_GATE_SPEC,
+    "organic_xyz_validity_gate": ORGANIC_XYZ_VALIDITY_GATE_SPEC,
 }
 
 
@@ -117,6 +125,8 @@ __all__ = [
     "_score_topology_single",
     "build_reward",
     "n_atoms_reward",
+    "organic_xyz_validity_gate_wrapper",
+    "organic_xyz_validity_reward",
     "scaffold_diversity_wrapper",
     "validity_gate_wrapper",
     "tanimoto_reward",

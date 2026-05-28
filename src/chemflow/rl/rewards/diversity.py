@@ -128,7 +128,9 @@ def scaffold_diversity_wrapper(
             "diversity_bucket must be 'murcko' or 'canonical_smiles', "
             f"got {diversity_bucket!r}",
         )
-    mem = memory if memory is not None else ScaffoldBucketMemory(window_batches=window_batches)
+    # Negative window = full-run memory (mirrors the old config flag's contract).
+    win = None if (window_batches is not None and window_batches < 0) else window_batches
+    mem = memory if memory is not None else ScaffoldBucketMemory(window_batches=win)
 
     def wrapped(module, trajectory) -> tuple[torch.Tensor, dict[str, float]]:
         r, diag = base_reward_fn(module, trajectory)

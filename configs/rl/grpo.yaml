@@ -23,13 +23,13 @@ data:
 # GRPO fine-tuning config.
 rl:
   # Pretrained checkpoint to start from. Must carry `hyper_parameters.representation`.
-  ckpt: ${oc.env:PROJECT_ROOT}/.pretrained_model/epoch=167-step=4009.ckpt
+  ckpt: ${oc.env:PROJECT_ROOT}/.pretrained_model/epoch=499-step=12000.ckpt
   # Saved under the per-run hydra dir so `.hydra/config.yaml`, the ckpts, and
   # the run log all live together.
   save:      ${hydra:runtime.output_dir}/grpo.pt
   save_best: ${hydra:runtime.output_dir}/grpo_best.pt
-  n_updates: 200
-  lr: 1e-4
+  n_updates: 1000
+  lr: 3e-5
   device: auto  # auto | cuda | cpu
   log_every: 1
   seed: 0
@@ -45,7 +45,7 @@ rl:
 
   # Policy / objective settings mapped directly into rl.grpo.GRPOConfig.
   grpo:
-    sigma_explore: 0.05
+    sigma_explore: 0.002
     clip_eps: 0.2
     eps_t: 0.01
     log_ratio_clamp: 20.0
@@ -53,23 +53,34 @@ rl:
     num_integration_steps: 100
     max_grad_norm: 1.0  # null disables; <=0 is also treated as disabled
     group_size: 8
-    kl_coef: 0.02
-    kl_omit_pos: true
-    update_passes: 2
+    kl_coef: 0.05
+    kl_omit_pos: false
+    update_passes: 1
     per_element_logp_mean: false
 
-  # Reward registry key and optional REINVENT-style diversity wrapper.
+  # Reward + composable wrappers. Order of `wrappers:` is the order of
+  # application; gates should run before diversity bucketing. Each entry has
+  # `enabled` plus the wrapper-specific kwargs (passed verbatim to its make()).
   reward:
     name: n_atoms
-    # Multiply reward by RDKit validity (0/1) per graph. MOLECULE only;
-    # raises if true under any other representation.
-    apply_validity_gate: true
-    scaffold_diversity: true
-    scaffold_bucket_size: 10
-    scaffold_penalty: 0.5
-    scaffold_window_batches: 50  # -1 = full-run memory; >=1 = rolling batches
-    scaffold_labeled: false
-    scaffold_diversity_key: canonical_smiles  # murcko | canonical_smiles
+    wrappers:
+      # RDKit validity gate. MOLECULE only; raises under any other representation.
+      validity_gate:
+        enabled: true
+      # Neutral organic XYZ validity gate (RDKit DetermineBonds).
+      # Use instead of validity_gate when QM9-style organic edges are projected.
+      organic_xyz_validity_gate:
+        enabled: false
+        cov_factor: 1.3  # covalent-radii scale for connectivity; lower = stricter
+        max_iterations: 200
+      # REINVENT-style scaffold-occurrence bucketing.
+      scaffold_diversity:
+        enabled: true
+        bucket_size: 10
+        penalty: 0.5
+        diversity_bucket: canonical_smiles  # murcko | canonical_smiles
+        window_batches: 50                  # >=1 = rolling batches; full-run memory needs the wrapper directly
+        generic_scaffold: true              # was scaffold_labeled=false
 
   # Weights & Biases logging for RL metrics. `group` is the right knob for sweep
   # aggregation; set it from the sweep wrapper.

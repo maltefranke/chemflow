@@ -247,38 +247,34 @@ def build_grpo_config(grpo_cfg: DictConfig) -> GRPOConfig:
     return GRPOConfig(**kwargs)
 
 
-def build_reward(reward_cfg: DictConfig, *, representation: Representation):
+def build_reward(
+    reward_cfg: DictConfig,
+    *,
+    representation: Representation,
+    extra_kwargs: dict[str, dict] | None = None,
+):
+    """Declarative wrapper composition.
+
+    ``reward.wrappers`` is a name-keyed mapping; each entry carries an
+    ``enabled`` flag plus the wrapper-specific kwargs (passed through verbatim
+    to ``WrapperSpec.make``). Order of application matches insertion order in
+    the config — validity gates should come before diversity gates.
+
+    ``extra_kwargs`` is a per-wrapper dict of runtime objects (e.g. the train
+    dataset, a tokenizer) that aren't expressible in Hydra config. They're
+    merged on top of the config-supplied kwargs before instantiation.
+    """
     name = str(reward_cfg.name)
+    wrappers_cfg = reward_cfg.get("wrappers", {}) or {}
+    extra_kwargs = extra_kwargs or {}
+
     wrappers: list[tuple[str, dict]] = []
-
-    # Order matters: validity gates the raw reward first, then diversity
-    # bucketing penalizes over-represented scaffolds among the survivors.
-    if bool(reward_cfg.get("apply_validity_gate", False)):
-        wrappers.append(("validity_gate", {}))
-
-    if bool(reward_cfg.scaffold_diversity):
-        bucket_size = int(reward_cfg.scaffold_bucket_size)
-        if bucket_size < 1:
-            raise ValueError(f"scaffold_bucket_size must be >= 1, got {bucket_size}")
-
-        window_batches_raw = int(reward_cfg.scaffold_window_batches)
-        scaffold_window = None if window_batches_raw < 0 else window_batches_raw
-        if scaffold_window is not None and scaffold_window < 1:
-            raise ValueError(
-                "scaffold_window_batches must be >= 1 or -1 (full run), "
-                f"got {window_batches_raw}"
-            )
-
-        wrappers.append((
-            "scaffold_diversity",
-            dict(
-                bucket_size=bucket_size,
-                penalty=float(reward_cfg.scaffold_penalty),
-                generic_scaffold=not bool(reward_cfg.scaffold_labeled),
-                diversity_bucket=str(reward_cfg.scaffold_diversity_key),
-                window_batches=scaffold_window,
-            ),
-        ))
+    for w_name, w_cfg in wrappers_cfg.items():
+        w_cfg_dict = OmegaConf.to_container(w_cfg, resolve=True) or {}
+        if not bool(w_cfg_dict.pop("enabled", False)):
+            continue
+        w_cfg_dict.update(extra_kwargs.get(str(w_name), {}))
+        wrappers.append((str(w_name), w_cfg_dict))
 
     return build_reward_from_spec(name, representation=representation, wrappers=wrappers)
 

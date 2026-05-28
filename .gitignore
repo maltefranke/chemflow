@@ -187,5 +187,5 @@ src/chemflow/rl/notes/
 
 # All RL experiment scratch (scripts, notebooks, run artifacts) stays local-only.
 src/chemflow/rl/experiments/
-
+eval_outputs/
 .codex

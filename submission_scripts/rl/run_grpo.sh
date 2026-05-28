@@ -101,12 +101,12 @@ uv run --env-file .env python -m chemflow.rl.run_grpo \
     "rl.grpo.kl_coef=$KL_COEF" \
     "rl.grpo.per_element_logp_mean=$PER_ELEM_ENABLED" \
     "rl.reward.name=$REWARD" \
-    "rl.reward.scaffold_diversity=$SCAFFOLD_ENABLED" \
-    "rl.reward.scaffold_diversity_key=$SCAFFOLD_DIVERSITY_KEY" \
-    "rl.reward.scaffold_bucket_size=$SCAFFOLD_BUCKET_SIZE" \
-    "rl.reward.scaffold_penalty=$SCAFFOLD_PENALTY" \
-    "rl.reward.scaffold_window_batches=$SCAFFOLD_WINDOW_BATCHES" \
-    "rl.reward.scaffold_labeled=$SCAFFOLD_LABELED" \
+    "rl.reward.wrappers.scaffold_diversity.enabled=$SCAFFOLD_ENABLED" \
+    "rl.reward.wrappers.scaffold_diversity.diversity_bucket=$SCAFFOLD_DIVERSITY_KEY" \
+    "rl.reward.wrappers.scaffold_diversity.bucket_size=$SCAFFOLD_BUCKET_SIZE" \
+    "rl.reward.wrappers.scaffold_diversity.penalty=$SCAFFOLD_PENALTY" \
+    "rl.reward.wrappers.scaffold_diversity.window_batches=$SCAFFOLD_WINDOW_BATCHES" \
+    "rl.reward.wrappers.scaffold_diversity.generic_scaffold=$([[ "$SCAFFOLD_LABELED" =~ ^(1|true|yes|on)$ ]] && echo false || echo true)" \
     "rl.grpo.kl_omit_pos=$KL_OMIT_ENABLED" \
     "rl.wandb.enabled=$WANDB_ENABLED" \
     "rl.wandb.project=$GRPO_WANDB_PROJECT" \

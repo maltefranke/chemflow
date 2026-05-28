@@ -31,7 +31,8 @@ uv run --active --no-sync --env-file .env python -m chemflow.rl.run_grpo \
     model=dit \
     cfg=uncond \
     representation=pointcloud \
-    'rl.ckpt="${oc.env:PROJECT_ROOT}/.pretrained_model/epoch=206-step=4968.ckpt"' \
-    rl.reward.apply_validity_gate=false \
-    rl.reward.scaffold_diversity=false \
+    'rl.ckpt="${oc.env:PROJECT_ROOT}/.pretrained_model/epoch=499-step=12000.ckpt"' \
+    rl.reward.wrappers.validity_gate.enabled=false \
+    rl.reward.wrappers.organic_xyz_validity_gate.enabled=true \
+    rl.reward.wrappers.scaffold_diversity.enabled=false \
     "$@"
