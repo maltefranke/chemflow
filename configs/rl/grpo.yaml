@@ -23,7 +23,7 @@ data:
 # GRPO fine-tuning config.
 rl:
   # Pretrained checkpoint to start from. Must carry `hyper_parameters.representation`.
-  ckpt: ${oc.env:PROJECT_ROOT}/.pretrained_model/epoch=499-step=12000.ckpt
+  ckpt: ${oc.env:PROJECT_ROOT}/.pretrained_model/epoch=540-step=198547_tmqm_dit.ckpt
   # Saved under the per-run hydra dir so `.hydra/config.yaml`, the ckpts, and
   # the run log all live together.
   save:      ${hydra:runtime.output_dir}/grpo.pt
@@ -33,7 +33,7 @@ rl:
   device: auto  # auto | cuda | cpu
   log_every: 1
   seed: 0
-  max_atoms: 100
+  max_atoms: 120  # tmQM train tops out at ~101 atoms; headroom above that
   # Run module.batch_metrics + module.distribution_metrics on the final rollout
   # batch every N updates. 0 disables.
   diagnostics_every: 10
@@ -45,7 +45,7 @@ rl:
 
   # Policy / objective settings mapped directly into rl.grpo.GRPOConfig.
   grpo:
-    sigma_explore: 0.002
+    sigma_explore: 0.02  # calibrated for tmQM pointcloud rollouts (see force calib)
     clip_eps: 0.2
     eps_t: 0.01
     log_ratio_clamp: 20.0
@@ -62,20 +62,22 @@ rl:
   # application; gates should run before diversity bucketing. Each entry has
   # `enabled` plus the wrapper-specific kwargs (passed verbatim to its make()).
   reward:
-    name: n_atoms
+    # tmQM HOMO-LUMO gap maximization, gated by molSimplify+xTB validity
+    # (validity is baked into the reward, so no validity wrapper is needed).
+    name: tmqm_gap
     wrappers:
       # RDKit validity gate. MOLECULE only; raises under any other representation.
       validity_gate:
-        enabled: true
+        enabled: false
       # Neutral organic XYZ validity gate (RDKit DetermineBonds).
-      # Use instead of validity_gate when QM9-style organic edges are projected.
+      # Organic-only; would zero every TMC, so off for tmQM.
       organic_xyz_validity_gate:
         enabled: false
         cov_factor: 1.3  # covalent-radii scale for connectivity; lower = stricter
         max_iterations: 200
-      # REINVENT-style scaffold-occurrence bucketing.
+      # REINVENT-style scaffold-occurrence bucketing. Needs RDKit mols; off for tmQM.
       scaffold_diversity:
-        enabled: true
+        enabled: false
         bucket_size: 10
         penalty: 0.5
         diversity_bucket: canonical_smiles  # murcko | canonical_smiles
@@ -86,6 +88,6 @@ rl:
   # aggregation; set it from the sweep wrapper.
   wandb:
     enabled: true
-    project: chemflow-grpo-n_atoms
+    project: chemflow-grpo-tmqm-gap
     name: ${oc.env:CHEMFLOW_RUN_ID,base}
     group: null
